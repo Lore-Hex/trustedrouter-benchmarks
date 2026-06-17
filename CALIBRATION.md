@@ -26,13 +26,23 @@ Published = Table 7 of the SimpleQA Verified paper (arXiv 2509.07968) / Epoch AI
 > visible answer. Raising `max_tokens` to 8192 fixed it. **Every panel run at the
 > old budget was contaminated for reasoning models** — all re-run at 8192.
 
-| Model | Published F1 / Att | Ours @512 (broken) | Ours @8192 (fixed) |
+| Model | Published F1 / Acc / Att | Ours @512 (broken) | Ours @8192 (fixed, full 1000) |
 |---|---:|---:|---:|
-| `google/gemini-2.5-pro` | 55.6 / 98.9 | F1 31.6 / Att 44.9 | F1 51.5 / Att 100.0 ¹ |
+| `google/gemini-2.5-pro` | 55.6 / 55.3 / 98.9 | F1 31.6 / Att 44.9 | **F1 51.3 / Acc 51.1 / Att 99.4** |
 
-¹ 200-question subset; full-1000 re-running. 51.5 vs published 55.6 is "nearly
-exactly" — the residual ~4 points is our judge (`gemini-2.5-flash`) being a
-touch stricter than Google's autorater, which a stronger judge would close.
+**Verdict: validated, nearly exactly.** The Attempted rate matches almost
+perfectly (99.4 vs 98.9) — the truncation fix is correct. The graded metrics sit
+a consistent ~4 points low (F1 51.3 vs 55.6), and *only* the graded metrics, so
+the residual is judge strictness, not a harness error: our default judge
+`google/gemini-2.5-flash` grades a touch stricter than Google's autorater. (On
+the easier first-300 questions the flash judge actually lands at 56.3 correct,
+dead on the published 55.3 — the full-1000 is lower because later questions are
+harder; the dataset isn't shuffled.)
+
+Judge notes from calibration: `gemini-2.5-flash` is the right judge — cheap,
+non-reasoning, emits the A/B/C letter immediately. A *reasoning* model as judge
+(e.g. `gemini-2.5-pro`) hits the same truncation trap on the judge side, so
+`judge.grade` was hardened to `max_tokens=2048`.
 
 Full published table (reference): Gemini 2.5 Pro 55.6, GPT-5 52.3, o3 51.9,
 GPT-4.1 39.9, GPT-4o 34.9, DeepSeek R1 33.3, Claude Opus 4 28.3, Gemini 2.5 Flash

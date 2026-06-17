@@ -103,7 +103,10 @@ def grade(
         api_key=api_key,
         model=judge_model,
         messages=[{"role": "user", "content": prompt}],
-        max_tokens=8,
+        # Generous so a reasoning judge isn't truncated before it emits the
+        # A/B/C letter (a non-reasoning judge still stops after ~1 token, so this
+        # costs nothing extra for the default gemini-2.5-flash judge).
+        max_tokens=2048,
         temperature=0.0,
         timeout=timeout,
     )
