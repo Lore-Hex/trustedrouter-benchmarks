@@ -30,6 +30,7 @@ FRONTIER_REFS: tuple[str, ...] = (
     "anthropic/claude-opus-4.8",
     "google/gemini-3.1-pro-preview",
     "openai/gpt-5.5",
+    "anthropic/claude-haiku-4.5",  # Western budget reference — set against the cheap Chinese models
 )
 
 DEFAULT_PANEL: tuple[str, ...] = CHINESE_PANEL + FRONTIER_REFS

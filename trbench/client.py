@@ -64,6 +64,9 @@ def extract_text(data: dict[str, Any]) -> str:
     return ""
 
 
+DEFAULT_RETRIES = 4
+
+
 def chat(
     *,
     base_url: str,
@@ -74,8 +77,16 @@ def chat(
     temperature: float = 0.0,
     timeout: float = 120.0,
     extra_body: dict[str, Any] | None = None,
+    retries: int = DEFAULT_RETRIES,
+    retry_backoff: float = 1.5,
 ) -> dict[str, Any]:
-    """One chat completion. Returns {text, usage, latency_ms} or {error}."""
+    """One chat completion. Returns {text, usage, latency_ms} or {error}.
+
+    Transient failures (HTTP 5xx / 429, timeouts, connection drops) are retried
+    up to ``retries`` times with capped exponential backoff, so a single flaky
+    provider route no longer silently drops a row from the run. Client errors
+    (4xx other than 429) return immediately — retrying them would never help.
+    """
     started = time.monotonic()
     body: dict[str, Any] = {
         "model": model,
@@ -85,23 +96,37 @@ def chat(
     }
     if extra_body:
         body.update(extra_body)
-    try:
-        data = _post(
-            base_url.rstrip("/") + "/chat/completions",
-            headers={"Authorization": f"Bearer {api_key}"},
-            body=body,
-            timeout=timeout,
-        )
-        return {
-            "text": extract_text(data),
-            "usage": data.get("usage") if isinstance(data.get("usage"), dict) else {},
-            "latency_ms": round((time.monotonic() - started) * 1000),
-        }
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")[:600]
-        return {"error": f"http_{exc.code}: {detail}", "latency_ms": round((time.monotonic() - started) * 1000)}
-    except Exception as exc:  # noqa: BLE001
-        return {"error": f"{type(exc).__name__}: {exc}", "latency_ms": round((time.monotonic() - started) * 1000)}
+
+    last_error = "unknown"
+    for attempt in range(retries + 1):
+        try:
+            data = _post(
+                base_url.rstrip("/") + "/chat/completions",
+                headers={"Authorization": f"Bearer {api_key}"},
+                body=body,
+                timeout=timeout,
+            )
+            return {
+                "text": extract_text(data),
+                "usage": data.get("usage") if isinstance(data.get("usage"), dict) else {},
+                "latency_ms": round((time.monotonic() - started) * 1000),
+                "attempts": attempt + 1,
+            }
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")[:600]
+            last_error = f"http_{exc.code}: {detail}"
+            retryable = exc.code >= 500 or exc.code == 429
+        except (urllib.error.URLError, TimeoutError, ConnectionError) as exc:
+            last_error = f"{type(exc).__name__}: {exc}"
+            retryable = True
+        except Exception as exc:  # noqa: BLE001
+            last_error = f"{type(exc).__name__}: {exc}"
+            retryable = False
+        if retryable and attempt < retries:
+            time.sleep(min(retry_backoff * (2 ** attempt), 8.0))
+            continue
+        return {"error": last_error, "latency_ms": round((time.monotonic() - started) * 1000)}
+    return {"error": last_error, "latency_ms": round((time.monotonic() - started) * 1000)}
 
 
 def available_models(*, models_url: str = DEFAULT_MODELS_URL, timeout: float = 30.0) -> set[str]:
