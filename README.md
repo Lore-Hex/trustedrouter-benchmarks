@@ -78,6 +78,10 @@ sandbox — just 541 prompts scored by Google's deterministic verifiers.
 
 ## Methodology
 
+- **Calibrated against published numbers.** Before trusting any new result, we
+  run reference models with authoritative published scores and confirm the
+  harness reproduces them (e.g. SimpleQA Verified `gemini-2.5-pro` should land on
+  the published F1 of 55.6). See [CALIBRATION.md](CALIBRATION.md).
 - **Faithful, not reinvented.** Each eval uses the canonical dataset and scorer.
   IFEval vendors Google's official verifiers verbatim (only the imports are made
   package-relative); see [NOTICE](NOTICE).
