@@ -91,6 +91,17 @@ _Headline numbers are filled in once the panel runs complete._
   the safe-cheap bets; the LLM-judge and agentic ones cost more, so they get
   subsets and small-N.
 
+## Security
+
+Aider executes **model-generated** Python to run the unit tests. That now runs,
+by default, in a locked-down throwaway Docker container per test — `--network
+none`, read-only root FS, all caps dropped, `no-new-privileges`, non-root,
+memory/CPU/PID limits, `--rm`. Network isolation is verified (a container that
+tries to open a socket fails). `--sandbox host` falls back to the host with a
+loud warning (throwaway VM only); `--sandbox docker` requires the sandbox and
+refuses to run unsandboxed. (The separate question of sandboxing untrusted-doc
+parsing for a *production* web-fetch tool is a bigger project, deferred.)
+
 ## Next
 
 1. **Fusion.** Run each eval through `trustedrouter/fusion` vs the best single

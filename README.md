@@ -87,6 +87,10 @@ sandbox — just 541 prompts scored by Google's deterministic verifiers.
   package-relative); see [NOTICE](NOTICE).
 - **No judge where possible.** IFEval and Aider score deterministically; the
   factuality evals use a short LLM judge run with no tools.
+- **Untrusted code is sandboxed.** Aider runs model-generated Python, so by
+  default each test executes in a throwaway Docker container (`--network none`,
+  read-only FS, caps dropped, non-root, memory/CPU/PID limits). `--sandbox host`
+  falls back to the host (throwaway VM only); `--sandbox docker` requires it.
 - Raw model outputs land in `results/` (gitignored — they can contain a lot of
   text). Publish the summary tables and SVG charts.
 
