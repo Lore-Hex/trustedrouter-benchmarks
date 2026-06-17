@@ -30,8 +30,13 @@ FRONTIER_REFS: tuple[str, ...] = (
     "anthropic/claude-opus-4.8",
     "google/gemini-3.1-pro-preview",
     "openai/gpt-5.5",
-    "anthropic/claude-haiku-4.5",  # Western budget reference — set against the cheap Chinese models
 )
+
+# Cheap, well-documented Western model used to CALIBRATE each eval against its
+# published number. The frontier refs above are too new to have stable published
+# per-eval scores; gemini-2.5-flash does, so it's the standing calibration anchor
+# (it's also the judge for the factuality evals). Not part of the scored panel.
+CALIBRATION_REF: str = "google/gemini-2.5-flash"
 
 DEFAULT_PANEL: tuple[str, ...] = CHINESE_PANEL + FRONTIER_REFS
 
