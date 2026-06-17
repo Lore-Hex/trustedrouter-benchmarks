@@ -119,6 +119,26 @@ number in the output). The canonical 1319-problem test split is fetched from the
 official OpenAI repo at runtime and cached under `.data/`.
 
 <!-- GSM8K_RESULTS_START -->
+
+GSM8K snapshot: `2026-06-17T23:14:26.377661+00:00` via `api.trustedrouter.com`. 30-problem subset, 12 models. Deterministic numeric match (no judge). Three models omitted (`z-ai/glm-5.2`, `moonshotai/kimi-k2.6`, `deepseek/deepseek-v3.2`) for >10% TrustedRouter route errors during the run. Note GSM8K is near-saturated at this level — the whole panel clusters at 93–100%, the open models at 100% — so it separates these models far less than the harder evals here; it's kept as a cheap deterministic sanity check, not a discriminator.
+
+![GSM8K chart](assets/gsm8k.svg)
+
+| Rank | Model | Accuracy | Correct | Total | Errors |
+|---:|---|---:|---:|---:|---:|
+| 1 | `deepseek/deepseek-v4-flash` | 100.0 | 30 | 30 | 0 |
+| 2 | `deepseek/deepseek-v4-pro` | 100.0 | 30 | 30 | 0 |
+| 3 | `moonshotai/kimi-k2.7-code` | 100.0 | 30 | 30 | 0 |
+| 4 | `tencent/hy3-preview` | 100.0 | 30 | 30 | 0 |
+| 5 | `xiaomi/mimo-v2.5` | 100.0 | 30 | 30 | 0 |
+| 6 | `xiaomi/mimo-v2.5-pro` | 100.0 | 30 | 30 | 0 |
+| 7 | `anthropic/claude-opus-4.8` | 96.7 | 29 | 30 | 0 |
+| 8 | `google/gemini-3.1-pro-preview` | 96.7 | 29 | 30 | 0 |
+| 9 | `minimax/minimax-m3` | 96.7 | 29 | 30 | 0 |
+| 10 | `openai/gpt-5.5` | 96.7 | 29 | 30 | 0 |
+| 11 | `z-ai/glm-5.1` | 96.7 | 29 | 30 | 1 |
+| 12 | `z-ai/glm-5` | 93.3 | 28 | 30 | 2 |
+
 <!-- GSM8K_RESULTS_END -->
 
 ## Methodology

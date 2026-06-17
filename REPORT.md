@@ -8,7 +8,8 @@ this is the narrative.
 
 | Eval | Implemented | Run on the panel | Notes |
 |---|---|---|---|
-| IFEval | ✅ | ✅ full 541 | deterministic, no judge — cheapest |
+| IFEval | ✅ | ✅ 100-subset (10 clean) | deterministic, no judge; frontier 90s, open models verbose → 32-51 |
+| GSM8K | ✅ | ✅ 30-subset (12 clean) | deterministic, no judge; near-saturated (panel 93-100%) |
 | SimpleQA Verified | ✅ | ✅ 250-subset | no-tools; novel Chinese-panel data |
 | Chinese SimpleQA | ✅ | ✅ 250-subset | Chinese-language factuality |
 | Aider polyglot (Python) | ✅ | ✅ 34 exercises | real unit tests, pass@1 |
@@ -16,7 +17,7 @@ this is the narrative.
 | LiveCodeBench | run-doc | ⏸ pending infra | needs code execution |
 | Terminal-Bench 2.0 | run-doc | ⏸ pending infra | needs Docker (some images amd64-only) |
 
-Four evals run end-to-end on the Chinese panel via TrustedRouter. The three
+Five evals run end-to-end on the Chinese panel via TrustedRouter. The three
 agentic/sandboxed ones have the exact canonical run command (pointed at the TR
 endpoint) in each eval's `README.md`; running them faithfully needs Docker /
 language toolchains / a code-execution sandbox, so they're documented rather
@@ -27,12 +28,23 @@ than spun up blindly here.
 See the result blocks in the README (spliced in by each eval's `score`):
 
 - IFEval — `IFEVAL_RESULTS`
+- GSM8K — `GSM8K_RESULTS`
 - SimpleQA Verified — `SIMPLEQA_VERIFIED_RESULTS`
 - Chinese SimpleQA — `CHINESE_SIMPLEQA_RESULTS`
 - Aider polyglot (Python) — `AIDER_POLYGLOT_RESULTS`
 
 <!-- REPORT_HEADLINES_START -->
-_Headline numbers are filled in once the panel runs complete._
+
+Headline numbers, TrustedRouter panel, 2026-06-17 (subsets noted; per eval, models whose routes errored heavily during the run are excluded rather than published as fake zeros):
+
+- **SimpleQA Verified** (English closed-book factuality, 250 questions, no tools) — DeepSeek V4 Pro **52.4** F1 leads, edging the frontier reference Opus 4.8 (51.5). On plain facts the gap to the frontier is gone.
+- **Chinese SimpleQA** (Chinese-language factuality, 250 questions) — DeepSeek V4 Pro **75.9**, V3.2 72.6, V4 Flash 72.4; the whole Chinese panel sits in the high 60s–70s and the frontier reference can't keep up.
+- **IFEval** (instruction-following, 100-prompt subset, 10 clean models) — gemini-3.1-pro **98.4**, gpt-5.5 96.4, Hunyuan 92.0, Opus 4.8 91.1; the other Chinese open models land 32–51. That's real, not truncation — they emit very long zero-shot outputs that blow IFEval's strict format/length/start-end constraints while the concise frontier models keep them.
+- **Aider polyglot** (Python subset, pass@1, real unit tests) — Opus 4.8 **88.2%** leads; best open model Hunyuan 41.2. Coding is where the frontier still wins clearly. This is a strict floor (Python-only, single attempt) vs the full public leaderboard.
+- **GSM8K** (grade-school math, 30-problem subset, 12 clean models) — near-saturated: the panel clusters at 93–100%, the open models (DeepSeek V4, Kimi K2.7-code, MiMo, Hunyuan) at 100%. Low discrimination; kept as a cheap deterministic sanity check.
+
+One line: on **facts** the open Chinese models are at the frontier (and ahead in Chinese); on **strict instruction-following** and **coding** the frontier still leads; **math** is saturated for everyone.
+
 <!-- REPORT_HEADLINES_END -->
 
 ## Decisions
