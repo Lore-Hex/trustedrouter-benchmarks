@@ -42,12 +42,12 @@ saturated benchmarks we deliberately skip are in [EVALS.md](EVALS.md).
 | Eval | Measures | Scorer | Status |
 |---|---|---|---|
 | **IFEval** | instruction-following | deterministic Python verifiers (no judge) | ✅ runnable |
-| **Aider polyglot** | repo-edit coding | real unit tests (no judge) | planned |
-| **Terminal-Bench 2.0** | agentic terminal/coding | task harness (small-N subset) | planned |
-| **SimpleQA Verified** | closed-book factuality | LLM judge (no tools) | planned |
-| **Chinese SimpleQA** | Chinese-language factuality | LLM judge (verify license first) | planned |
+| **SimpleQA Verified** | closed-book factuality | LLM judge (no tools) | ✅ runnable |
+| **Chinese SimpleQA** | Chinese-language factuality | LLM judge (no tools) | ✅ runnable |
+| **Aider polyglot** | repo-edit coding | real unit tests (no judge) | ✅ runnable (Python subset) |
+| **LiveCodeBench** | contamination-proof coding | date-filtered, code execution | planned |
 | **tau2-bench** | agentic tool-use | upstream CLI (`--num-tasks`) | planned |
-| **LiveCodeBench** | contamination-proof coding | date-filtered | planned |
+| **Terminal-Bench 2.0** | agentic terminal/coding | Docker harness (small-N subset) | planned |
 
 GPQA Diamond is intentionally excluded — near-saturated at the frontier, so it
 barely separates top models.

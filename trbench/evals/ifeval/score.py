@@ -74,7 +74,11 @@ def score_model(inputs: list[Any], responses: list[dict]) -> dict[str, Any]:
 
 
 def summarize(result: dict[str, Any]) -> list[dict[str, Any]]:
-    inputs = E.read_prompt_list(str(DATA_PATH))
+    all_inputs = E.read_prompt_list(str(DATA_PATH))
+    # Score only over the prompts that were actually run (so --prompt-limit
+    # subsets aren't divided by the full 541).
+    run_keys = {r.get("key") for r in result.get("responses", [])}
+    inputs = [i for i in all_inputs if i.key in run_keys] or all_inputs
     by_model: dict[str, list[dict]] = {}
     for r in result.get("responses", []):
         by_model.setdefault(str(r.get("model")), []).append(r)
