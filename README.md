@@ -42,6 +42,7 @@ saturated benchmarks we deliberately skip are in [EVALS.md](EVALS.md).
 | Eval | Measures | Scorer | Status |
 |---|---|---|---|
 | **IFEval** | instruction-following | deterministic Python verifiers (no judge) | ✅ runnable |
+| **GSM8K** | grade-school math reasoning | deterministic numeric match (no judge) | ✅ runnable |
 | **SimpleQA Verified** | closed-book factuality | LLM judge (no tools) | ✅ runnable |
 | **Chinese SimpleQA** | Chinese-language factuality | LLM judge (no tools) | ✅ runnable |
 | **Aider polyglot** | repo-edit coding | real unit tests (no judge) | ✅ runnable (Python subset) |
@@ -75,6 +76,32 @@ sandbox — just 541 prompts scored by Google's deterministic verifiers.
 
 <!-- IFEVAL_RESULTS_START -->
 <!-- IFEVAL_RESULTS_END -->
+
+## Run GSM8K
+
+```bash
+export TRUSTEDROUTER_API_KEY="sk-..."   # a throwaway key
+
+# cheap smoke (first 10 problems, a couple of models)
+python -m trbench.evals.gsm8k.run --models z-ai/glm-5.1,deepseek/deepseek-v4-flash \
+  --prompt-limit 10 --out results/gsm8k_smoke.json
+
+# full panel (1319 problems)
+python -m trbench.evals.gsm8k.run --out results/gsm8k.json
+
+# score + render chart + splice into a README
+python -m trbench.evals.gsm8k.score results/gsm8k.json \
+  --svg assets/gsm8k.svg --readme README.md
+```
+
+GSM8K is grade-school math word problems. Like IFEval it needs no judge and no
+sandbox: the model is asked to end with a `#### <answer>` marker and a
+deterministic numeric matcher checks exact match (falling back to the last
+number in the output). The canonical 1319-problem test split is fetched from the
+official OpenAI repo at runtime and cached under `.data/`.
+
+<!-- GSM8K_RESULTS_START -->
+<!-- GSM8K_RESULTS_END -->
 
 ## Methodology
 
@@ -122,3 +149,51 @@ Aider polyglot (Python subset) snapshot: `2026-06-17T13:21:24.049770+00:00`. 34 
 | 13 | `xiaomi/mimo-v2.5` | 0.0 | 0 | 34 | 0 |
 
 <!-- AIDER_POLYGLOT_RESULTS_END -->
+
+<!-- SIMPLEQA_VERIFIED_RESULTS_START -->
+
+SimpleQA Verified snapshot: `2026-06-17T13:23:05.762381+00:00`. 250 closed-book questions, no tools. Judge: `google/gemini-2.5-flash`. F-score = harmonic mean of accuracy and accuracy-given-attempted.
+
+![SimpleQA Verified chart](assets/simpleqa_verified.svg)
+
+| Rank | Model | F-score | Correct% | Attempted% | Acc|attempted | Errors |
+|---:|---|---:|---:|---:|---:|---:|
+| 1 | `deepseek/deepseek-v4-pro` | 52.4 | 50.2 | 91.7 | 54.8 | 9 |
+| 2 | `anthropic/claude-opus-4.8` | 51.5 | 40.0 | 55.2 | 72.5 | 0 |
+| 3 | `moonshotai/kimi-k2.7-code` | 36.4 | 24.9 | 36.9 | 67.4 | 9 |
+| 4 | `deepseek/deepseek-v4-flash` | 35.4 | 31.3 | 76.8 | 40.7 | 4 |
+| 5 | `xiaomi/mimo-v2.5-pro` | 33.6 | 29.6 | 76.0 | 38.9 | 0 |
+| 6 | `moonshotai/kimi-k2.6` | 28.0 | 18.0 | 28.8 | 62.5 | 0 |
+| 7 | `tencent/hy3-preview` | 26.3 | 26.0 | 98.0 | 26.5 | 0 |
+| 8 | `z-ai/glm-5.2` | 24.7 | 16.0 | 29.3 | 54.5 | 175 |
+| 9 | `deepseek/deepseek-v3.2` | 24.6 | 24.4 | 98.4 | 24.8 | 4 |
+| 10 | `z-ai/glm-5.1` | 23.1 | 14.4 | 24.8 | 58.1 | 0 |
+| 11 | `minimax/minimax-m3` | 22.8 | 16.4 | 44.0 | 37.3 | 0 |
+| 12 | `z-ai/glm-5` | 21.8 | 15.4 | 40.9 | 37.6 | 3 |
+| 13 | `xiaomi/mimo-v2.5` | 20.8 | 19.6 | 88.8 | 22.1 | 0 |
+
+<!-- SIMPLEQA_VERIFIED_RESULTS_END -->
+
+<!-- CHINESE_SIMPLEQA_RESULTS_START -->
+
+Chinese SimpleQA snapshot: `2026-06-17T13:26:37.168268+00:00`. 250 closed-book Chinese questions, no tools. Judge: `google/gemini-2.5-flash`.
+
+![Chinese SimpleQA chart](assets/chinese_simpleqa.svg)
+
+| Rank | Model | F-score | Correct% | Attempted% | Acc|attempted | Errors |
+|---:|---|---:|---:|---:|---:|---:|
+| 1 | `deepseek/deepseek-v4-pro` | 75.9 | 73.9 | 94.8 | 78.0 | 1 |
+| 2 | `deepseek/deepseek-v3.2` | 72.6 | 71.8 | 98.0 | 73.3 | 5 |
+| 3 | `deepseek/deepseek-v4-flash` | 72.4 | 68.8 | 90.0 | 76.4 | 0 |
+| 4 | `moonshotai/kimi-k2.6` | 71.6 | 62.0 | 73.2 | 84.7 | 0 |
+| 5 | `anthropic/claude-opus-4.8` | 71.3 | 61.8 | 73.5 | 84.2 | 1 |
+| 6 | `moonshotai/kimi-k2.7-code` | 71.3 | 57.7 | 61.9 | 93.2 | 11 |
+| 7 | `z-ai/glm-5.2` | 70.4 | 59.1 | 67.8 | 87.1 | 101 |
+| 8 | `xiaomi/mimo-v2.5-pro` | 68.3 | 65.2 | 90.8 | 71.8 | 0 |
+| 9 | `z-ai/glm-5` | 67.1 | 58.5 | 74.2 | 78.8 | 2 |
+| 10 | `tencent/hy3-preview` | 66.5 | 65.2 | 96.0 | 67.9 | 0 |
+| 11 | `xiaomi/mimo-v2.5` | 62.3 | 59.2 | 90.0 | 65.8 | 0 |
+| 12 | `minimax/minimax-m3` | 59.7 | 54.0 | 80.8 | 66.8 | 0 |
+| 13 | `z-ai/glm-5.1` | 59.7 | 46.0 | 54.0 | 85.2 | 0 |
+
+<!-- CHINESE_SIMPLEQA_RESULTS_END -->
