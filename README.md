@@ -94,3 +94,27 @@ sandbox — just 541 prompts scored by Google's deterministic verifiers.
 
 Apache-2.0. Vendored IFEval verifiers are Apache-2.0 from
 [google-research](https://github.com/google-research/google-research/tree/master/instruction_following_eval).
+
+<!-- AIDER_POLYGLOT_RESULTS_START -->
+
+Aider polyglot (Python subset) snapshot: `2026-06-17T13:21:24.049770+00:00`. 34 Exercism exercises, pass@1, real unit tests (no judge).
+
+![Aider polyglot chart](assets/aider_polyglot.svg)
+
+| Rank | Model | Pass% | Passed | Total | Errors |
+|---:|---|---:|---:|---:|---:|
+| 1 | `anthropic/claude-opus-4.8` | 88.2 | 30 | 34 | 0 |
+| 2 | `tencent/hy3-preview` | 41.2 | 14 | 34 | 0 |
+| 3 | `deepseek/deepseek-v3.2` | 38.2 | 13 | 34 | 0 |
+| 4 | `moonshotai/kimi-k2.7-code` | 32.4 | 11 | 34 | 0 |
+| 5 | `xiaomi/mimo-v2.5-pro` | 26.5 | 9 | 34 | 0 |
+| 6 | `deepseek/deepseek-v4-flash` | 23.5 | 8 | 34 | 0 |
+| 7 | `deepseek/deepseek-v4-pro` | 20.6 | 7 | 34 | 1 |
+| 8 | `z-ai/glm-5` | 20.6 | 7 | 34 | 1 |
+| 9 | `minimax/minimax-m3` | 14.7 | 5 | 34 | 0 |
+| 10 | `moonshotai/kimi-k2.6` | 14.7 | 5 | 34 | 3 |
+| 11 | `z-ai/glm-5.1` | 11.8 | 4 | 34 | 7 |
+| 12 | `z-ai/glm-5.2` | 2.9 | 1 | 34 | 18 |
+| 13 | `xiaomi/mimo-v2.5` | 0.0 | 0 | 34 | 0 |
+
+<!-- AIDER_POLYGLOT_RESULTS_END -->

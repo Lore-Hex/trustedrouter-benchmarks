@@ -18,7 +18,7 @@ def run_panel(
     base_url: str,
     api_key: str,
     models: list[str],
-    max_tokens: int = 512,
+    max_tokens: int = 8192,
     timeout: float = 90.0,
     concurrency: int = 8,
 ) -> list[dict[str, Any]]:

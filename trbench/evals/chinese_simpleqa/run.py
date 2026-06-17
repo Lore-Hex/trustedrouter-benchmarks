@@ -18,7 +18,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--models", default=None)
     parser.add_argument("--base-url", default=client.DEFAULT_BASE_URL)
     parser.add_argument("--api-key", default=None)
-    parser.add_argument("--max-tokens", type=int, default=512)
+    parser.add_argument("--max-tokens", type=int, default=8192)
     parser.add_argument("--timeout", type=float, default=90.0)
     parser.add_argument("--concurrency", type=int, default=8)
     parser.add_argument("--limit", type=int, default=None)
