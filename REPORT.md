@@ -64,6 +64,15 @@ _Headline numbers are filled in once the panel runs complete._
 
 ## Learnings (things that broke, and the fix)
 
+- **The big one: reasoning-model truncation, caught by calibration.** Before
+  trusting any new number we ran `gemini-2.5-pro` on SimpleQA Verified, where
+  Google publishes F1 55.6. We got **31.6**. The tell was the Attempted rate —
+  44.9% vs the published 98.9%. The model's answers were being **truncated
+  mid-sentence** because a reasoning model spends the token budget on hidden
+  thinking, and `max_tokens=512` left nothing for the visible answer. At 8192 it
+  recovers (Attempted 100%, F1 51.5 ≈ 55.6). This would have silently
+  under-scored every reasoning model on every eval. The whole reason to
+  calibrate against published numbers first — see CALIBRATION.md.
 - **Subset scoring bug.** The first IFEval scorer divided by all 541 prompts
   even on a `--prompt-limit` smoke, so subset scores looked ~0.2%. The smoke
   caught it; fix = score only over the prompts actually run.

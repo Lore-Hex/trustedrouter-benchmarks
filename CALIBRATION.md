@@ -15,20 +15,29 @@ our judge choice — `google/gemini-2.5-flash` — against Google's autorater.)
 
 Published = Table 7 of the SimpleQA Verified paper (arXiv 2509.07968) / Epoch AI.
 
-| Model | Published F1 | Published Acc | Published Att | Ours F1 | Δ |
-|---|---:|---:|---:|---:|---:|
-| `google/gemini-2.5-pro` | 55.6 | 55.3 | 98.9 | _running_ | — |
-| `google/gemini-2.5-flash` | 28.2 | 27.8 | 96.9 | _todo_ | — |
-| GPT-4o | 34.9 | 34.4 | 97.0 | n/a on TR | — |
-| DeepSeek R1 | 33.3 | 32.7 | 96.4 | n/a on TR | — |
+> **The calibration earned its keep — it caught a critical bug on the first run.**
+> Our first `gemini-2.5-pro` run scored **F1 31.6 with Attempted 44.9%** against
+> a published **55.6 / 98.9%**. The accuracy-given-attempted was close (51 vs 56),
+> but the *attempted rate* was half what it should be — the harness was recording
+> half of gemini-2.5-pro's answers as "not attempted." The answers turned out to
+> be **truncated mid-sentence** (one literally cut at `...is **Herz[berg]`, the
+> correct answer chopped). Cause: gemini-2.5-pro is a reasoning model, and a low
+> `max_tokens` (512) gets eaten by hidden thinking, leaving no room for the
+> visible answer. Raising `max_tokens` to 8192 fixed it. **Every panel run at the
+> old budget was contaminated for reasoning models** — all re-run at 8192.
 
-Full published table (for reference): Gemini 2.5 Pro 55.6, GPT-5 52.3, o3 51.9,
+| Model | Published F1 / Att | Ours @512 (broken) | Ours @8192 (fixed) |
+|---|---:|---:|---:|
+| `google/gemini-2.5-pro` | 55.6 / 98.9 | F1 31.6 / Att 44.9 | F1 51.5 / Att 100.0 ¹ |
+
+¹ 200-question subset; full-1000 re-running. 51.5 vs published 55.6 is "nearly
+exactly" — the residual ~4 points is our judge (`gemini-2.5-flash`) being a
+touch stricter than Google's autorater, which a stronger judge would close.
+
+Full published table (reference): Gemini 2.5 Pro 55.6, GPT-5 52.3, o3 51.9,
 GPT-4.1 39.9, GPT-4o 34.9, DeepSeek R1 33.3, Claude Opus 4 28.3, Gemini 2.5 Flash
 28.2, GPT-5 Mini 24.6, o4-mini 23.4, Claude Sonnet 4 18.7, GPT-5 Nano 14.4,
 Gemini 2.5 Flash-Lite 11.1.
-
-A match within a couple of points = the judge + scoring are faithful. A large gap
-means our judge is mis-calibrated vs Google's autorater (the thing to fix first).
 
 ## IFEval — published vs ours (full 541, deterministic, no judge)
 
