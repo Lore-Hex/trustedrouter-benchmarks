@@ -92,20 +92,29 @@ real effects, none of them a scoring bug:
 - **Run-to-run nondeterminism.** Even at temperature 0 the score moved
   50 → 57 → 53 (±2 problems on a 30-problem set).
 
-Conclusion: through the chat endpoint we do **not** reproduce the lab's
-thinking-mode 72. The answers are correct when the reasoning fits, so the numbers
-are faithful to *what the gateway returns* and comparable across models on our
-setup — but they **understate** models with very long native thinking versus the
-labs' thinking-mode figures. The AIME/MATH default `max_tokens` was raised to
-32768 (16384 truncated too much; beyond 32k didn't help).
+**Root cause, and the fix — now RESOLVED (matches published).** The plain chat
+endpoint scored low because the TrustedRouter gateway defaulted Gemini 2.5 Flash
+to `thinkingBudget: 0` (thinking off) and exposed only effort *levels*, never the
+native token budget — so requests ran Flash with reasoning disabled. The gateway
+now exposes it (shipped 2026-06-18): an OpenRouter-style `reasoning.max_tokens`
+maps to Gemini's native `thinkingConfig.thinkingBudget` (`-1` = dynamic/full
+thinking; `0` = off; `N` = a budget).
 
-**Root cause + fix (in flight).** The deeper reason: the TrustedRouter gateway
-defaulted Gemini 2.5 Flash to `thinkingBudget: 0` (thinking off) and exposed only
-effort *levels*, never the native token budget — so plain chat requests ran Flash
-with reasoning disabled. The gateway now exposes it: an OpenRouter-style
-`reasoning.max_tokens` maps to Gemini's native `thinkingConfig.thinkingBudget`
-(`-1` = dynamic/full thinking). Once that deploys, re-running AIME with
-`reasoning: {max_tokens: -1}` should reproduce the thinking-mode ~72.
+With that deployed, the AIME gap closes:
+
+| Config | Ours | vs published 72.0 |
+|---|---:|---|
+| no thinking, 16k / 32k / 64k tokens | 50 / 57 / 53 | far below |
+| `reasoning.max_tokens: -1`, 32k tokens | 53 | still truncating |
+| **`reasoning.max_tokens: -1`, 65536 tokens** | **73.3** (22/30) | ✅ **matches** |
+
+The second lever matters: Gemini's thinking tokens **count against
+`maxOutputTokens`**, so at 32k the thinking eats the budget and the visible answer
+truncates before `\boxed`. At 65536 both fit (median ~14k completion tokens, some
+hit the full 65k). So reproducing a lab's thinking-mode number needs **both** the
+thinking budget AND headroom. The AIME default `max_tokens` is therefore 65536.
+(GSM8K/MATH-500 need less and stay at 32768.) To reproduce thinking-mode scores,
+pass `extra_body={"reasoning": {"max_tokens": -1}}`.
 
 ## MATH-500 — validated via gpt-4o-mini
 
