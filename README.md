@@ -224,25 +224,25 @@ Aider polyglot (Python subset) snapshot: `2026-06-17T13:21:24.049770+00:00`. 34 
 
 <!-- SIMPLEQA_VERIFIED_RESULTS_START -->
 
-SimpleQA Verified snapshot: `2026-06-17T13:23:05.762381+00:00`. 250 closed-book questions, no tools. Judge: `google/gemini-2.5-flash`. F-score = harmonic mean of accuracy and accuracy-given-attempted.
+SimpleQA Verified snapshot: `2026-06-17T13:23:05.762381+00:00`. 250 closed-book questions, no tools. Judge: `openai/gpt-4.1`. F-score = harmonic mean of accuracy and accuracy-given-attempted.
 
 ![SimpleQA Verified chart](assets/simpleqa_verified.svg)
 
 | Rank | Model | F-score | Correct% | Attempted% | Acc|attempted | Errors |
 |---:|---|---:|---:|---:|---:|---:|
-| 1 | `deepseek/deepseek-v4-pro` | 52.4 | 50.2 | 91.7 | 54.8 | 9 |
-| 2 | `anthropic/claude-opus-4.8` | 51.5 | 40.0 | 55.2 | 72.5 | 0 |
-| 3 | `moonshotai/kimi-k2.7-code` | 36.4 | 24.9 | 36.9 | 67.4 | 9 |
-| 4 | `deepseek/deepseek-v4-flash` | 35.4 | 31.3 | 76.8 | 40.7 | 4 |
-| 5 | `xiaomi/mimo-v2.5-pro` | 33.6 | 29.6 | 76.0 | 38.9 | 0 |
-| 6 | `moonshotai/kimi-k2.6` | 28.0 | 18.0 | 28.8 | 62.5 | 0 |
-| 7 | `tencent/hy3-preview` | 26.3 | 26.0 | 98.0 | 26.5 | 0 |
-| 8 | `z-ai/glm-5.2` | 24.7 | 16.0 | 29.3 | 54.5 | 175 |
-| 9 | `deepseek/deepseek-v3.2` | 24.6 | 24.4 | 98.4 | 24.8 | 4 |
-| 10 | `z-ai/glm-5.1` | 23.1 | 14.4 | 24.8 | 58.1 | 0 |
-| 11 | `minimax/minimax-m3` | 22.8 | 16.4 | 44.0 | 37.3 | 0 |
-| 12 | `z-ai/glm-5` | 21.8 | 15.4 | 40.9 | 37.6 | 3 |
-| 13 | `xiaomi/mimo-v2.5` | 20.8 | 19.6 | 88.8 | 22.1 | 0 |
+| 1 | `deepseek/deepseek-v4-pro` | 55.1 | 52.7 | 91.3 | 57.7 | 9 |
+| 2 | `anthropic/claude-opus-4.8` | 52.7 | 40.4 | 53.2 | 75.9 | 0 |
+| 3 | `z-ai/glm-5` | 40.5 | 31.2 | 53.8 | 57.9 | 3 |
+| 4 | `z-ai/glm-5.2` | 40.4 | 26.7 | 32.0 | 83.3 | 175 |
+| 5 | `moonshotai/kimi-k2.7-code` | 40.2 | 27.8 | 38.2 | 72.8 | 9 |
+| 6 | `deepseek/deepseek-v4-flash` | 37.5 | 33.3 | 77.6 | 42.9 | 4 |
+| 7 | `xiaomi/mimo-v2.5-pro` | 34.1 | 29.6 | 73.6 | 40.2 | 0 |
+| 8 | `moonshotai/kimi-k2.6` | 32.1 | 20.4 | 27.2 | 75.0 | 0 |
+| 9 | `z-ai/glm-5.1` | 29.8 | 19.2 | 28.8 | 66.7 | 0 |
+| 10 | `tencent/hy3-preview` | 27.7 | 27.2 | 96.4 | 28.2 | 0 |
+| 11 | `deepseek/deepseek-v3.2` | 25.9 | 25.6 | 97.6 | 26.2 | 4 |
+| 12 | `minimax/minimax-m3` | 24.0 | 17.6 | 46.4 | 37.9 | 0 |
+| 13 | `xiaomi/mimo-v2.5` | 21.1 | 19.6 | 86.0 | 22.8 | 0 |
 
 <!-- SIMPLEQA_VERIFIED_RESULTS_END -->
 

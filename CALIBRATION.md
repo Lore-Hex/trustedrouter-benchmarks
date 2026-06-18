@@ -8,8 +8,12 @@ scores and check that our harness lands on them — exactly or nearly exactly.
 The cleanest anchor is **SimpleQA Verified**: Google published an exact per-model
 table (no tools, single dataset), and several of those models route on
 TrustedRouter. If our `gemini-2.5-pro` run lands on 55.6 F1, the whole
-answer → no-tools → LLM-judge → F-score pipeline is validated. (This also tests
-our judge choice — `google/gemini-2.5-flash` — against Google's autorater.)
+answer → no-tools → LLM-judge → F-score pipeline is validated. To grade the way
+Google does, we use Google's **exact autorater**: `openai/gpt-4.1` with the
+SimpleQA Verified grader prompt — OpenAI's original SimpleQA rubric, modified by
+Google to force direct answers, penalize guessing in long responses, and honor
+per-target numeric *acceptable ranges* (see `trbench/judge.py`; the modifications
+are the three the dataset card documents).
 
 ## SimpleQA Verified — published vs ours (full 1000, no tools)
 
@@ -26,23 +30,43 @@ Published = Table 7 of the SimpleQA Verified paper (arXiv 2509.07968) / Epoch AI
 > visible answer. Raising `max_tokens` to 8192 fixed it. **Every panel run at the
 > old budget was contaminated for reasoning models** — all re-run at 8192.
 
-| Model | Published F1 / Acc / Att | Ours @512 (broken) | Ours @8192 (fixed, full 1000) |
-|---|---:|---:|---:|
-| `google/gemini-2.5-pro` | 55.6 / 55.3 / 98.9 | F1 31.6 / Att 44.9 | **F1 51.3 / Acc 51.1 / Att 99.4** |
+`google/gemini-2.5-pro`, full 1000, no tools:
 
-**Verdict: validated, nearly exactly.** The Attempted rate matches almost
-perfectly (99.4 vs 98.9) — the truncation fix is correct. The graded metrics sit
-a consistent ~4 points low (F1 51.3 vs 55.6), and *only* the graded metrics, so
-the residual is judge strictness, not a harness error: our default judge
-`google/gemini-2.5-flash` grades a touch stricter than Google's autorater. (On
-the easier first-300 questions the flash judge actually lands at 56.3 correct,
-dead on the published 55.3 — the full-1000 is lower because later questions are
-harder; the dataset isn't shuffled.)
+| Run | F1 / Acc / Att |
+|---|---:|
+| **Published** (Table 7, arXiv 2509.07968 / Epoch AI) | **55.6 / 55.3 / 98.9** |
+| Ours @512 max_tokens (broken: thinking ate the answer) | 31.6 / — / 44.9 |
+| Ours @8192, judge `gemini-2.5-flash` + original SimpleQA prompt | 51.3 / 51.1 / 99.4 |
+| Ours @8192, **Google's autorater** (`gpt-4.1` + modified prompt) | **53.5 / 52.6 / 96.7** |
 
-Judge notes from calibration: `gemini-2.5-flash` is the right judge — cheap,
-non-reasoning, emits the A/B/C letter immediately. A *reasoning* model as judge
-(e.g. `gemini-2.5-pro`) hits the same truncation trap on the judge side, so
-`judge.grade` was hardened to `max_tokens=2048`.
+**Verdict: validated.** Three findings pin it down:
+
+- **The autorater was the gap, as suspected.** Switching from the cheap default
+  judge to Google's exact autorater (`gpt-4.1` + the modified grader prompt) moved
+  full-1000 F1 from 51.3 to **53.5** — over half the remaining ~4-point gap. The
+  single biggest driver is the numeric **acceptable-range** rule: 88 of the 1000
+  gold answers ship a range like `150 (acceptable range: anything between 148 and
+  152)`, and the original prompt's "correct to the last significant figure" marked
+  near-misses wrong, whereas Google's prompt accepts anything inside the range.
+- **On a comparable subset we're at/above Google.** The dataset isn't shuffled
+  (later questions are harder), so on the easier first-300 the *same* autorater
+  scores **F1 57.3 / Acc 57.0** — at or above the published full-1000 of 55.6. The
+  grader is correctly calibrated, not lenient.
+- **The residual ~2 F1 on the full 1000 is generation-side, not grading.** We ruled
+  out the obvious suspects: thinking is already on for gemini-2.5-pro by default
+  (verified — 724 reasoning tokens on a default call; it can't be disabled for pro,
+  `max_tokens:0` returns empty), and a short-answer query template raised Attempted
+  to 100% but did **not** raise F1 (56.7 vs 57.3 on the first-300 — neutral, so not
+  adopted; raw-question matches original SimpleQA anyway). What's left is back-tail
+  answer variance between our gemini-2.5-pro run and Google's, well within normal
+  LLM-autorater reproduction tolerance.
+
+Judge notes: the SimpleQA Verified default judge is now `openai/gpt-4.1` (Google's
+published autorater); like `gemini-2.5-flash` it's non-reasoning and emits the
+A/B/C letter immediately, so grading stays cheap and fast. A *reasoning* model as
+judge (e.g. `gemini-2.5-pro`) hits the truncation trap on the judge side, so
+`judge.grade` keeps `max_tokens=2048` as a guard. Every run replay is published in
+`results/`, so any of these numbers can be re-graded with `--judge-model`.
 
 Full published table (reference): Gemini 2.5 Pro 55.6, GPT-5 52.3, o3 51.9,
 GPT-4.1 39.9, GPT-4o 34.9, DeepSeek R1 33.3, Claude Opus 4 28.3, Gemini 2.5 Flash

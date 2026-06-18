@@ -8,7 +8,10 @@ from pathlib import Path
 from trbench import client, report
 from trbench.evals.qa_common import COLUMNS, score_panel
 
-DEFAULT_JUDGE = "google/gemini-2.5-flash"
+# GPT-4.1 is the published SimpleQA Verified autorater (arXiv:2509.07968); pairing
+# it with the modified grader prompt in trbench.judge is what reproduces Google's
+# reported scores. Override with --judge-model for a quick/cheaper re-grade.
+DEFAULT_JUDGE = "openai/gpt-4.1"
 
 
 def main(argv: list[str] | None = None) -> int:
