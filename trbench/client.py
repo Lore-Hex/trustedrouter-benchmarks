@@ -1,19 +1,27 @@
-"""Minimal OpenAI-compatible client for the TrustedRouter gateway.
+"""TrustedRouter gateway client for the benchmarks.
 
-No SDK dependency on purpose: a benchmark harness should be auditable top to
-bottom. Every eval in this repo talks to models through this one function.
+Every gateway (inference) call goes through the official TrustedRouter Python
+SDK (`trusted-router-py`) — the same shipped client the SDKs and PrometheusBench
+use — so the harness exercises the real client path. The thin `chat()` wrapper
+keeps a stable {text, usage} shape for the scorers and owns the retry policy:
+the SDK is created with max_retries=0 and this loop retries transient failures
+(HTTP 5xx / 429, timeouts, connection drops) with capped exponential backoff, so
+a single flaky provider route doesn't silently drop a row. (The SDK's own retry
+only covers 502/503/504 via regional failover and skips 429, so we keep our own.)
 """
 from __future__ import annotations
 
 import json
 import os
 import time
-import urllib.error
 import urllib.request
 from typing import Any
 
+from trustedrouter import TrustedRouter
+
 DEFAULT_BASE_URL = "https://api.trustedrouter.com/v1"
 DEFAULT_MODELS_URL = "https://trustedrouter.com/v1/models"
+DEFAULT_RETRIES = 4
 
 _API_KEY_ENV = (
     "TRUSTEDROUTER_API_KEY",
@@ -35,17 +43,6 @@ def api_key_from_env(explicit: str | None = None) -> str:
     )
 
 
-def _post(url: str, *, headers: dict[str, str], body: dict[str, Any], timeout: float) -> dict[str, Any]:
-    req = urllib.request.Request(
-        url,
-        method="POST",
-        headers={**headers, "Content-Type": "application/json"},
-        data=json.dumps(body).encode("utf-8"),
-    )
-    with urllib.request.urlopen(req, timeout=timeout) as response:  # noqa: S310
-        return json.loads(response.read().decode("utf-8"))
-
-
 def extract_text(data: dict[str, Any]) -> str:
     choices = data.get("choices")
     if isinstance(choices, list) and choices:
@@ -64,7 +61,20 @@ def extract_text(data: dict[str, Any]) -> str:
     return ""
 
 
-DEFAULT_RETRIES = 4
+# One SDK client per (base_url, api_key, timeout); httpx.Client is safe to share
+# across the worker threads, and reuse keeps connection pooling.
+_clients: dict[tuple[str, str, float], TrustedRouter] = {}
+
+
+def _sdk_client(base_url: str, api_key: str, timeout: float) -> TrustedRouter:
+    key = (base_url, api_key, timeout)
+    cli = _clients.get(key)
+    if cli is None:
+        # max_retries=0: this module's chat() loop owns retry (incl. 429, which
+        # the SDK doesn't retry) so behavior is identical across the panel.
+        cli = TrustedRouter(api_key=api_key, base_url=base_url, timeout=timeout, max_retries=0)
+        _clients[key] = cli
+    return cli
 
 
 def chat(
@@ -80,48 +90,31 @@ def chat(
     retries: int = DEFAULT_RETRIES,
     retry_backoff: float = 1.5,
 ) -> dict[str, Any]:
-    """One chat completion. Returns {text, usage, latency_ms} or {error}.
-
-    Transient failures (HTTP 5xx / 429, timeouts, connection drops) are retried
-    up to ``retries`` times with capped exponential backoff, so a single flaky
-    provider route no longer silently drops a row from the run. Client errors
-    (4xx other than 429) return immediately — retrying them would never help.
-    """
+    """One chat completion via the TrustedRouter SDK. Returns {text, usage,
+    latency_ms} or {error}. Transient failures retry; 4xx (other than 429) don't."""
     started = time.monotonic()
-    body: dict[str, Any] = {
-        "model": model,
-        "messages": messages,
-        "temperature": temperature,
-        "max_tokens": max_tokens,
-    }
+    params: dict[str, Any] = {"temperature": temperature, "max_tokens": max_tokens}
     if extra_body:
-        body.update(extra_body)
+        params.update(extra_body)
+    cli = _sdk_client(base_url, api_key, timeout)
 
     last_error = "unknown"
     for attempt in range(retries + 1):
         try:
-            data = _post(
-                base_url.rstrip("/") + "/chat/completions",
-                headers={"Authorization": f"Bearer {api_key}"},
-                body=body,
-                timeout=timeout,
-            )
+            data = cli.chat_completions(model=model, messages=messages, **params).model_dump()
             return {
                 "text": extract_text(data),
                 "usage": data.get("usage") if isinstance(data.get("usage"), dict) else {},
                 "latency_ms": round((time.monotonic() - started) * 1000),
                 "attempts": attempt + 1,
             }
-        except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace")[:600]
-            last_error = f"http_{exc.code}: {detail}"
-            retryable = exc.code >= 500 or exc.code == 429
-        except (urllib.error.URLError, TimeoutError, ConnectionError) as exc:
-            last_error = f"{type(exc).__name__}: {exc}"
-            retryable = True
         except Exception as exc:  # noqa: BLE001
-            last_error = f"{type(exc).__name__}: {exc}"
-            retryable = False
+            code = getattr(exc, "status_code", None)
+            last_error = (f"http_{code}: " if isinstance(code, int) else f"{type(exc).__name__}: ") + str(exc)[:600]
+            if isinstance(code, int):
+                retryable = code >= 500 or code == 429  # server / rate-limit: retry; other 4xx: don't
+            else:
+                retryable = True  # transport / timeout / connection drop: retry
         if retryable and attempt < retries:
             time.sleep(min(retry_backoff * (2 ** attempt), 8.0))
             continue
@@ -130,6 +123,8 @@ def chat(
 
 
 def available_models(*, models_url: str = DEFAULT_MODELS_URL, timeout: float = 30.0) -> set[str]:
+    """The live TrustedRouter catalog (a plain GET against the public catalog URL,
+    a different host than the inference base_url; not a gateway/inference call)."""
     req = urllib.request.Request(models_url, headers={"User-Agent": "trbench/0.1"})
     with urllib.request.urlopen(req, timeout=timeout) as response:  # noqa: S310
         data = json.loads(response.read().decode("utf-8"))
