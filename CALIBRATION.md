@@ -73,6 +73,28 @@ GPT-4.1 39.9, GPT-4o 34.9, DeepSeek R1 33.3, Claude Opus 4 28.3, Gemini 2.5 Flas
 28.2, GPT-5 Mini 24.6, o4-mini 23.4, Claude Sonnet 4 18.7, GPT-5 Nano 14.4,
 Gemini 2.5 Flash-Lite 11.1.
 
+### Panel gotcha: 8192 tokens still truncates the most verbose reasoners
+
+The gemini-2.5-pro fix (max_tokens 512→8192) wasn't enough for everyone. On the
+Chinese panel, the GLM family and Kimi K2.6 spend *more* than 8192 tokens thinking
+on hard SimpleQA questions and truncate before emitting a committed answer — the
+harness then sees blank text and grades NOT_ATTEMPTED, crushing their score. The
+tell was the new **Empty** column (blank-but-no-error responses):
+
+| Model | @8192 (truncated) | @32768 (re-run) | Empty @8192 → @32768 |
+|---|---:|---:|---:|
+| `z-ai/glm-5.1` | F1 29.8 | **49.7** | 97 → 0 |
+| `moonshotai/kimi-k2.6` | F1 31.0 | **49.2** | 87 → 0 |
+| `z-ai/glm-5` | F1 38.9 | **46.1** | (reasoning-leak) → 0 |
+| `z-ai/glm-5.2` | F1 ~5 | 6.1 | 228 → **231** |
+
+So the closed-book-QA default is now **32768** (free for non-reasoners — they stop
+at natural length). `glm-5.2` is the exception: it stays empty on 231/250 even at
+32768 (runaway reasoning that never commits to an answer) — that's genuine model
+behavior on this task, not a harness limit, and the Empty column makes it legible.
+**Likely affects other evals too** (the Aider polyglot panel shows the same GLM/Kimi
+models low with errors) — worth a budget audit across the suite.
+
 ## IFEval — published vs ours (full 541, deterministic, no judge)
 
 IFEval has no judge, so a faithful harness should match published numbers

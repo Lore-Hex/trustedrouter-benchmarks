@@ -18,8 +18,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--models", default=None)
     parser.add_argument("--base-url", default=client.DEFAULT_BASE_URL)
     parser.add_argument("--api-key", default=None)
-    parser.add_argument("--max-tokens", type=int, default=8192)
-    parser.add_argument("--timeout", type=float, default=90.0)
+    # 32768, not 8192: verbose reasoning models (the GLM family, kimi-k2.6) spend
+    # >8192 tokens thinking on hard questions and truncate before emitting a final
+    # answer — the harness then records an empty/incomplete response that grades
+    # NOT_ATTEMPTED, artificially sinking their score. A generous budget is free for
+    # non-reasoning models (they stop at natural length).
+    parser.add_argument("--max-tokens", type=int, default=32768)
+    parser.add_argument("--timeout", type=float, default=180.0)
     parser.add_argument("--concurrency", type=int, default=8)
     parser.add_argument("--limit", type=int, default=None, help="First N questions (cheap subset).")
     parser.add_argument("--out", default="results/simpleqa_verified.json")

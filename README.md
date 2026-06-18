@@ -228,23 +228,35 @@ SimpleQA Verified snapshot: `2026-06-17T13:23:05.762381+00:00`. 250 closed-book 
 
 ![SimpleQA Verified chart](assets/simpleqa_verified.svg)
 
-| Rank | Model | F-score | Correct% | Attempted% | Acc|attempted | Errors |
-|---:|---|---:|---:|---:|---:|---:|
-| 1 | `deepseek/deepseek-v4-pro` | 55.1 | 52.7 | 91.3 | 57.7 | 9 |
-| 2 | `anthropic/claude-opus-4.8` | 52.7 | 40.4 | 53.2 | 75.9 | 0 |
-| 3 | `z-ai/glm-5` | 40.5 | 31.2 | 53.8 | 57.9 | 3 |
-| 4 | `z-ai/glm-5.2` | 40.4 | 26.7 | 32.0 | 83.3 | 175 |
-| 5 | `moonshotai/kimi-k2.7-code` | 40.2 | 27.8 | 38.2 | 72.8 | 9 |
-| 6 | `deepseek/deepseek-v4-flash` | 37.5 | 33.3 | 77.6 | 42.9 | 4 |
-| 7 | `xiaomi/mimo-v2.5-pro` | 34.1 | 29.6 | 73.6 | 40.2 | 0 |
-| 8 | `moonshotai/kimi-k2.6` | 32.1 | 20.4 | 27.2 | 75.0 | 0 |
-| 9 | `z-ai/glm-5.1` | 29.8 | 19.2 | 28.8 | 66.7 | 0 |
-| 10 | `tencent/hy3-preview` | 27.7 | 27.2 | 96.4 | 28.2 | 0 |
-| 11 | `deepseek/deepseek-v3.2` | 25.9 | 25.6 | 97.6 | 26.2 | 4 |
-| 12 | `minimax/minimax-m3` | 24.0 | 17.6 | 46.4 | 37.9 | 0 |
-| 13 | `xiaomi/mimo-v2.5` | 21.1 | 19.6 | 86.0 | 22.8 | 0 |
+| Rank | Model | F-score | Correct% | Attempted% | Acc|attempted | Empty | Errors |
+|---:|---|---:|---:|---:|---:|---:|---:|
+| 1 | `deepseek/deepseek-v4-pro` | 55.0 | 52.7 | 91.7 | 57.5 | 0 | 9 |
+| 2 | `anthropic/claude-opus-4.8` | 53.1 | 40.8 | 53.6 | 76.1 | 0 | 0 |
+| 3 | `z-ai/glm-5.1` | 49.7 | 43.2 | 74.0 | 58.4 | 0 | 0 |
+| 4 | `moonshotai/kimi-k2.6` | 49.2 | 43.2 | 75.6 | 57.1 | 0 | 0 |
+| 5 | `z-ai/glm-5` | 46.1 | 44.4 | 92.8 | 47.8 | 0 | 0 |
+| 6 | `moonshotai/kimi-k2.7-code` | 39.8 | 27.4 | 37.8 | 72.5 | 0 | 9 |
+| 7 | `deepseek/deepseek-v4-flash` | 37.7 | 33.3 | 76.8 | 43.4 | 0 | 4 |
+| 8 | `xiaomi/mimo-v2.5-pro` | 34.0 | 29.6 | 74.0 | 40.0 | 0 | 0 |
+| 9 | `tencent/hy3-preview` | 27.6 | 27.2 | 96.8 | 28.1 | 0 | 0 |
+| 10 | `deepseek/deepseek-v3.2` | 26.0 | 25.6 | 97.2 | 26.4 | 0 | 4 |
+| 11 | `minimax/minimax-m3` | 24.1 | 17.6 | 46.0 | 38.3 | 0 | 0 |
+| 12 | `xiaomi/mimo-v2.5` | 21.1 | 19.6 | 86.0 | 22.8 | 0 | 0 |
+| 13 | `z-ai/glm-5.2` | 6.1 | 3.2 | 4.8 | 66.7 | 231 | 0 |
 
 <!-- SIMPLEQA_VERIFIED_RESULTS_END -->
+
+> **Grading & budget.** Graded with Google's exact autorater — `openai/gpt-4.1`
+> plus the published *modified* SimpleQA Verified grader prompt (direct-answer +
+> numeric acceptable-range rules). Generation budget is 32768 tokens: the verbose
+> reasoning models (the GLM family, Kimi K2.6) spend >8192 tokens thinking on hard
+> questions and would otherwise truncate before the answer — re-running them at the
+> higher budget moved glm-5.1 29.8→49.7 and kimi-k2.6 31.0→49.2. The **Empty**
+> column counts answers that came back blank (truncated/no committed answer): they
+> grade NOT_ATTEMPTED, so a high count means a budget/generation problem, not
+> knowledge. `z-ai/glm-5.2` is pathological here — it returns empty on 231/250 even
+> at 32768 (runaway reasoning that never commits), so its 6.1 reflects that, not its
+> factual knowledge. See [CALIBRATION.md](CALIBRATION.md).
 
 <!-- CHINESE_SIMPLEQA_RESULTS_START -->
 

@@ -18,8 +18,8 @@ def run_panel(
     base_url: str,
     api_key: str,
     models: list[str],
-    max_tokens: int = 8192,
-    timeout: float = 90.0,
+    max_tokens: int = 32768,
+    timeout: float = 180.0,
     concurrency: int = 8,
 ) -> list[dict[str, Any]]:
     responses: list[dict[str, Any]] = []
@@ -83,8 +83,15 @@ def score_panel(
         correct = grades.count("CORRECT")
         incorrect = grades.count("INCORRECT")
         not_att = grades.count("NOT_ATTEMPTED") + grades.count("JUDGE_ERROR")
+        # Empty = answered (no transport error) but blank/whitespace text. These
+        # grade NOT_ATTEMPTED but are usually TRUNCATION (a verbose reasoner spent
+        # the whole token budget thinking) rather than a genuine abstention — a big
+        # empty count means raise --max-tokens, not "the model declined." Surfacing
+        # it keeps a truncation artifact from masquerading as a real low score.
+        empty = sum(1 for r in answered if not (r.get("text") or "").strip())
         rows.append(
-            {"model": model, **judge.fscore(correct, incorrect, not_att), "completed": len(answered), "errors": errors}
+            {"model": model, **judge.fscore(correct, incorrect, not_att),
+             "completed": len(answered), "empty": empty, "errors": errors}
         )
 
     rows.sort(key=lambda r: (-float(r["f1"]), -float(r["correct"]), int(r["errors"]), r["model"]))
@@ -97,5 +104,6 @@ COLUMNS = [
     ("Correct%", "correct"),
     ("Attempted%", "attempted"),
     ("Acc|attempted", "given_attempted"),
+    ("Empty", "empty"),
     ("Errors", "errors"),
 ]
