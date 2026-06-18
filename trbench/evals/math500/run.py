@@ -60,7 +60,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--models", default=None, help="Comma-separated model ids (default: the panel).")
     parser.add_argument("--base-url", default=client.DEFAULT_BASE_URL)
     parser.add_argument("--api-key", default=None)
-    parser.add_argument("--max-tokens", type=int, default=32768)  # long reasoning; 16k truncated the tail (see CALIBRATION.md)
+    # Long reasoning; 16k truncated the tail (see CALIBRATION.md).
+    parser.add_argument("--max-tokens", type=int, default=32768)
     parser.add_argument("--timeout", type=float, default=180.0)
     parser.add_argument("--concurrency", type=int, default=8)
     parser.add_argument("--prompt-limit", type=int, default=None, help="Use only the first N problems.")
