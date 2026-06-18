@@ -57,11 +57,57 @@ the average of the four). We report all four sub-metrics, so we can line up
 against whichever a source used. Reference models run: `openai/gpt-4o-mini`,
 `google/gemini-2.5-flash`, `google/gemini-2.5-pro`.
 
-| Model | Published IFEval | Metric | Ours (prompt-strict / avg) | Δ |
-|---|---:|---|---|---:|
-| `google/gemini-2.5-pro` | _todo_ | — | _running_ | — |
-| `google/gemini-2.5-flash` | _todo_ | — | _running_ | — |
-| `openai/gpt-4o-mini` | _todo_ | — | _running_ | — |
+| Model | Published IFEval | Ours (prompt-strict / avg) | Verdict |
+|---|---|---|---|
+| `openai/gpt-4o-mini` | ~86 (M-IFEval EN strict, arXiv 2502.04688) | 79.7 / **84.4** | **within ~2pt — validated** |
+| `google/gemini-2.5-flash` | none official | 82.3 / 86.4 | Google publishes no IFEval for the 2.5 family |
+| `google/gemini-2.5-pro` | none official | provider-flaky run (55–63 with 171 errors) | inconclusive; no official target anyway |
+
+**Verdict: validated via gpt-4o-mini.** No lab publishes an official IFEval for the
+Gemini 2.5 family (their cards report GPQA / AIME 2025 / LiveCodeBench / SWE-Bench /
+SimpleQA, not IFEval), so the cleanest anchor is `gpt-4o-mini` against the
+peer-reviewed M-IFEval re-run of the original IFEval (~86 instruction-level avg
+strict). Our 84.4 lands within ~2 points, and the verifiers themselves are
+Google's canonical code, so the IFEval pipeline is sound. (Third-party
+aggregators for gpt-4o-mini conflict — 84 / 86 / 76.5 depending on the exact
+sub-metric — so treat ~84–86 as the band, not a single point.)
+
+## AIME 2025 — the reasoning-budget gap (does NOT cleanly match)
+
+AIME is where the gateway path and the labs' published numbers diverge, and it's
+worth being blunt about it. Google's official Gemini 2.5 Flash model card reports
+AIME 2025 pass@1 = **72.0** (GA "thinking"; 75.6 for the 09-2025 preview), and a
+second source corroborates 72. Our `gemini-2.5-flash` through the TrustedRouter
+chat endpoint lands **50.0 / 56.7 / 53.3** at `max_tokens` 16k / 32k / 64k. Three
+real effects, none of them a scoring bug:
+
+- **Truncation at low budgets.** Flash reasons 50k–100k+ characters on hard AIME
+  problems. At 16k tokens, 7/30 responses are cut off mid-reasoning before
+  reaching `\boxed`; at 32k, 5/30. Raising the budget recovers some.
+- **A reasoning ceiling above ~32k, not just our cap.** At a 64k request the
+  longest responses came back *shorter* (max ~36k chars) than at 32k (~101k
+  chars), and 5 problems still never reached an answer — so past ~32k the extra
+  budget isn't used. The published 72 uses Gemini's *native thinking budget*,
+  which the OpenAI-compatible chat path does not expose.
+- **Run-to-run nondeterminism.** Even at temperature 0 the score moved
+  50 → 57 → 53 (±2 problems on a 30-problem set).
+
+Conclusion: through the chat endpoint we do **not** reproduce the lab's
+thinking-mode 72. The answers are correct when the reasoning fits, so the numbers
+are faithful to *what the gateway returns* and comparable across models on our
+setup — but they **understate** models with very long native thinking versus the
+labs' thinking-mode figures. The AIME/MATH default `max_tokens` was raised to
+32768 (16384 truncated too much; beyond 32k didn't help).
+
+## MATH-500 / GSM8K — no published target to match
+
+No lab publishes an official MATH-500 or GSM8K number for the Gemini 2.5 family
+(their cards report AIME 2025, GPQA, LiveCodeBench, SWE-Bench, SimpleQA — not
+MATH-500 or GSM8K; GSM8K is saturated and has been dropped). There is nothing
+authoritative to calibrate these against. Our `gemini-2.5-flash` MATH-500 = 90.8
+(full 500) is internally plausible; GSM8K is near-saturated for everyone. Treat
+both as harness-internal (comparable across our panel) rather than
+published-matched.
 
 ## Aider polyglot — not directly calibratable here
 
