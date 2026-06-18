@@ -99,15 +99,37 @@ setup — but they **understate** models with very long native thinking versus t
 labs' thinking-mode figures. The AIME/MATH default `max_tokens` was raised to
 32768 (16384 truncated too much; beyond 32k didn't help).
 
-## MATH-500 / GSM8K — no published target to match
+**Root cause + fix (in flight).** The deeper reason: the TrustedRouter gateway
+defaulted Gemini 2.5 Flash to `thinkingBudget: 0` (thinking off) and exposed only
+effort *levels*, never the native token budget — so plain chat requests ran Flash
+with reasoning disabled. The gateway now exposes it: an OpenRouter-style
+`reasoning.max_tokens` maps to Gemini's native `thinkingConfig.thinkingBudget`
+(`-1` = dynamic/full thinking). Once that deploys, re-running AIME with
+`reasoning: {max_tokens: -1}` should reproduce the thinking-mode ~72.
 
-No lab publishes an official MATH-500 or GSM8K number for the Gemini 2.5 family
-(their cards report AIME 2025, GPQA, LiveCodeBench, SWE-Bench, SimpleQA — not
-MATH-500 or GSM8K; GSM8K is saturated and has been dropped). There is nothing
-authoritative to calibrate these against. Our `gemini-2.5-flash` MATH-500 = 90.8
-(full 500) is internally plausible; GSM8K is near-saturated for everyone. Treat
-both as harness-internal (comparable across our panel) rather than
-published-matched.
+## MATH-500 — validated via gpt-4o-mini
+
+MATH-500 is one of the most widely published benchmarks — Artificial Analysis
+runs a full MATH-500 leaderboard (GPT-5 99.4, o3 99.2 at the top). The only true
+narrow fact is that the **Gemini 2.5 family reports AIME 2025, not MATH-500**, so
+`gemini-2.5-flash` was a bad anchor for it. We calibrate instead against
+**gpt-4o-mini** — non-thinking (no truncation ambiguity) and widely reported at
+~70–75% (OpenAI's own gpt-4o-mini "MATH" = 70.2).
+
+| Model | Published MATH-500 | Ours (full 500) | Verdict |
+|---|---|---:|---|
+| `openai/gpt-4o-mini` | ~70–75 | **73.8** (369/500) | ✅ **right in the band — validated** |
+
+This also validates the vendored Hendrycks `is_equiv` scorer. (Our
+`gemini-2.5-flash` MATH-500 = 90.8 is plausible for a thinking model but has no
+published MATH-500 to check against — see the AIME note re: thinking budget.)
+
+## GSM8K — saturated, dropped by recent labs
+
+GSM8K has plenty of public numbers for older models, but recent labs (including
+the Gemini 2.5 family) have dropped it from their cards as saturated — it's
+near-100 for everyone. We keep it as a cheap deterministic sanity check, not a
+discriminator, and don't claim a published match for the current panel.
 
 ## Aider polyglot — not directly calibratable here
 
