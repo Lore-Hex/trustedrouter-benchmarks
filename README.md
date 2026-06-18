@@ -187,8 +187,11 @@ and a reasoning model that truncates will look artificially weak.
   default each test executes in a throwaway Docker container (`--network none`,
   read-only FS, caps dropped, non-root, memory/CPU/PID limits). `--sandbox host`
   falls back to the host (throwaway VM only); `--sandbox docker` requires it.
-- Raw model outputs land in `results/` (gitignored — they can contain a lot of
-  text). Publish the summary tables and SVG charts.
+- **Reproducible: the raw run replays are published.** Every run's per-item
+  responses live in `results/*.json` and are committed, so any number here can be
+  re-scored and audited end to end. The one exception is Chinese SimpleQA, whose
+  replay embeds a dataset that ships no license; only its aggregate scores are
+  published. Raw dataset caches (`.data/`) stay out of git.
 
 ## License
 
