@@ -42,7 +42,9 @@ saturated benchmarks we deliberately skip are in [EVALS.md](EVALS.md).
 | Eval | Measures | Scorer | Status |
 |---|---|---|---|
 | **IFEval** | instruction-following | deterministic Python verifiers (no judge) | ✅ runnable |
-| **GSM8K** | grade-school math reasoning | deterministic numeric match (no judge) | ✅ runnable |
+| **GSM8K** | grade-school math reasoning | deterministic numeric match (no judge) | ✅ runnable (saturated) |
+| **AIME 2025** | competition math | deterministic integer match (no judge) | ✅ runnable |
+| **MATH-500** | contest math | vendored Hendrycks answer-equivalence (no judge) | ✅ runnable |
 | **SimpleQA Verified** | closed-book factuality | LLM judge (no tools) | ✅ runnable |
 | **Chinese SimpleQA** | Chinese-language factuality | LLM judge (no tools) | ✅ runnable |
 | **Aider polyglot** | repo-edit coding | real unit tests (no judge) | ✅ runnable (Python subset) |
@@ -140,6 +142,35 @@ GSM8K snapshot: `2026-06-17T23:14:26.377661+00:00` via `api.trustedrouter.com`. 
 | 12 | `z-ai/glm-5` | 93.3 | 28 | 30 | 2 |
 
 <!-- GSM8K_RESULTS_END -->
+
+GSM8K is near-saturated, so **AIME 2025** and **MATH-500** are the real math
+discriminators (and they have published numbers to calibrate against).
+
+## Run AIME / MATH-500
+
+```bash
+export TRUSTEDROUTER_API_KEY="sk-..."   # a throwaway key
+
+# AIME 2025 — 30 competition problems, integer answers
+python -m trbench.evals.aime.run --out results/aime.json
+python -m trbench.evals.aime.score results/aime.json --svg assets/aime.svg --readme README.md
+
+# MATH-500 — 500 contest problems, LaTeX answers
+python -m trbench.evals.math500.run --out results/math500.json
+python -m trbench.evals.math500.score results/math500.json --svg assets/math500.svg --readme README.md
+```
+
+Both are deterministic (no judge): the model reasons and puts its final answer
+in `\boxed{}`. AIME checks exact integer match; MATH-500 uses the vendored
+Hendrycks answer-equivalence checker (LaTeX normalization), so grading matches
+published results. `--max-tokens` defaults to 16384 — these need long solutions,
+and a reasoning model that truncates will look artificially weak.
+
+<!-- AIME_RESULTS_START -->
+<!-- AIME_RESULTS_END -->
+
+<!-- MATH500_RESULTS_START -->
+<!-- MATH500_RESULTS_END -->
 
 ## Methodology
 
