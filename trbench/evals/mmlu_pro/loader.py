@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import urllib.request
 from pathlib import Path
 
@@ -47,7 +48,15 @@ def load(limit: int | None = None) -> list[dict]:
     else:
         full = _download_all()
         CACHE.parent.mkdir(parents=True, exist_ok=True)
-        CACHE.write_text("\n".join(json.dumps(it, ensure_ascii=False) for it in full) + "\n", encoding="utf-8")
+        # ensure_ascii=True (default): some questions contain a Unicode line
+        # separator (U+2028/U+2029) that json keeps literal with ensure_ascii=False
+        # and str.splitlines() then splits on, truncating that JSONL line. Escaping
+        # all non-ASCII keeps every record on exactly one physical line.
+        # Atomic write (temp + rename) so two processes first-loading concurrently
+        # can't interleave into a half-written cache.
+        tmp = CACHE.with_suffix(f".tmp.{os.getpid()}")
+        tmp.write_text("\n".join(json.dumps(it) for it in full) + "\n", encoding="utf-8")
+        os.replace(tmp, CACHE)
 
     if limit is None or limit >= len(full):
         return full
