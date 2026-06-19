@@ -1,22 +1,28 @@
-# LiveCodeBench (contamination-proof coding)
+# LiveCodeBench (contamination-resistant coding)
 
-Competition problems tagged with release dates; `--start_date`/`--end_date`
-filtering scores models only on problems released AFTER their training cutoff —
-the one eval here with a built-in contamination guard.
+Real code execution, graded by running each model's program against the problem's
+full test suite — **pass@1**, no judge. Contamination-resistant by *time-windowing*:
+LiveCodeBench ships versioned releases (`v1`…`v6`), each adding problems from a
+later window, so we grade on problems published after the models' training cutoffs.
 
-Status: **harness documented, run pending infra** — needs code execution
-(stdin/stdout test cases). Upstream: https://github.com/LiveCodeBench/LiveCodeBench
+**Untrusted code runs only in a container.** Every solution is executed in a
+throwaway Docker container with `--network none`, capped memory/CPU/pids, and a
+per-test timeout — never in-process. The dataset's `private_test_cases` pickle is
+decoded with a restricted unpickler (builtins only), so even loading the data
+can't execute code.
+
+Scope today: **stdin/stdout problems** (AtCoder/Codeforces — empty `starter_code`).
+LeetCode functional problems need call-based harnessing and are filtered out for now.
 
 ```bash
-pip install livecodebench   # or clone the repo
-# generation pointed at TrustedRouter (OpenAI-compatible), then evaluate.
-# Use a recent post-cutoff window to keep it both cheap and contamination-free:
-python -m lcb_runner.runner.main \
-  --model z-ai/glm-5.1 \
-  --base_url https://api.trustedrouter.com/v1 \
-  --scenario codegeneration \
-  --start_date 2025-06-01 --end_date 2025-12-31
+export TRUSTEDROUTER_API_KEY=...        # throwaway key
+# generate solutions (replay = raw model output)
+python -m trbench.evals.livecodebench.run --prompt-limit 50 --out results/livecodebench.json
+# grade in containers + render
+python -m trbench.evals.livecodebench.score results/livecodebench.json --concurrency 6
 ```
 
-Report pass@1 on the date-filtered subset. Because problems are post-cutoff,
-this stays discriminating even when static coding evals saturate.
+Needs Docker/OrbStack with the `python:3.11-slim` image. `--version` / `--min-date`
+pick the release window. Calibration: gpt-4.1, 8 AtCoder stdin problems → pass@1 75.0
+(harness validated end to end; a published-comparable number needs the full
+windowed set incl. LeetCode functional, a follow-up).
