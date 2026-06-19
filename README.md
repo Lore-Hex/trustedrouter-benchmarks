@@ -45,11 +45,12 @@ saturated benchmarks we deliberately skip are in [EVALS.md](EVALS.md).
 | **GSM8K** | grade-school math reasoning | deterministic numeric match (no judge) | ✅ runnable (saturated) |
 | **AIME 2025** | competition math | deterministic integer match (no judge) | ✅ runnable |
 | **MATH-500** | contest math | vendored Hendrycks answer-equivalence (no judge) | ✅ runnable |
-| **SimpleQA Verified** | closed-book factuality | LLM judge (no tools) | ✅ runnable |
+| **SimpleQA Verified** | closed-book factuality | GPT-4.1 autorater (no tools) | ✅ runnable |
 | **Chinese SimpleQA** | Chinese-language factuality | LLM judge (no tools) | ✅ runnable |
+| **MMLU-Pro** | broad knowledge / reasoning | deterministic letter-match (no judge) | ✅ runnable |
 | **Aider polyglot** | repo-edit coding | real unit tests (no judge) | ✅ runnable (Python subset) |
-| **LiveCodeBench** | contamination-proof coding | date-filtered, code execution | planned |
-| **tau2-bench** | agentic tool-use | upstream CLI (`--num-tasks`) | planned |
+| **LiveCodeBench** | contamination-resistant coding | date-windowed, containerized execution | ✅ runnable (stdin subset) |
+| **tau2-bench** | agentic tool-use | upstream CLI, pass^1 (no judge) | ✅ runnable |
 | **Terminal-Bench 2.0** | agentic terminal/coding | Docker harness (small-N subset) | planned |
 
 GPQA Diamond is intentionally excluded — near-saturated at the frontier, so it
@@ -281,3 +282,29 @@ Chinese SimpleQA snapshot: `2026-06-17T13:26:37.168268+00:00`. 250 closed-book C
 | 13 | `z-ai/glm-5.1` | 59.7 | 46.0 | 54.0 | 85.2 | 0 |
 
 <!-- CHINESE_SIMPLEQA_RESULTS_END -->
+
+<!-- TAU2_RESULTS_START -->
+
+tau2-bench snapshot: `2026-06-19T02:23:54.885426+00:00`. Domain `retail`, 20 tasks x 1 trial(s), agent vs fixed user `openai/gpt-4.1`. Metric: pass^1 (task reward == 1). Small-subset numbers run high; the ranking is the signal.
+
+![tau2-bench chart](assets/tau2.svg)
+
+| Rank | Model | pass^1 | avg_reward | Tasks | Errors |
+|---:|---|---:|---:|---:|---:|
+| 1 | `deepseek/deepseek-v4-flash` | 100.0 | 100.0 | 20 | 0 |
+| 2 | `openai/gpt-5.5` | 100.0 | 100.0 | 20 | 0 |
+| 3 | `deepseek/deepseek-v4-pro` | 95.0 | 95.0 | 20 | 0 |
+| 4 | `minimax/minimax-m3` | 95.0 | 95.0 | 20 | 0 |
+| 5 | `anthropic/claude-opus-4.8` | 94.1 | 94.1 | 17 | 3 |
+| 6 | `google/gemini-3.1-pro-preview` | 90.0 | 90.0 | 20 | 0 |
+| 7 | `moonshotai/kimi-k2.6` | 90.0 | 90.0 | 20 | 0 |
+| 8 | `tencent/hy3-preview` | 90.0 | 90.0 | 20 | 0 |
+| 9 | `z-ai/glm-5.2` | 90.0 | 90.0 | 20 | 0 |
+| 10 | `z-ai/glm-5` | 85.0 | 85.0 | 20 | 0 |
+| 11 | `deepseek/deepseek-v3.2` | 82.4 | 82.4 | 17 | 3 |
+| 12 | `moonshotai/kimi-k2.7-code` | 80.0 | 80.0 | 20 | 0 |
+| 13 | `xiaomi/mimo-v2.5-pro` | 80.0 | 80.0 | 20 | 0 |
+| 14 | `z-ai/glm-5.1` | 80.0 | 80.0 | 20 | 0 |
+| 15 | `xiaomi/mimo-v2.5` | 70.0 | 70.0 | 20 | 0 |
+
+<!-- TAU2_RESULTS_END -->
