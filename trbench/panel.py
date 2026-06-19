@@ -25,8 +25,8 @@ CHINESE_PANEL: tuple[str, ...] = (
     "xiaomi/mimo-v2.5",
     "tencent/hy3-preview",
     # Qwen (Alibaba) — a top Chinese open-weight lab; modern flagships.
+    # (qwen3-235b-a22b-2507 omitted — not an authorized route on our workspace.)
     "qwen/qwen3.5-397b-a17b",
-    "qwen/qwen3-235b-a22b-2507",
     "qwen/qwen3-235b-a22b-thinking-2507",
     "qwen/qwen3-30b-a3b-instruct-2507",
     "qwen/qwen3-coder-next",

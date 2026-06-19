@@ -308,3 +308,29 @@ tau2-bench snapshot: `2026-06-19T02:23:54.885426+00:00`. Domain `retail`, 20 tas
 | 15 | `xiaomi/mimo-v2.5` | 70.0 | 70.0 | 20 | 0 |
 
 <!-- TAU2_RESULTS_END -->
+
+<!-- MMLU_PRO_RESULTS_START -->
+
+MMLU-Pro snapshot: `2026-06-19T04:56:04.874288+00:00` via `api.trustedrouter.com`. 150 questions, 15 models. Zero-shot CoT, deterministic letter-match (no judge).
+
+![MMLU-Pro chart](assets/mmlu_pro.svg)
+
+| Rank | Model | Accuracy | Correct | Total | No answer | Errors |
+|---:|---|---:|---:|---:|---:|---:|
+| 1 | `anthropic/claude-opus-4.8` | 88.0 | 132 | 150 | 0 | 0 |
+| 2 | `moonshotai/kimi-k2.6` | 87.3 | 131 | 150 | 0 | 0 |
+| 3 | `moonshotai/kimi-k2.7-code` | 86.0 | 129 | 150 | 0 | 0 |
+| 4 | `openai/gpt-5.5` | 85.3 | 128 | 150 | 0 | 1 |
+| 5 | `deepseek/deepseek-v3.2` | 84.0 | 126 | 150 | 1 | 0 |
+| 6 | `deepseek/deepseek-v4-flash` | 84.0 | 126 | 150 | 0 | 0 |
+| 7 | `minimax/minimax-m3` | 84.0 | 126 | 150 | 0 | 0 |
+| 8 | `deepseek/deepseek-v4-pro` | 83.3 | 125 | 150 | 2 | 0 |
+| 9 | `xiaomi/mimo-v2.5` | 83.3 | 125 | 150 | 0 | 0 |
+| 10 | `google/gemini-3.1-pro-preview` | 83.3 | 125 | 150 | 0 | 4 |
+| 11 | `xiaomi/mimo-v2.5-pro` | 82.0 | 123 | 150 | 1 | 0 |
+| 12 | `z-ai/glm-5` | 82.0 | 123 | 150 | 2 | 0 |
+| 13 | `z-ai/glm-5.1` | 80.7 | 121 | 150 | 5 | 0 |
+| 14 | `tencent/hy3-preview` | 76.0 | 114 | 150 | 5 | 0 |
+| 15 | `z-ai/glm-5.2` | 7.3 | 11 | 150 | 137 | 0 |
+
+<!-- MMLU_PRO_RESULTS_END -->

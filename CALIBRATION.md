@@ -193,6 +193,37 @@ full 225 exercises across 6 languages with a 2nd attempt. So our numbers are a
 strict floor, not a reproduction of the published leaderboard. Calibrating
 against the leaderboard would require running the full polyglot harness.
 
+## Stable open-weight anchors — the harness reproduces across many models
+
+The frontier/Chinese flagships drift and rarely publish standardized per-eval
+numbers, so they can't anchor anything. The cleanest validation is to run
+**pinned open-weight checkpoints** (+ the gpt-4o family) whose IFEval / MMLU-Pro /
+GSM8K numbers are in their model cards (`CALIBRATION_ANCHORS` in `panel.py`).
+Across 7 independent models, ours land within a few points of the cards — the
+harness reproduces, it's not tuned to one model:
+
+| Model | IFEval (card) | GSM8K (card) | MMLU-Pro (card) |
+|---|---|---|---|
+| `llama-3.3-70b-instruct` | 93.5 (~92) | 96.7 (~95) | 70.7 (~69) |
+| `llama-3.1-70b-instruct` | 85.0 (~87) | 100 (~95) | 64.7 (~66) |
+| `llama-3.1-8b-instruct` | 83.2 (~80) | 83.3 (~84) | 42.0 (~48) |
+| `qwen-2.5-72b-instruct` | 86.7 (~84) | 96.7 (~96) | 65.3 (~58–71) |
+| `qwen-2.5-7b-instruct` | 74.8 (~75) | 86.7 (~85) | 57.3 (~56) |
+| `gpt-4o` | 86.5 (~87) | 93.3 (~96) | 70.7 (~73) |
+| `gpt-4o-mini` | 83.4 (~86) | 96.7 (~93) | 60.7 (~63) |
+
+(100-prompt IFEval / 30-problem GSM8K / 150-question MMLU-Pro subsets, so a few
+points of subset noise on top of 0-shot-vs-few-shot protocol differences.
+`llama-3.1-8b` MMLU-Pro is low because its small output limit still truncated ~21
+answers even at 8192.)
+
+> **Gateway gotcha found here.** Requesting `max_tokens` beyond a model's output
+> limit made the TR gateway return an opaque **502 "provider error"** (sometimes an
+> empty 200), silently zeroing the small-output anchors (gpt-4o/-mini, qwen-2.5,
+> llama-3.1) at the 32768 default. Re-running them at 8192 fixed it. The gateway is
+> being upgraded to surface the real upstream 4xx (e.g. "max_tokens is too large")
+> instead of masking it. Big reasoning models are unaffected (they accept 32768).
+
 ## Method
 
 Calibration runs use the same harness, full dataset, and the published model
