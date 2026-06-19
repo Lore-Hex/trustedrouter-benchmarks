@@ -96,6 +96,13 @@ def chat(
     params: dict[str, Any] = {"temperature": temperature, "max_tokens": max_tokens}
     if extra_body:
         params.update(extra_body)
+    # Pin the upstream provider for the whole run via env (e.g. route every
+    # request through the confidential TEE tier: TRBENCH_PROVIDER=tinfoil). Sent
+    # as the OpenRouter-style `provider.only` filter; a model the provider doesn't
+    # serve then 400s "no route candidates" rather than silently using another.
+    provider = os.environ.get("TRBENCH_PROVIDER")
+    if provider and "provider" not in params:
+        params["provider"] = {"only": [p.strip() for p in provider.split(",") if p.strip()]}
     cli = _sdk_client(base_url, api_key, timeout)
 
     last_error = "unknown"
