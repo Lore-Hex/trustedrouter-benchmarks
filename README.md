@@ -79,24 +79,31 @@ sandbox — just 541 prompts scored by Google's deterministic verifiers.
 
 <!-- IFEVAL_RESULTS_START -->
 
-IFEval snapshot: `2026-06-17T19:39:21.984871+00:00` via `api.trustedrouter.com`. 100-prompt subset, 10 models. Deterministic Python verifiers (no judge). Five panel models (`minimax/minimax-m3`, `xiaomi/mimo-v2.5-pro`, `z-ai/glm-5.2`, `deepseek/deepseek-v3.2`, `moonshotai/kimi-k2.6`) are omitted: their TrustedRouter routes errored on >5% of prompts during this run and will be re-run rather than published at face value. The low open-model scores are real, not truncation — those models emit very long zero-shot outputs (GLM-5.1 median ~6.7k chars) that blow IFEval's strict length/format/start-end constraints, while the concise frontier models keep them.
+IFEval snapshot: `2026-06-17T19:39:21.984871+00:00` via `api.trustedrouter.com`. 100 prompts, 11 models. Deterministic Python verifiers (no judge).
 
 ![IFEval chart](assets/ifeval.svg)
 
 | Rank | Model | IFEval | Prompt-strict | Prompt-loose | Inst-strict | Inst-loose | Errors |
 |---:|---|---:|---:|---:|---:|---:|---:|
 | 1 | `google/gemini-3.1-pro-preview` | 98.4 | 98.0 | 98.0 | 98.8 | 98.8 | 0 |
-| 2 | `openai/gpt-5.5` | 96.4 | 96.0 | 95.0 | 97.5 | 96.9 | 0 |
-| 3 | `tencent/hy3-preview` | 92.0 | 88.0 | 93.0 | 92.0 | 95.1 | 0 |
-| 4 | `anthropic/claude-opus-4.8` | 91.1 | 88.0 | 90.0 | 92.6 | 93.9 | 0 |
-| 5 | `deepseek/deepseek-v4-flash` | 50.6 | 36.0 | 50.0 | 52.1 | 64.4 | 0 |
-| 6 | `xiaomi/mimo-v2.5` | 37.6 | 27.0 | 30.0 | 44.8 | 48.5 | 0 |
-| 7 | `deepseek/deepseek-v4-pro` | 36.5 | 24.0 | 30.0 | 42.9 | 49.1 | 2 |
+| 2 | `openai/gpt-5.5` | 95.2 | 94.0 | 94.0 | 96.3 | 96.3 | 0 |
+| 3 | `z-ai/glm-5.2` | 93.9 | 94.0 | 94.0 | 93.9 | 93.9 | 4 |
+| 4 | `anthropic/claude-opus-4.8` | 91.5 | 87.0 | 92.0 | 92.0 | 95.1 | 0 |
+| 5 | `tencent/hy3-preview` | 91.2 | 87.0 | 92.0 | 91.4 | 94.5 | 0 |
+| 6 | `deepseek/deepseek-v4-flash` | 50.2 | 35.0 | 50.0 | 51.5 | 64.4 | 0 |
+| 7 | `xiaomi/mimo-v2.5` | 37.6 | 27.0 | 30.0 | 44.8 | 48.5 | 0 |
 | 8 | `moonshotai/kimi-k2.7-code` | 36.5 | 23.0 | 34.0 | 41.1 | 47.9 | 4 |
-| 9 | `z-ai/glm-5` | 32.1 | 22.0 | 25.0 | 39.9 | 41.7 | 3 |
-| 10 | `z-ai/glm-5.1` | 32.1 | 23.0 | 23.0 | 41.1 | 41.1 | 4 |
+| 9 | `deepseek/deepseek-v4-pro` | 36.2 | 24.0 | 30.0 | 42.3 | 48.5 | 2 |
+| 10 | `z-ai/glm-5` | 32.1 | 22.0 | 25.0 | 39.9 | 41.7 | 3 |
+| 11 | `z-ai/glm-5.1` | 32.1 | 23.0 | 23.0 | 41.1 | 41.1 | 4 |
 
 <!-- IFEVAL_RESULTS_END -->
+
+> **`z-ai/glm-5.2` is scored via the `tinfoil` confidential provider.** Its default
+> TrustedRouter route returns empty responses (a provider bug) — at face value it
+> scored near-zero and was omitted. Routed through tinfoil it answers cleanly (0
+> empty) and lands at its real level (#3 here). Reproduce: `TRBENCH_PROVIDER=tinfoil`.
+> The same applies to its MMLU-Pro row below.
 
 ## Run GSM8K
 
@@ -329,8 +336,8 @@ MMLU-Pro snapshot: `2026-06-19T04:56:04.874288+00:00` via `api.trustedrouter.com
 | 10 | `google/gemini-3.1-pro-preview` | 83.3 | 125 | 150 | 0 | 4 |
 | 11 | `xiaomi/mimo-v2.5-pro` | 82.0 | 123 | 150 | 1 | 0 |
 | 12 | `z-ai/glm-5` | 82.0 | 123 | 150 | 2 | 0 |
-| 13 | `z-ai/glm-5.1` | 80.7 | 121 | 150 | 5 | 0 |
-| 14 | `tencent/hy3-preview` | 76.0 | 114 | 150 | 5 | 0 |
-| 15 | `z-ai/glm-5.2` | 7.3 | 11 | 150 | 137 | 0 |
+| 13 | `z-ai/glm-5.2` | 82.0 | 123 | 150 | 0 | 14 |
+| 14 | `z-ai/glm-5.1` | 80.7 | 121 | 150 | 5 | 0 |
+| 15 | `tencent/hy3-preview` | 76.0 | 114 | 150 | 5 | 0 |
 
 <!-- MMLU_PRO_RESULTS_END -->
