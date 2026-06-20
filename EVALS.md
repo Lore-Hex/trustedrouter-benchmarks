@@ -23,10 +23,17 @@ item counts, deterministic or short judges, and no exotic infra.
 - **Harness:** aider's own benchmark harness pointed at the TR base_url. Needs the six language toolchains (Docker).
 - **Caveat:** part of the published spread reflects model *size*; unproven for the very latest gen.
 
-### Terminal-Bench 2.0 — agentic terminal/coding
-- **What:** Terminus 2 harness; the widest discriminating range in the field (SOTA 84.7% → floor 3.1%).
-- **Distinguishing:** **best per-model Chinese ranking** on a fixed harness — GLM-5 52.4 > Kimi K2.5 43.2 > DeepSeek-V3.2 39.6 > Kimi-K2-Thinking 35.7 > GLM-4.7 33.4 > … > Qwen3-Coder 23.9. (GLM-4.6 ≈ Qwen3-Coder are a tie.)
-- **Cost:** agentic + Docker sandbox + multi-turn → **expensive on a full run; use a small-N task subset** to stay cheap.
+### Terminal-Bench — agentic terminal/coding ✅ (built)
+- **What:** drive the upstream `tb` CLI (laude-institute/terminal-bench, Apache-2.0) as a subprocess per model; agent runs in a Docker sandbox, scored by each task's own unit tests (no judge). `trbench/evals/terminal_bench/run.py`.
+- **Harness gotchas (hard-won):** use the **`terminus-2`** agent, NOT `terminus-1` — terminus-1 demands strict JSON output and fatally bails (`fatal_llm_parse_error`) on prose-emitting models (deepseek-v4-flash scored 1/10 from parse failures alone). Default is a **curated 10-task subset** biased toward arch-portable pure-Python/C tasks (the qemu/kernel-build tasks are amd64-only and won't build on Apple Silicon). Run resumable (per-model JSONL sidecar + `--resume`).
+- **Distinguishing:** **best per-model Chinese ranking** on a fixed harness — GLM-5 52.4 > Kimi K2.5 43.2 > DeepSeek-V3.2 39.6 > Kimi-K2-Thinking 35.7 > GLM-4.7 33.4 > … > Qwen3-Coder 23.9.
+- **Cost:** the 10-task curated subset is CHEAP (~$5–15 for the whole panel); the $1k–50k scare numbers are full 89-task runs with frontier reasoners hitting 100M-token outlier tasks. ⚠️ Do NOT run concurrently with a network-heavy eval (BEAM) — Docker resource starvation zeros every model (`unknown_agent_error`). Run heavy evals sequentially.
+
+### BEAM 128K — long-context memory ✅ (built)
+- **What:** "Beyond a Million Tokens" (ICLR 2026), HF `Mohammadta/BEAM` split `100K` — 20 conversations ~127K tokens each, 10 memory-ability categories (abstention, contradiction resolution, event ordering, info extraction, instruction/preference following, knowledge update, multi-session/temporal reasoning, summarization). `trbench/evals/beam/`.
+- **Scoring:** BEAM's unified rubric judge (GPT-4.1 scores each rubric item 0/0.5/1.0 → item mean → overall mean across categories). Loader parses BEAM's Python-repr `probing_questions` via `ast.literal_eval` (NOT json), flattens batched chat turns to standard messages.
+- **Distinguishing:** discriminates well — opus 81.7 ≫ glm-5.2 63.7 ≈ mimo 62.5 (mini-panel). No published Chinese-panel numbers exist → novel data.
+- **Cost:** scales with INPUT price × 127K context. Run the open-weight set (frontier refs are $343 of a $593 full-19-model/200-item panel). Reasoners need `--max-tokens 8192` (thinking truncates the final answer to empty at 1-2K → grades 0). Resumable (per-item JSONL + `--resume`).
 
 ### SimpleQA Verified — closed-book factuality
 - **What:** 1,000 prompts (Google DeepMind), **run with no tools** (search → near-100%). Unsaturated: Gemini 2.5 Pro F1 55.6 → 11.1.
