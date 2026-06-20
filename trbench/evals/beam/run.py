@@ -54,8 +54,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--models", default=None)
     parser.add_argument("--base-url", default=client.DEFAULT_BASE_URL)
     parser.add_argument("--api-key", default=None)
-    # BEAM answers are expected concise — long reasoning models still need room
-    parser.add_argument("--max-tokens", type=int, default=2048)
+    # BEAM answers are concise, but heavy reasoners (opus-4.8) spend the budget
+    # thinking and truncate to an empty final answer at 1-2K — that grades 0 and
+    # wrongly sinks the strongest models. 8192 gives reasoning room; output cost is
+    # tiny next to the 127K-token input anyway.
+    parser.add_argument("--max-tokens", type=int, default=8192)
     parser.add_argument("--timeout", type=float, default=300.0)
     # Lower concurrency: each request carries a 128K context
     parser.add_argument("--concurrency", type=int, default=4)

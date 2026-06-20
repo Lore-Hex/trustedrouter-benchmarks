@@ -117,8 +117,10 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run Terminal-Bench on a TrustedRouter panel (agentic coding).")
     parser.add_argument("--models", default=None, help="Panel name or comma list of TR model ids.")
     parser.add_argument("--dataset", default=DEFAULT_DATASET)
-    parser.add_argument("--agent", default="terminus",
-                        help="Terminal-Bench agent (terminus, terminus-2, ...).")
+    parser.add_argument("--agent", default="terminus-2",
+                        help="Terminal-Bench agent. terminus-2 (default) is robust to free-form "
+                             "model output; terminus-1 demands strict JSON and fatally bails "
+                             "(fatal_llm_parse_error) on models that emit prose.")
     parser.add_argument("--tasks", default=None,
                         help="Comma list of task IDs. Default = curated 10-task subset.")
     parser.add_argument("--n-concurrent", type=int, default=2)
