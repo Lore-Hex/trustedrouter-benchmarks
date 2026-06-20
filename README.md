@@ -238,19 +238,19 @@ SimpleQA Verified snapshot: `2026-06-17T13:23:05.762381+00:00`. 250 closed-book 
 
 | Rank | Model | F-score | Correct% | Attempted% | Acc|attempted | Empty | Errors |
 |---:|---|---:|---:|---:|---:|---:|---:|
-| 1 | `deepseek/deepseek-v4-pro` | 55.0 | 52.7 | 91.7 | 57.5 | 0 | 9 |
+| 1 | `deepseek/deepseek-v4-pro` | 55.1 | 52.7 | 91.3 | 57.7 | 0 | 9 |
 | 2 | `anthropic/claude-opus-4.8` | 53.1 | 40.8 | 53.6 | 76.1 | 0 | 0 |
-| 3 | `z-ai/glm-5.1` | 49.7 | 43.2 | 74.0 | 58.4 | 0 | 0 |
-| 4 | `moonshotai/kimi-k2.6` | 49.2 | 43.2 | 75.6 | 57.1 | 0 | 0 |
-| 5 | `z-ai/glm-5` | 46.1 | 44.4 | 92.8 | 47.8 | 0 | 0 |
-| 6 | `moonshotai/kimi-k2.7-code` | 39.8 | 27.4 | 37.8 | 72.5 | 0 | 9 |
-| 7 | `deepseek/deepseek-v4-flash` | 37.7 | 33.3 | 76.8 | 43.4 | 0 | 4 |
-| 8 | `xiaomi/mimo-v2.5-pro` | 34.0 | 29.6 | 74.0 | 40.0 | 0 | 0 |
-| 9 | `tencent/hy3-preview` | 27.6 | 27.2 | 96.8 | 28.1 | 0 | 0 |
-| 10 | `deepseek/deepseek-v3.2` | 26.0 | 25.6 | 97.2 | 26.4 | 0 | 4 |
-| 11 | `minimax/minimax-m3` | 24.1 | 17.6 | 46.0 | 38.3 | 0 | 0 |
-| 12 | `xiaomi/mimo-v2.5` | 21.1 | 19.6 | 86.0 | 22.8 | 0 | 0 |
-| 13 | `z-ai/glm-5.2` | 6.1 | 3.2 | 4.8 | 66.7 | 231 | 0 |
+| 3 | `z-ai/glm-5.1` | 51.6 | 45.2 | 75.2 | 60.1 | 0 | 0 |
+| 4 | `moonshotai/kimi-k2.6` | 49.7 | 43.2 | 74.0 | 58.4 | 0 | 0 |
+| 5 | `z-ai/glm-5.2` | 48.3 | 40.0 | 65.6 | 61.0 | 8 | 0 |
+| 6 | `z-ai/glm-5` | 46.5 | 44.8 | 92.8 | 48.3 | 0 | 0 |
+| 7 | `moonshotai/kimi-k2.7-code` | 41.1 | 28.6 | 39.4 | 72.6 | 0 | 9 |
+| 8 | `deepseek/deepseek-v4-flash` | 37.2 | 32.9 | 76.8 | 42.9 | 0 | 4 |
+| 9 | `xiaomi/mimo-v2.5-pro` | 33.6 | 29.2 | 73.6 | 39.7 | 0 | 0 |
+| 10 | `tencent/hy3-preview` | 28.0 | 27.6 | 96.8 | 28.5 | 0 | 0 |
+| 11 | `deepseek/deepseek-v3.2` | 25.9 | 25.6 | 97.6 | 26.2 | 0 | 4 |
+| 12 | `minimax/minimax-m3` | 24.1 | 17.6 | 46.0 | 38.3 | 0 | 0 |
+| 13 | `xiaomi/mimo-v2.5` | 20.9 | 19.6 | 87.6 | 22.4 | 0 | 0 |
 
 <!-- SIMPLEQA_VERIFIED_RESULTS_END -->
 
