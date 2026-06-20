@@ -341,3 +341,9 @@ MMLU-Pro snapshot: `2026-06-19T04:56:04.874288+00:00` via `api.trustedrouter.com
 | 15 | `tencent/hy3-preview` | 76.0 | 114 | 150 | 5 | 0 |
 
 <!-- MMLU_PRO_RESULTS_END -->
+
+<!-- BEAM_128K_RESULTS_START -->
+
+*BEAM 128K results coming soon.*
+
+<!-- BEAM_128K_RESULTS_END -->
