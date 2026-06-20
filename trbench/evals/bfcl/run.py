@@ -37,12 +37,13 @@ def decode_tool_calls(tool_calls: list[dict] | None) -> list[dict]:
     return out
 
 
-def _answer_one(it: dict, model: str, base_url: str, api_key: str, max_tokens: int, timeout: float) -> dict:
+def _answer_one(it: dict, model: str, base_url: str, api_key: str, max_tokens: int, timeout: float,
+                extra_body: dict | None = None) -> dict:
     tools = to_openai_tools(it["functions"])
     r = client.chat(
         base_url=base_url, api_key=api_key, model=model,
         messages=it["messages"], tools=tools, max_tokens=max_tokens,
-        temperature=0.0, timeout=timeout,
+        temperature=0.0, timeout=timeout, extra_body=extra_body,
     )
     row = {
         "model": model, "id": it["id"], "category": it["category"],
@@ -69,8 +70,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max-tokens", type=int, default=1024)
     parser.add_argument("--timeout", type=float, default=120.0)
     parser.add_argument("--concurrency", type=int, default=8)
+    parser.add_argument("--extra-body", default=None,
+                        help='JSON merged into the request body, e.g. fusion config: '
+                             '\'{"plugins":[{"id":"fusion","judge_models":["..."],"final_models":["..."]}]}\'')
     parser.add_argument("--out", default="results/bfcl.json")
     args = parser.parse_args(argv)
+    extra_body = json.loads(args.extra_body) if args.extra_body else None
 
     api_key = client.api_key_from_env(args.api_key)
     models = resolve_panel(args.models)
@@ -82,7 +87,7 @@ def main(argv: list[str] | None = None) -> int:
     for model in models:
         print(f"  answering: {model} ({len(items)} items)")
         with ThreadPoolExecutor(max_workers=max(1, args.concurrency)) as pool:
-            futs = [pool.submit(_answer_one, it, model, args.base_url, api_key, args.max_tokens, args.timeout) for it in items]
+            futs = [pool.submit(_answer_one, it, model, args.base_url, api_key, args.max_tokens, args.timeout, extra_body) for it in items]
             for f in as_completed(futs):
                 responses.append(f.result())
 
