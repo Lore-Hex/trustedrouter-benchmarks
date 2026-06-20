@@ -92,13 +92,12 @@ def main(argv: list[str] | None = None) -> int:
             if not line.strip():
                 continue
             row = json.loads(line)
-            # NEVER treat an errored row (402 credit-out, 502, timeout) OR a
-            # clean-but-empty row as done — both must RE-RUN, not be skipped.
-            # Empty-text-no-error is almost always a transient provider glitch
-            # (verified: gemma-4 empties return real answers on retry); one retry
-            # pass recovers them. A later good row supersedes the bad one in the
-            # append-only sidecar.
-            if row.get("error") or not (row.get("text") or "").strip():
+            # Re-run only TRANSPORT errors (402 credit-out, 502, timeout) — those
+            # aren't the model's answer. Do NOT re-run a clean-but-empty response:
+            # an empty IS the model's output (e.g. it declined to answer), and
+            # BEAM's grader scores a non-responsive answer 0. Retrying empties would
+            # overwrite a genuine decline with a forced (often confabulated) answer.
+            if row.get("error"):
                 errors_skipped += 1
                 continue
             best[(row["model"], row["id"])] = row

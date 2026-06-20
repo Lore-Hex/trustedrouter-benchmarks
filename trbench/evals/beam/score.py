@@ -16,33 +16,19 @@ from pathlib import Path
 from trbench import client, report
 from trbench.evals.beam.loader import QUESTION_TYPES
 
-DEFAULT_JUDGE = "openai/gpt-4.1"
+# BEAM's canonical judge is gpt-4.1-mini (src/llm.py: gpt_llm_obj model_name="gpt-4.1-mini",
+# temperature=0) — NOT the full gpt-4.1. Matching the judge model is part of reproducing
+# the paper's numbers (a bigger/different judge grades more leniently).
+DEFAULT_JUDGE = "openai/gpt-4.1-mini"
 
-# Adapted from BEAM's unified_llm_judge_base_prompt (mohammadtavakoli78/BEAM/src/prompts.py)
-JUDGE_PROMPT = """You are an expert evaluator judging whether an LLM's response meets a specific rubric criterion.
-
-## INPUTS
-- QUESTION: <question>
-- RUBRIC CRITERION: <rubric_item>
-- MODEL RESPONSE: <response>
-
-## RULES
-1. If the response does not address the QUESTION at all, score 0.0.
-2. Judge by meaning, not exact wording. Accept paraphrases, synonyms, and equivalent numeric forms.
-3. Negative constraints ("should NOT mention X") require BOTH that the response is on-topic AND that X is absent.
-4. Ignore tone, length, and formatting unless the rubric explicitly requires a specific format.
-
-## SCORING
-Respond ONLY with a JSON object, nothing else:
-{"score": 0.0}   # No compliance
-{"score": 0.5}   # Partial compliance
-{"score": 1.0}   # Full compliance
-
-Include a brief "reason" field if helpful for debugging."""
+# BEAM's EXACT judge prompt, vendored verbatim (see beam_grader_prompt.py). Using
+# the canonical grader — not a reimplementation — is what makes our scores
+# comparable to the paper. BEAM replaces ONLY <rubric_item> and <llm_response> at
+# call time (it leaves <question> a literal placeholder — replicated for fidelity).
+from trbench.evals.beam.beam_grader_prompt import UNIFIED_LLM_JUDGE_PROMPT  # noqa: E402
 
 
 def _judge_rubric_item(
-    question: str,
     rubric_item: str,
     response: str,
     judge_model: str,
@@ -50,33 +36,19 @@ def _judge_rubric_item(
     api_key: str,
     timeout: float,
 ) -> float:
-    prompt = (
-        JUDGE_PROMPT
-        .replace("<question>", question)
-        .replace("<rubric_item>", rubric_item)
-        .replace("<response>", response)
-    )
+    # BEAM: prompt.replace("<rubric_item>", item).replace("<llm_response>", llm_response)
+    prompt = UNIFIED_LLM_JUDGE_PROMPT.replace("<rubric_item>", rubric_item).replace("<llm_response>", response)
     r = client.chat(
-        base_url=base_url,
-        api_key=api_key,
-        model=judge_model,
+        base_url=base_url, api_key=api_key, model=judge_model,
         messages=[{"role": "user", "content": prompt}],
-        max_tokens=128,
-        temperature=0.0,
-        timeout=timeout,
+        max_tokens=512, temperature=0.0, timeout=timeout,
     )
     text = r.get("text", "") or ""
-    # Parse JSON score from response
-    m = re.search(r'"score"\s*:\s*([01](?:\.\d+)?)', text)
-    if m:
-        return float(m.group(1))
-    # Fallback: look for bare number
-    m = re.search(r'\b([01](?:\.\d+)?)\b', text)
+    m = re.search(r'"score"\s*:\s*(1(?:\.0+)?|0(?:\.\d+)?)', text)
     if m:
         v = float(m.group(1))
-        if v in (0.0, 0.5, 1.0):
-            return v
-    return 0.0  # conservative default on parse failure
+        return v if v in (0.0, 0.5, 1.0) else 0.0
+    return 0.0  # BEAM defaults a non-parseable judgment toward no-compliance
 
 
 def _score_response(
@@ -88,17 +60,29 @@ def _score_response(
 ) -> dict:
     rubric = resp.get("rubric", [])
     text = resp.get("text", "") or ""
-    question = resp.get("question", "")
+    qtype = resp.get("question_type", "")
 
-    if resp.get("error") or not text.strip():
-        return {**resp, "rubric_scores": [0.0] * len(rubric), "item_score": 0.0, "is_error": True}
+    # Transport error (402/502/timeout) = infra, not a model answer → exclude.
+    if resp.get("error"):
+        return {**resp, "rubric_scores": [], "item_score": 0.0, "is_error": True}
 
-    scores = [
-        _judge_rubric_item(question, item, text, judge_model, base_url, api_key, timeout)
+    # Empty model response is NOT excluded: BEAM's judge scores a non-responsive
+    # answer 0 (and the paper's "explicit-only" abstention means silence fails).
+    # Short-circuit empties to 0 across the rubric rather than spend judge calls.
+    if not text.strip():
+        return {**resp, "rubric_scores": [0.0] * len(rubric), "item_score": 0.0, "is_error": False}
+
+    raw = [
+        _judge_rubric_item(item, text, judge_model, base_url, api_key, timeout)
         for item in rubric
     ]
-    item_score = sum(scores) / len(scores) if scores else 0.0
-    return {**resp, "rubric_scores": scores, "item_score": item_score, "is_error": False}
+    # BEAM aggregation: 9 rubric types floor each item with int() (0.5 → 0, binary
+    # full-compliance); event_ordering keeps the float. Mean across rubric items.
+    if qtype == "event_ordering":
+        item_score = sum(raw) / len(raw) if raw else 0.0
+    else:
+        item_score = sum(int(s) for s in raw) / len(raw) if raw else 0.0
+    return {**resp, "rubric_scores": raw, "item_score": item_score, "is_error": False}
 
 
 def main(argv: list[str] | None = None) -> int:
