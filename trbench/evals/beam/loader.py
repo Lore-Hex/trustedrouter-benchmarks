@@ -163,5 +163,26 @@ def load(limit: int | None = None, questions_per_type: int | None = None) -> lis
 
     if limit is None or limit >= len(full):
         return full
-    stride = len(full) / limit
-    return [full[int(i * stride)] for i in range(limit)]
+    # TYPE-BALANCED subset: a flat stride over the (conversation-then-type-ordered)
+    # list collapses to only a couple of memory types (e.g. limit=40 → just
+    # abstention + knowledge_update), making "overall across 10 abilities"
+    # misrepresent 2. Instead take a round-robin across the 10 question types so
+    # every ability is represented ~equally. Stable order (no shuffle) for resume.
+    by_type: dict[str, list[dict]] = {qt: [] for qt in QUESTION_TYPES}
+    for it in full:
+        by_type.setdefault(it["question_type"], []).append(it)
+    picked: list[dict] = []
+    round_idx = 0
+    while len(picked) < limit:
+        added_any = False
+        for qt in QUESTION_TYPES:
+            bucket = by_type.get(qt, [])
+            if round_idx < len(bucket):
+                picked.append(bucket[round_idx])
+                added_any = True
+                if len(picked) >= limit:
+                    break
+        if not added_any:
+            break
+        round_idx += 1
+    return picked

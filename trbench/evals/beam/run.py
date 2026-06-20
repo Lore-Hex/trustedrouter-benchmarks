@@ -86,13 +86,27 @@ def main(argv: list[str] | None = None) -> int:
     done_keys: set[tuple[str, str]] = set()
     responses: list[dict] = []
     if args.resume and sidecar.exists():
+        errors_skipped = 0
+        best: dict[tuple[str, str], dict] = {}
         for line in sidecar.read_text(encoding="utf-8").splitlines():
             if not line.strip():
                 continue
             row = json.loads(line)
-            done_keys.add((row["model"], row["id"]))
+            # NEVER treat an errored row (402 credit-out, 502, timeout) OR a
+            # clean-but-empty row as done — both must RE-RUN, not be skipped.
+            # Empty-text-no-error is almost always a transient provider glitch
+            # (verified: gemma-4 empties return real answers on retry); one retry
+            # pass recovers them. A later good row supersedes the bad one in the
+            # append-only sidecar.
+            if row.get("error") or not (row.get("text") or "").strip():
+                errors_skipped += 1
+                continue
+            best[(row["model"], row["id"])] = row
+        for key, row in best.items():
+            done_keys.add(key)
             responses.append(row)
-        print(f"  resume: {len(done_keys)} answers already recorded", flush=True)
+        print(f"  resume: {len(done_keys)} good answers recorded, {errors_skipped} errored rows will re-run",
+              flush=True)
 
     sc = sidecar.open("a", encoding="utf-8")
     for model in models:
@@ -115,6 +129,12 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"    {done}/{len(todo)}", flush=True)
     sc.close()
 
+    # Filter to exactly (requested models × requested items): a resumed/--limit run
+    # must not leak stale sidecar rows (a model dropped from --models, or a model's
+    # extra answers from a larger prior --limit) into the result — that would score
+    # models on inconsistent item sets. Keep only the current run's (model,id) grid.
+    wanted = {(m, it["id"]) for m in models for it in items}
+    kept = [r for r in responses if (r["model"], r["id"]) in wanted]
     result = {
         "eval": "beam_128k",
         "dataset": "Mohammadta/BEAM (100K split)",
@@ -122,7 +142,7 @@ def main(argv: list[str] | None = None) -> int:
         "base_url_host": urllib.parse.urlparse(args.base_url).netloc,
         "models": models,
         "item_count": len(items),
-        "responses": sorted(responses, key=lambda r: (r["model"], r["id"])),
+        "responses": sorted(kept, key=lambda r: (r["model"], r["id"])),
     }
     out.write_text(json.dumps(result, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     print(f"wrote {out}", flush=True)
