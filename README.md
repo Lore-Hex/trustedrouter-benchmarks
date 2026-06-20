@@ -342,9 +342,54 @@ MMLU-Pro snapshot: `2026-06-19T04:56:04.874288+00:00` via `api.trustedrouter.com
 
 <!-- MMLU_PRO_RESULTS_END -->
 
+## Run BEAM 128K
+
+```bash
+export TRUSTEDROUTER_API_KEY="sk-..."   # a throwaway key
+uv add datasets                          # one-time, for the HF pull
+
+# generate answers (resumable; per-item JSONL sidecar)
+python -m trbench.evals.beam.run --models z-ai/glm-5.2,deepseek/deepseek-v4-pro \
+  --limit 40 --resume --out results/beam_128k_panel.json
+
+# judge (GPT-4.1 rubric) + render chart + splice README
+python -m trbench.evals.beam.score results/beam_128k_panel.json --readme README.md
+```
+
+[BEAM](https://github.com/mohammadtavakoli78/BEAM) ("Beyond a Million Tokens",
+ICLR 2026) tests long-term memory: each probing question ships with its full
+~128K-token conversation, and the model must answer from memory across 10
+abilities (info extraction, temporal/multi-hop reasoning, abstention,
+contradiction resolution, etc.). Scored by BEAM's rubric judge (each rubric item
+0/0.5/1.0). The `--limit` subset is **type-balanced** (equal items per ability)
+so "overall across 10 abilities" stays honest; reasoners need `--max-tokens 8192`
+(thinking truncates a 1–2K budget to empty). Cost scales with each model's input
+price × the 128K context, so this is the open-weight panel only (frontier refs at
+128K are ~$130/model each).
+
+> **Abstention scores near 0 because the models confabulate, not because the
+> judge is wrong** (verified). On unanswerable questions (e.g. "how did user
+> feedback influence my UI changes?" when the chat never links the two) the
+> expected answer is *"there's no information about that"* — but the models invent
+> a plausible causal link instead. This confabulation-over-abstention is exactly
+> the long-context failure BEAM is built to surface; only MiniMax M3 abstained on
+> any. Per-ability cells are noisy (4 items each at `--limit 40`); the **Overall**
+> column is the reliable comparison.
+
 <!-- BEAM_128K_RESULTS_START -->
 
-*BEAM 128K results coming soon.*
+BEAM 128K snapshot: `2026-06-20T12:03:12.956958+00:00`. 40 probing questions across 20 conversations (~128K tokens each). Rubric-based LLM judge (openai/gpt-4.1). Overall = mean across 10 memory-ability categories.
+
+![BEAM 128K chart](assets/beam_128k.svg)
+
+| Rank | Model | Overall | Info Extr. | Temporal | Multi-hop | Abstention | Errors |
+|---:|---|---:|---:|---:|---:|---:|---:|
+| 1 | `moonshotai/kimi-k2.7-code` | 72.5 | 100.0 | 68.8 | 75.0 | 0.0 | 0 |
+| 2 | `z-ai/glm-5.2` | 71.8 | 87.5 | 81.2 | 75.0 | 0.0 | 0 |
+| 3 | `deepseek/deepseek-v4-pro` | 68.7 | 100.0 | 75.0 | 62.5 | 0.0 | 0 |
+| 4 | `z-ai/glm-5.1` | 67.8 | 70.8 | 68.8 | 37.5 | 0.0 | 0 |
+| 5 | `minimax/minimax-m3` | 63.0 | 95.8 | 56.2 | 31.2 | 50.0 | 0 |
+| 6 | `google/gemma-4-31b-it` | 62.7 | 100.0 | 87.5 | 31.2 | 0.0 | 0 |
 
 <!-- BEAM_128K_RESULTS_END -->
 
