@@ -65,30 +65,52 @@ def main(argv: list[str] | None = None) -> int:
         help="Questions per (conversation, type) pair. Default=1 ≈ 200 items total. Use 0 for all.",
     )
     parser.add_argument("--out", default="results/beam_128k.json")
+    parser.add_argument("--resume", action="store_true",
+                        help="Skip (model,id) pairs already in the sidecar JSONL.")
     args = parser.parse_args(argv)
 
     api_key = client.api_key_from_env(args.api_key)
     models = resolve_panel(args.models)
     qpt = args.questions_per_type if args.questions_per_type > 0 else None
     items = load(limit=args.limit, questions_per_type=qpt)
-    print(f"beam-128k: {len(models)} models × {len(items)} questions")
+    print(f"beam-128k: {len(models)} models × {len(items)} questions", flush=True)
 
+    # Per-item sidecar JSONL: each answer is appended immediately, so a killed run
+    # loses nothing and --resume skips done pairs (the 127K-context run is long).
+    out = Path(args.out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    sidecar = out.with_suffix(".jsonl")
+    done_keys: set[tuple[str, str]] = set()
     responses: list[dict] = []
+    if args.resume and sidecar.exists():
+        for line in sidecar.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            done_keys.add((row["model"], row["id"]))
+            responses.append(row)
+        print(f"  resume: {len(done_keys)} answers already recorded", flush=True)
+
+    sc = sidecar.open("a", encoding="utf-8")
     for model in models:
-        print(f"  answering: {model}")
+        todo = [it for it in items if (model, it["id"]) not in done_keys]
+        print(f"  answering: {model} ({len(todo)}/{len(items)} to do)", flush=True)
         with ThreadPoolExecutor(max_workers=max(1, args.concurrency)) as pool:
             futs = {
                 pool.submit(
                     _answer_one, it, model,
                     args.base_url, api_key, args.max_tokens, args.timeout,
                 ): it
-                for it in items
+                for it in todo
             }
             for done, f in enumerate(as_completed(futs), 1):
                 row = f.result()
                 responses.append(row)
-                if done % 20 == 0:
-                    print(f"    {done}/{len(items)}")
+                sc.write(json.dumps(row, ensure_ascii=False) + "\n")
+                sc.flush()
+                if done % 10 == 0 or done == len(todo):
+                    print(f"    {done}/{len(todo)}", flush=True)
+    sc.close()
 
     result = {
         "eval": "beam_128k",
@@ -99,10 +121,8 @@ def main(argv: list[str] | None = None) -> int:
         "item_count": len(items),
         "responses": sorted(responses, key=lambda r: (r["model"], r["id"])),
     }
-    out = Path(args.out)
-    out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(result, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-    print(f"wrote {out}")
+    print(f"wrote {out}", flush=True)
     return 0
 
 
