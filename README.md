@@ -352,7 +352,7 @@ uv add datasets                          # one-time, for the HF pull
 python -m trbench.evals.beam.run --models z-ai/glm-5.2,deepseek/deepseek-v4-pro \
   --limit 40 --resume --out results/beam_128k_panel.json
 
-# judge (GPT-4.1 rubric) + render chart + splice README
+# judge (BEAM's exact grader: gpt-4.1-mini) + render chart + splice README
 python -m trbench.evals.beam.score results/beam_128k_panel.json --readme README.md
 ```
 
@@ -360,39 +360,48 @@ python -m trbench.evals.beam.score results/beam_128k_panel.json --readme README.
 ICLR 2026) tests long-term memory: each probing question ships with its full
 ~128K-token conversation, and the model must answer from memory across 10
 abilities (info extraction, temporal/multi-hop reasoning, abstention,
-contradiction resolution, etc.). Scored by BEAM's rubric judge (each rubric item
-0/0.5/1.0). The `--limit` subset is **type-balanced** (equal items per ability)
-so "overall across 10 abilities" stays honest; reasoners need `--max-tokens 8192`
-(thinking truncates a 1–2K budget to empty). Cost scales with each model's input
-price × the 128K context, so this is the open-weight panel only (frontier refs at
-128K are ~$130/model each).
+contradiction resolution, etc.). We **vendor BEAM's exact grader verbatim**
+(`beam_grader_prompt.py` + `gpt-4.1-mini` judge + `int()` 0.5→0 flooring) rather
+than reimplement it. `--limit` is type-balanced (equal items per ability);
+reasoners need `--max-tokens 8192` (thinking truncates a 1–2K budget to empty).
+This is the open-weight panel + the paper's two baselines (`gpt-4.1-nano`,
+`llama-4-maverick-fp8`); cost scales with input price × the 128K context.
 
-> **Abstention scores near 0 because the models confabulate, not because the
-> judge is wrong** (verified by reading the answers). On unanswerable questions
-> (e.g. "how did user feedback influence my UI changes?" when the chat never links
-> the two) the gold answer is *"there's no information about that"* — but **no model
-> cleanly abstains.** kimi/deepseek/glm/gemma invent *specific false memories*
-> ("Turn 3,15 mentioned a dark-mode toggle…"); MiniMax M3 (the only non-zero,
-> 50.0) is least bad — it deflects to *generic textbook* answers rather than
-> fabricating project-specific history, which the judge credits on 2/4. This
-> confabulation-over-abstention is exactly the long-context failure BEAM surfaces.
-> Per-ability cells are noisy (4 items each at `--limit 40`); the **Overall**
-> column is the reliable comparison.
+> [!IMPORTANT]
+> **These numbers are NOT comparable to BEAM's published scores — only relative
+> within this harness.** Confirmed by running the paper's *own* baselines through
+> our harness: `gpt-4.1-nano` scores **49.9 here vs 23.9 in the paper** (~2×). The
+> grader is faithful (verbatim), so the gap is the **subset**: 4 items per ability
+> can't reproduce the paper's 2,000-question average, and our sampled 100K-tier
+> conversations are easier. So read the table **head-to-head** — our flagships
+> clearly beat the two lab baselines on identical items — not as "beats the BEAM
+> leaderboard." For paper-comparable absolutes, run the full ~400-question 100K tier.
+>
+> **The `Abstention` column is ~100 for everyone because BEAM's grader is
+> question-blind and credits confabulation.** BEAM substitutes only the rubric item
+> and the response into its judge prompt — never the question — so the rubric *"there
+> is no information related to X"* is misread as *"the response should describe X,"*
+> and a model that confabulates X gets **1.0** (verified directly). We keep the quirk
+> for fidelity to the published methodology, but the abstention cells don't measure
+> real abstention. (It may also explain why the paper reports abstention as the
+> *strongest* ability.)
 
 <!-- BEAM_128K_RESULTS_START -->
 
-BEAM 128K snapshot: `2026-06-20T12:03:12.956958+00:00`. 40 probing questions across 20 conversations (~128K tokens each). Rubric-based LLM judge (openai/gpt-4.1). Overall = mean across 10 memory-ability categories.
+BEAM 128K snapshot: `2026-06-20T12:03:12.956958+00:00`. 40 probing questions across 20 conversations (~128K tokens each). Rubric-based LLM judge (openai/gpt-4.1-mini). Overall = mean across 10 memory-ability categories.
 
 ![BEAM 128K chart](assets/beam_128k.svg)
 
 | Rank | Model | Overall | Info Extr. | Temporal | Multi-hop | Abstention | Errors |
 |---:|---|---:|---:|---:|---:|---:|---:|
-| 1 | `moonshotai/kimi-k2.7-code` | 72.5 | 100.0 | 68.8 | 75.0 | 0.0 | 0 |
-| 2 | `z-ai/glm-5.2` | 71.8 | 87.5 | 81.2 | 75.0 | 0.0 | 0 |
-| 3 | `deepseek/deepseek-v4-pro` | 68.7 | 100.0 | 75.0 | 62.5 | 0.0 | 0 |
-| 4 | `z-ai/glm-5.1` | 67.8 | 70.8 | 68.8 | 37.5 | 0.0 | 0 |
-| 5 | `minimax/minimax-m3` | 63.0 | 95.8 | 56.2 | 31.2 | 50.0 | 0 |
-| 6 | `google/gemma-4-31b-it` | 62.7 | 100.0 | 87.5 | 31.2 | 0.0 | 0 |
+| 1 | `z-ai/glm-5.2` | 88.6 | 100.0 | 62.5 | 100.0 | 100.0 | 0 |
+| 2 | `moonshotai/kimi-k2.7-code` | 87.6 | 100.0 | 75.0 | 100.0 | 100.0 | 0 |
+| 3 | `z-ai/glm-5.1` | 85.1 | 75.0 | 62.5 | 75.0 | 100.0 | 0 |
+| 4 | `deepseek/deepseek-v4-pro` | 78.4 | 100.0 | 62.5 | 87.5 | 100.0 | 0 |
+| 5 | `minimax/minimax-m3` | 66.0 | 100.0 | 50.0 | 62.5 | 100.0 | 0 |
+| 6 | `google/gemma-4-31b-it` | 63.2 | 91.7 | 75.0 | 25.0 | 100.0 | 0 |
+| 7 | `meta-llama/llama-4-maverick-17b-128e-instruct-fp8` | 51.0 | 91.7 | 62.5 | 25.0 | 100.0 | 0 |
+| 8 | `openai/gpt-4.1-nano` | 49.9 | 58.3 | 25.0 | 50.0 | 100.0 | 0 |
 
 <!-- BEAM_128K_RESULTS_END -->
 
