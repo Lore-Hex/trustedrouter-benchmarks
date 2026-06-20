@@ -131,6 +131,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--base-url", default=client.DEFAULT_BASE_URL)
     parser.add_argument("--api-key", default=None)
     parser.add_argument("--out", default="results/terminal_bench.json")
+    parser.add_argument("--resume", action="store_true",
+                        help="Skip models already in the sidecar JSONL.")
     parser.add_argument("--svg", default="assets/terminal_bench.svg")
     parser.add_argument("--readme", default=None)
     args = parser.parse_args(argv)
@@ -145,15 +147,39 @@ def main(argv: list[str] | None = None) -> int:
     output_root = Path(args.output_root).resolve()
     env = {**os.environ, "OPENAI_API_BASE": args.base_url, "OPENAI_API_KEY": api_key}
 
-    print(f"terminal-bench [{args.dataset}]: {len(models)} agents x {len(tasks)} tasks (agent={args.agent})")
+    print(f"terminal-bench [{args.dataset}]: {len(models)} agents x {len(tasks)} tasks (agent={args.agent})",
+          flush=True)
 
+    # Per-model sidecar JSONL: each model's row is appended as it finishes, so a kill
+    # mid-panel keeps completed models and --resume skips them (each model run is long).
+    out = Path(args.out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    sidecar = out.with_suffix(".jsonl")
+    done_models: set[str] = set()
     rows = []
+    if args.resume and sidecar.exists():
+        for line in sidecar.read_text(encoding="utf-8").splitlines():
+            if line.strip():
+                row = json.loads(line)
+                done_models.add(row["model"])
+                rows.append(row)
+        print(f"  resume: {len(done_models)} models already recorded", flush=True)
+
+    sc = sidecar.open("a", encoding="utf-8")
     for model in models:
-        rows.append(_run_one(
+        if model in done_models:
+            continue
+        row = _run_one(
             tb_bin=tb_bin, model=model, dataset=args.dataset, tasks=tasks, agent=args.agent,
             n_concurrent=args.n_concurrent, n_attempts=args.n_attempts, output_root=output_root,
             env=env, timeout=args.per_model_timeout, timeout_mult=args.timeout_multiplier,
-        ))
+        )
+        rows.append(row)
+        sc.write(json.dumps(row, ensure_ascii=False) + "\n")
+        sc.flush()
+        acc = row.get("accuracy", "err")
+        print(f"    {model}: accuracy={acc}", flush=True)
+    sc.close()
 
     good = [r for r in rows if "error" not in r]
     good.sort(key=lambda r: (-float(r["accuracy"]), -int(r["resolved"]), r["model"]))
