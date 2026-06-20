@@ -43,6 +43,17 @@ def api_key_from_env(explicit: str | None = None) -> str:
     )
 
 
+def extract_tool_calls(data: dict[str, Any]) -> list[dict[str, Any]] | None:
+    choices = data.get("choices")
+    if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+        message = choices[0].get("message")
+        if isinstance(message, dict):
+            calls = message.get("tool_calls")
+            if isinstance(calls, list) and calls:
+                return calls
+    return None
+
+
 def extract_text(data: dict[str, Any]) -> str:
     choices = data.get("choices")
     if isinstance(choices, list) and choices:
@@ -87,11 +98,20 @@ def chat(
     temperature: float = 0.0,
     timeout: float = 120.0,
     extra_body: dict[str, Any] | None = None,
+    tools: list[dict[str, Any]] | None = None,
+    tool_choice: Any | None = None,
     retries: int = DEFAULT_RETRIES,
     retry_backoff: float = 1.5,
 ) -> dict[str, Any]:
-    """One chat completion via the TrustedRouter SDK. Returns {text, usage,
-    latency_ms} or {error}. Transient failures retry; 4xx (other than 429) don't."""
+    """One chat completion via the TrustedRouter SDK. Returns {text, tool_calls?,
+    usage, latency_ms} or {error}. Transient failures retry; 4xx (other than 429)
+    don't.
+
+    Tool-calling (BFCL, agentic evals) goes through the SDK client's own
+    `request()` — a direct non-streaming POST — because the streaming
+    `chat_completions()` helper assembles the SSE stream and drops `tool_calls`.
+    The plain text path keeps `chat_completions()` (streaming tolerates the long
+    outputs that reasoning models produce). Both share this retry policy."""
     started = time.monotonic()
     params: dict[str, Any] = {"temperature": temperature, "max_tokens": max_tokens}
     if extra_body:
@@ -108,13 +128,23 @@ def chat(
     last_error = "unknown"
     for attempt in range(retries + 1):
         try:
-            data = cli.chat_completions(model=model, messages=messages, **params).model_dump()
-            return {
+            if tools is not None:
+                body: dict[str, Any] = {"model": model, "messages": messages, "tools": tools, **params}
+                if tool_choice is not None:
+                    body["tool_choice"] = tool_choice
+                data = cli.request("POST", "/chat/completions", json=body)
+            else:
+                data = cli.chat_completions(model=model, messages=messages, **params).model_dump()
+            result = {
                 "text": extract_text(data),
                 "usage": data.get("usage") if isinstance(data.get("usage"), dict) else {},
                 "latency_ms": round((time.monotonic() - started) * 1000),
                 "attempts": attempt + 1,
             }
+            calls = extract_tool_calls(data)
+            if calls is not None:
+                result["tool_calls"] = calls
+            return result
         except Exception as exc:  # noqa: BLE001
             code = getattr(exc, "status_code", None)
             last_error = (f"http_{code}: " if isinstance(code, int) else f"{type(exc).__name__}: ") + str(exc)[:600]
