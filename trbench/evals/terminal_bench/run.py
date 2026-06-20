@@ -50,17 +50,31 @@ DEFAULT_SUBSET = [
 DEFAULT_DATASET = "terminal-bench-core==0.1.1"
 
 
+_REPO_ROOT = Path(__file__).resolve().parents[3]              # trustedrouter-benchmarks/
+_SHIM_DIR = Path(__file__).resolve().parents[1] / "_tr_sdk_shim"  # sitecustomize that registers the SDK provider
+
+
 def _litellm_name(tr_model_id: str) -> str:
     """TR model id -> LiteLLM custom-OpenAI name. The `openai/` prefix routes to
     OPENAI_API_BASE; the rest is sent as `model`. Idempotent."""
     return tr_model_id if tr_model_id.startswith("openai/") and tr_model_id.count("/") >= 2 else f"openai/{tr_model_id}"
 
 
+def _model_arg(tr_model_id: str, use_sdk: bool) -> str:
+    """The `--model` litellm passes to the agent. With --use-sdk (default), the
+    `trustedrouter/` prefix routes every call through the TrustedRouter SDK (via
+    the litellm custom provider in trbench.tr_litellm, registered by the shim);
+    otherwise the generic `openai/` provider hits the OpenAI-compatible base URL."""
+    if use_sdk:
+        return tr_model_id if tr_model_id.startswith("trustedrouter/") else f"trustedrouter/{tr_model_id}"
+    return _litellm_name(tr_model_id)
+
+
 def _slug(model: str) -> str:
     return "trbench-" + re.sub(r"[^a-z0-9]+", "-", model.lower()).strip("-")
 
 
-def _run_one(*, tb_bin: str, model: str, dataset: str, tasks: list[str], agent: str,
+def _run_one(*, tb_bin: str, model: str, model_arg: str, dataset: str, tasks: list[str], agent: str,
              n_concurrent: int, n_attempts: int, output_root: Path, env: dict[str, str],
              timeout: float, timeout_mult: float) -> dict:
     run_id = _slug(model)
@@ -68,7 +82,7 @@ def _run_one(*, tb_bin: str, model: str, dataset: str, tasks: list[str], agent: 
     shutil.rmtree(run_dir, ignore_errors=True)  # clean run
 
     cmd = [
-        tb_bin, "run", "--agent", agent, "--model", _litellm_name(model),
+        tb_bin, "run", "--agent", agent, "--model", model_arg,
         "--dataset", dataset, "--output-path", str(output_root), "--run-id", run_id,
         "--n-concurrent", str(n_concurrent), "--n-attempts", str(n_attempts),
         "--global-timeout-multiplier", str(timeout_mult), "--cleanup",
@@ -133,6 +147,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--out", default="results/terminal_bench.json")
     parser.add_argument("--resume", action="store_true",
                         help="Skip models already in the sidecar JSONL.")
+    parser.add_argument("--use-sdk", dest="use_sdk", action=argparse.BooleanOptionalAction, default=True,
+                        help="Route the agent's calls through the TrustedRouter SDK (litellm custom "
+                             "provider). --no-use-sdk falls back to the OpenAI-compatible base URL.")
     parser.add_argument("--svg", default="assets/terminal_bench.svg")
     parser.add_argument("--readme", default=None)
     args = parser.parse_args(argv)
@@ -145,10 +162,23 @@ def main(argv: list[str] | None = None) -> int:
     tasks = [t.strip() for t in args.tasks.split(",") if t.strip()] if args.tasks else list(DEFAULT_SUBSET)
     models = resolve_panel(args.models)
     output_root = Path(args.output_root).resolve()
-    env = {**os.environ, "OPENAI_API_BASE": args.base_url, "OPENAI_API_KEY": api_key}
+    env = {**os.environ}
+    if args.use_sdk:
+        # Force the sitecustomize shim + repo root onto the tb subprocess PYTHONPATH
+        # so `trustedrouter/<model>` routes through the TrustedRouter SDK. The tb
+        # tool venv must have the SDK installed: `uv tool install terminal-bench
+        # --with /path/to/trusted-router-py`.
+        env["TRUSTEDROUTER_API_KEY"] = api_key
+        env["TRUSTEDROUTER_BASE_URL"] = args.base_url
+        env["PYTHONPATH"] = os.pathsep.join(
+            [str(_SHIM_DIR), str(_REPO_ROOT), os.environ.get("PYTHONPATH", "")]
+        ).rstrip(os.pathsep)
+    else:
+        env["OPENAI_API_BASE"] = args.base_url
+        env["OPENAI_API_KEY"] = api_key
 
-    print(f"terminal-bench [{args.dataset}]: {len(models)} agents x {len(tasks)} tasks (agent={args.agent})",
-          flush=True)
+    print(f"terminal-bench [{args.dataset}]: {len(models)} agents x {len(tasks)} tasks "
+          f"(agent={args.agent}, transport={'TR-SDK' if args.use_sdk else 'openai-base-url'})", flush=True)
 
     # Per-model sidecar JSONL: each model's row is appended as it finishes, so a kill
     # mid-panel keeps completed models and --resume skips them (each model run is long).
@@ -170,7 +200,8 @@ def main(argv: list[str] | None = None) -> int:
         if model in done_models:
             continue
         row = _run_one(
-            tb_bin=tb_bin, model=model, dataset=args.dataset, tasks=tasks, agent=args.agent,
+            tb_bin=tb_bin, model=model, model_arg=_model_arg(model, args.use_sdk),
+            dataset=args.dataset, tasks=tasks, agent=args.agent,
             n_concurrent=args.n_concurrent, n_attempts=args.n_attempts, output_root=output_root,
             env=env, timeout=args.per_model_timeout, timeout_mult=args.timeout_multiplier,
         )
