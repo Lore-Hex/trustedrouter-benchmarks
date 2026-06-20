@@ -27,3 +27,11 @@ try:
     }
 except Exception:  # never let the shim break the run
     pass
+
+# With --use-sdk, the runner names models `trustedrouter/<id>`; register the
+# litellm custom provider so those route through the TrustedRouter SDK. Inert if
+# trbench / the SDK aren't importable (e.g. the openai/ base-url path).
+try:
+    import trbench.tr_litellm  # noqa: F401  - self-registers the provider
+except Exception:
+    pass

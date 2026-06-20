@@ -36,10 +36,21 @@ DEFAULT_USER_LLM = "openai/gpt-4.1"  # fixed simulated user (a TR model id)
 SUCCESS = 0.999  # tau2 reward is in [0,1]; a task "passes" at reward == 1
 
 
+_REPO_ROOT = Path(__file__).resolve().parents[3]  # trustedrouter-benchmarks/
+
+
 def _litellm_name(tr_model_id: str) -> str:
     """TR model id -> LiteLLM custom-OpenAI name (the `openai/` prefix routes to
     OPENAI_API_BASE; the rest is sent as the model). Idempotent."""
     return tr_model_id if tr_model_id.startswith("openai/") and tr_model_id.count("/") >= 2 else f"openai/{tr_model_id}"
+
+
+def _model_arg(tr_model_id: str, use_sdk: bool) -> str:
+    """litellm model name. --use-sdk routes through the TrustedRouter SDK (custom
+    provider in trbench.tr_litellm, registered by the _shim); else openai/ base URL."""
+    if use_sdk:
+        return tr_model_id if tr_model_id.startswith("trustedrouter/") else f"trustedrouter/{tr_model_id}"
+    return _litellm_name(tr_model_id)
 
 
 def _pass_hat_k(success_count: int, num_trials: int, k: int) -> float:
@@ -55,7 +66,7 @@ def _slug(model: str, domain: str) -> str:
 
 
 def _run_one(*, tau2_bin: str, tau2_home: Path, domain: str, model: str, user_llm: str,
-             num_tasks: int, num_trials: int, max_steps: int, max_concurrency: int,
+             use_sdk: bool, num_tasks: int, num_trials: int, max_steps: int, max_concurrency: int,
              max_retries: int, retry_delay: float, seed: int, env: dict[str, str],
              timeout: float, resume: bool) -> dict:
     slug = _slug(model, domain)
@@ -66,7 +77,7 @@ def _run_one(*, tau2_bin: str, tau2_home: Path, domain: str, model: str, user_ll
         shutil.rmtree(tau2_home / "data" / "simulations" / slug, ignore_errors=True)
     cmd = [
         tau2_bin, "run", "--domain", domain,
-        "--agent-llm", _litellm_name(model), "--user-llm", _litellm_name(user_llm),
+        "--agent-llm", _model_arg(model, use_sdk), "--user-llm", _model_arg(user_llm, use_sdk),
         "--num-tasks", str(num_tasks), "--num-trials", str(num_trials),
         "--max-steps", str(max_steps), "--max-concurrency", str(max_concurrency),
         "--max-retries", str(max_retries), "--retry-delay", str(retry_delay),
@@ -136,6 +147,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--retry-delay", type=float, default=5.0)
     parser.add_argument("--resume", action="store_true",
                         help="Keep tau2's existing sims for a slug (default: clear for a clean run).")
+    parser.add_argument("--use-sdk", dest="use_sdk", action=argparse.BooleanOptionalAction, default=True,
+                        help="Route agent/user/judge calls through the TrustedRouter SDK (litellm "
+                             "custom provider). --no-use-sdk falls back to the OpenAI-compatible base URL.")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--tau2-home", default=DEFAULT_TAU2_HOME)
     parser.add_argument("--base-url", default=client.DEFAULT_BASE_URL)
@@ -158,12 +172,22 @@ def main(argv: list[str] | None = None) -> int:
     # evaluator/judge calls route through TR instead of aborting the sim. The judge
     # is fixed (not the agent under test) so grading stays consistent across models.
     shim_dir = str(Path(__file__).resolve().parent / "_shim")
-    pythonpath = os.pathsep.join([shim_dir, os.environ.get("PYTHONPATH", "")]).rstrip(os.pathsep)
+    # --use-sdk also needs the repo root on PYTHONPATH so the shim can import
+    # trbench.tr_litellm (the SDK custom provider). The tau2 venv then needs the
+    # SDK: tau2-bench/.venv/bin/pip install /path/to/trusted-router-py.
+    pp_parts = [shim_dir] + ([str(_REPO_ROOT)] if args.use_sdk else []) + [os.environ.get("PYTHONPATH", "")]
+    pythonpath = os.pathsep.join(pp_parts).rstrip(os.pathsep)
     env = {
         **os.environ,
-        "OPENAI_API_BASE": args.base_url, "OPENAI_API_KEY": api_key,
-        "PYTHONPATH": pythonpath, "TRBENCH_TAU2_EVAL_LLM": _litellm_name(args.eval_llm),
+        "PYTHONPATH": pythonpath,
+        "TRBENCH_TAU2_EVAL_LLM": _model_arg(args.eval_llm, args.use_sdk),
     }
+    if args.use_sdk:
+        env["TRUSTEDROUTER_API_KEY"] = api_key
+        env["TRUSTEDROUTER_BASE_URL"] = args.base_url
+    else:
+        env["OPENAI_API_BASE"] = args.base_url
+        env["OPENAI_API_KEY"] = api_key
     print(f"tau2-bench [{args.domain}]: {len(models)} agents x {args.num_tasks} tasks "
           f"x {args.num_trials} trials, user={args.user_llm}")
 
@@ -171,6 +195,7 @@ def main(argv: list[str] | None = None) -> int:
     for model in models:
         rows.append(_run_one(
             tau2_bin=tau2_bin, tau2_home=tau2_home, domain=args.domain, model=model, user_llm=args.user_llm,
+            use_sdk=args.use_sdk,
             num_tasks=args.num_tasks, num_trials=args.num_trials, max_steps=args.max_steps,
             max_concurrency=args.max_concurrency, max_retries=args.max_retries, retry_delay=args.retry_delay,
             seed=args.seed, env=env, timeout=args.per_model_timeout, resume=args.resume,
