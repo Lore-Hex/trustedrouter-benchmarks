@@ -347,3 +347,9 @@ MMLU-Pro snapshot: `2026-06-19T04:56:04.874288+00:00` via `api.trustedrouter.com
 *BEAM 128K results coming soon.*
 
 <!-- BEAM_128K_RESULTS_END -->
+
+<!-- TERMINAL_BENCH_RESULTS_START -->
+
+*Terminal-Bench results coming soon.*
+
+<!-- TERMINAL_BENCH_RESULTS_END -->
