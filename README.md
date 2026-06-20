@@ -368,12 +368,15 @@ price × the 128K context, so this is the open-weight panel only (frontier refs 
 128K are ~$130/model each).
 
 > **Abstention scores near 0 because the models confabulate, not because the
-> judge is wrong** (verified). On unanswerable questions (e.g. "how did user
-> feedback influence my UI changes?" when the chat never links the two) the
-> expected answer is *"there's no information about that"* — but the models invent
-> a plausible causal link instead. This confabulation-over-abstention is exactly
-> the long-context failure BEAM is built to surface; only MiniMax M3 abstained on
-> any. Per-ability cells are noisy (4 items each at `--limit 40`); the **Overall**
+> judge is wrong** (verified by reading the answers). On unanswerable questions
+> (e.g. "how did user feedback influence my UI changes?" when the chat never links
+> the two) the gold answer is *"there's no information about that"* — but **no model
+> cleanly abstains.** kimi/deepseek/glm/gemma invent *specific false memories*
+> ("Turn 3,15 mentioned a dark-mode toggle…"); MiniMax M3 (the only non-zero,
+> 50.0) is least bad — it deflects to *generic textbook* answers rather than
+> fabricating project-specific history, which the judge credits on 2/4. This
+> confabulation-over-abstention is exactly the long-context failure BEAM surfaces.
+> Per-ability cells are noisy (4 items each at `--limit 40`); the **Overall**
 > column is the reliable comparison.
 
 <!-- BEAM_128K_RESULTS_START -->
