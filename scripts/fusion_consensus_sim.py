@@ -84,8 +84,7 @@ def judge_pick(item: dict, proposals: list[list[dict]], key: str) -> list[dict]:
     return uniq[idx] if 0 <= idx < len(uniq) else uniq[0]
 
 
-JUDGE_SWEEP = ["deepseek/deepseek-v4-pro", "google/gemini-3.1-pro-preview",
-               "openai/gpt-5.5", "z-ai/glm-5.2", "anthropic/claude-opus-4.8"]
+JUDGE_SWEEP = ["moonshotai/kimi-k2.6", "z-ai/glm-5.2", "deepseek/deepseek-v4-pro", "google/gemma-4-31b-it"]
 PANEL_CACHE = "results/_consensus_panel.json"
 
 
@@ -115,11 +114,73 @@ def judge_best_every(item: dict, proposals: list[list[dict]], judge_model: str, 
     return uniq[idx] if 0 <= idx < len(uniq) else uniq[0]
 
 
+def _distinct(proposals: list[list[dict]]) -> list[list[dict]]:
+    uniq, seen = [], set()
+    for p in proposals:
+        c = canonical(p)
+        if c not in seen:
+            seen.add(c)
+            uniq.append(p)
+    return uniq
+
+
+def judge_ideas(item: dict, proposals: list[list[dict]], judge_model: str, key: str) -> str:
+    """Stage 1 — judge SURFACES the distinct ideas/options (does NOT pick a final answer)."""
+    uniq = _distinct(proposals)
+    q = item["messages"][-1]["content"]
+    schema = json.dumps([f.get("name") for f in item["functions"]])
+    cands = "\n".join(f"[{i}] {json.dumps(p)}" for i, p in enumerate(uniq))
+    prompt = (f"You are analyzing a panel of candidate tool-call answers for a user request.\n"
+              f"Available functions: {schema}\n\nUSER REQUEST:\n{q}\n\nPANEL PROPOSALS:\n{cands}\n\n"
+              f"Lay out the distinct ideas/options: which function(s) to call, where the candidates AGREE, "
+              f"and where they DIFFER (on which argument/value, and which reading is right for THIS request). "
+              f"Do NOT output a final answer — just analyze the options and the tradeoffs.")
+    r = client.chat(base_url=client.DEFAULT_BASE_URL, api_key=key, model=judge_model,
+                    messages=[{"role": "user", "content": prompt}], max_tokens=4096, temperature=0.0, timeout=180)
+    return r.get("text", "") or ""
+
+
+def synthesize_from_ideas(item: dict, proposals: list[list[dict]], analysis: str, synth_model: str, key: str) -> list[dict]:
+    """Stage 2 — synthesizer ASSEMBLES the best complete set of calls from the ideas (several, not one)."""
+    uniq = _distinct(proposals)
+    if len(uniq) == 1:
+        return uniq[0]
+    q = item["messages"][-1]["content"]
+    schema = json.dumps([f.get("name") for f in item["functions"]])
+    cands = "\n".join(f"[{i}] {json.dumps(p)}" for i, p in enumerate(uniq))
+    prompt = (f"Assemble the single best, complete set of tool calls for a user request.\n"
+              f"Available functions: {schema}\n\nUSER REQUEST:\n{q}\n\nPANEL PROPOSALS:\n{cands}\n\n"
+              f"JUDGE'S ANALYSIS OF THE OPTIONS:\n{analysis}\n\n"
+              f"Pick the correct function(s) with the correct arguments, drawing on the best ideas above "
+              f"(you may combine the right call from one proposal with the right argument from another). "
+              f'Output ONLY JSON: {{"tool_calls": [{{"name": "fn", "arguments": {{...}}}}]}}.')
+    r = client.chat(base_url=client.DEFAULT_BASE_URL, api_key=key, model=synth_model,
+                    messages=[{"role": "user", "content": prompt}], max_tokens=4096, temperature=0.0, timeout=180)
+    text = r.get("text", "") or ""
+    import re
+    m = re.search(r'\{.*"tool_calls".*\}', text, re.DOTALL)
+    if not m:
+        return uniq[0]
+    try:
+        obj = json.loads(m.group(0))
+        out = []
+        for tc in obj.get("tool_calls", []):
+            args = tc.get("arguments")
+            if isinstance(args, str):
+                args = json.loads(args)
+            out.append({tc["name"]: args or {}})
+        return out or uniq[0]
+    except Exception:
+        return uniq[0]
+
+
 def main() -> int:
     import os
     ap = argparse.ArgumentParser()
     ap.add_argument("--limit", type=int, default=30)
     ap.add_argument("--judge-sweep", action="store_true", help="Sweep judge models for best-of-N selection.")
+    ap.add_argument("--two-stage", action="store_true",
+                    help="judge surfaces ideas -> synthesizer assembles (the real fusion architecture).")
     args = ap.parse_args()
     key = client.api_key_from_env()
     items = load(categories=CATEGORIES, limit_per_category=args.limit)
@@ -133,7 +194,7 @@ def main() -> int:
             answers = defaultdict(dict, {k: v for k, v in cached.items()})
             print("  (reused cached panel answers)")
     if not answers:
-        with ThreadPoolExecutor(max_workers=10) as pool:
+        with ThreadPoolExecutor(max_workers=3) as pool:
             futs = {pool.submit(ask, m, it, key): (m, it["id"]) for it in items for m in PANEL}
             for f in as_completed(futs):
                 m, iid = futs[f]
@@ -174,13 +235,33 @@ def main() -> int:
         print("\n=== JUDGE SWEEP: judge picks the most-correct candidate every item ===")
         for jm in JUDGE_SWEEP:
             correct = 0
-            with ThreadPoolExecutor(max_workers=8) as pool:
+            with ThreadPoolExecutor(max_workers=3) as pool:
                 futs = {pool.submit(judge_best_every, it, [answers[it["id"]].get(m, []) for m in PANEL], jm, key): it
                         for it in items}
                 for f in as_completed(futs):
                     it = futs[f]
                     correct += grade(it, f.result())
             print(f"  judge={jm:32} {100*correct/n:5.1f}")
+
+    if args.two_stage:
+        print("\n=== TWO-STAGE: judge surfaces ideas -> synthesizer assembles (many, not one) ===")
+        combos = [
+            ("moonshotai/kimi-k2.6", "z-ai/glm-5.2"),
+            ("deepseek/deepseek-v4-pro", "z-ai/glm-5.2"),
+            ("google/gemma-4-31b-it", "z-ai/glm-5.2"),
+            ("z-ai/glm-5.2", "deepseek/deepseek-v4-pro"),
+        ]
+        for judge_m, synth_m in combos:
+            correct = 0
+            with ThreadPoolExecutor(max_workers=3) as pool:
+                def run(it, jm=judge_m, sm=synth_m):
+                    props = [answers[it["id"]].get(m, []) for m in PANEL]
+                    analysis = judge_ideas(it, props, jm, key)
+                    return grade(it, synthesize_from_ideas(it, props, analysis, sm, key))
+                futs = {pool.submit(run, it): it for it in items}
+                for f in as_completed(futs):
+                    correct += f.result()
+            print(f"  judge={judge_m:26} synth={synth_m:14} {100*correct/n:5.1f}")
     return 0
 
 
