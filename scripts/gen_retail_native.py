@@ -20,9 +20,9 @@ TAU = "/Users/jperla/claude/tau2-bench/data/tau2/domains/retail"
 PICK = sys.argv[1].split(",") if len(sys.argv) > 1 else [str(i) for i in range(20)]
 SUF = sys.argv[2] if len(sys.argv) > 2 else "_NAT"
 MODEL = sys.argv[3] if len(sys.argv) > 3 else "sonnet"
-SOLO = (sys.argv[4] if len(sys.argv) > 4 else "solo") == "solo"
-CONC = 4
-POLICIES_JS = "['solo']" if SOLO else "['solo','fusion']"
+MODE = sys.argv[4] if len(sys.argv) > 4 else "solo"
+CONC = 2 if MODE == "fusion" else 4
+POLICIES_JS = {"solo": "['solo']", "fusion": "['fusion']", "both": "['solo','fusion']"}.get(MODE, "['solo']")
 
 db = json.load(open(f"{TAU}/db.json"))
 tasks_all = {str(t["id"]): t for t in json.load(open(f"{TAU}/tasks.json"))}
@@ -177,4 +177,4 @@ for(let i=0;i<jobs.length;i+={CONC}){{ out.push(...(await parallel(jobs.slice(i,
 return out
 """
 open(f"results/_retail_native{SUF}.js", "w").write(js)
-print(f"wrote results/_retail_native{SUF}.js | tasks={len(tasks)} users={len(sel_users)} orders={len(sel_orders)} | model={MODEL} solo={SOLO} | bytes={len(js)}")
+print(f"wrote results/_retail_native{SUF}.js | tasks={len(tasks)} users={len(sel_users)} orders={len(sel_orders)} | model={MODEL} mode={MODE} | bytes={len(js)}")
