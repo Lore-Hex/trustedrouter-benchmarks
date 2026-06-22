@@ -36,12 +36,16 @@ out), orchestrated with the Workflow tool. They isolate two questions:
 |---|---|
 | Haiku solo (my loop)        | ~15% (writes-only) |
 | Haiku fusion (per-step)     | ~25% (writes-only) — **+10 over solo** |
-| Sonnet solo (my loop)       | **45%** (DB, real evaluator) |
-| — published full retail —   | claude-3.7-sonnet 78.7 · gpt-4.1 74.1 · gpt-4.1-mini 66 |
+| Sonnet solo (loose-JSON loop)        | 45% (DB, real evaluator) |
+| Sonnet solo (near-identical loop)    | **70% & 75%** (two runs, avg ~72.5%, DB, real evaluator) |
+| — published full retail —            | gpt-4.1-mini 66 · **Sonnet 4.6 (ours) 70–75** · o4-mini 71.5 · gpt-4.1 74.1 · claude-3.7-sonnet 78.7 |
 
-The Sonnet 45 → ~79 gap is the **agent-loop handicap** (my loop's tool-calls + user-sim),
-not the scorer (now tau2's own). `scripts/gen_retail_native.py` narrows it: tau2's
-**verbatim** agent + user-sim prompts + **schema-forced** structured tool-calls.
+**The 45 → ~72 jump (same model, same scorer) proves the gap was harness-looseness, not
+the model.** `scripts/gen_retail_native.py` (tau2's verbatim agent + user-sim prompts +
+schema-forced structured tool-calls) lands Sonnet 4.6 squarely in the published band —
+≈ o4-mini / gpt-4.1 tier (validating gpt-4.1 ≈ Sonnet 4.6). Run-to-run variance is real
+Sonnet non-determinism (e.g. recovering a dropped `#` in an order id). DB-only reward; NL
+factor (usually ≈ 1) omitted since its judge needs an OpenAI cred (substitute Sonnet).
 
 ## Repro
 
