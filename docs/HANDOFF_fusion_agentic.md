@@ -34,29 +34,33 @@ payment), not "couldn't choose between two good paths" — so gather-then-verifi
 Goal: **drop-in for any harness (opencode unmodified) — a standard OpenAI chat-completions
 call, no new params, no client changes.** The synthesizer self-classifies read vs write.
 
-Per-call behavior (fusion is invoked once per agent step by the client loop):
-1. **Default = 1 model call** to produce the next action — like a normal completion. Cheap.
-2. **If the action is a READ or a message → return it directly** (1 call total). Reads are
-   reversible; if wrong, the agent recovers next turn. Encourage emitting *multiple* read
-   tool_calls at once (parallel exploration — clients like opencode run parallel tool_calls
-   natively).
-3. **If the action is a WRITE (mutating) → spend the fusion budget HERE and only here:**
-   generate **N candidate writes** (N samples of the model, or N diverse panel models) and
-   have the **synth pick/verify once** (self-consistency / `evidence_decide`). Commit the
-   agreed call. This is the original panel→synth fusion, fired only at irreversible actions.
+**The panel runs every step. The asymmetry is in how proposals are AGGREGATED, forced by
+reversibility — NOT in whether the panel runs.** Per call:
+1. Panel (diverse proposers) propose the next action(s) for the current state.
+2. **READ proposals → UNION.** Return the union of all distinct read tool_calls the panel
+   proposed; the client runs them in PARALLEL. Diversity = breadth of exploration (different
+   members look up different things) → more complete info. This is where the oracle headroom
+   lives (the 2 solo runs hit 90% by exploring *differently* — union recovers that). Reads
+   are reversible/additive, so taking many never hurts.
+3. **WRITE → the synth selects ONE and returns it.** You can't union irreversible writes;
+   the synth picks the single action, informed by the now-complete reads. **No N-redundancy**
+   — once exploration is broad the write is basically determined. The synth decided → write it.
+
+So: **same panel both times; UNION the reads, SELECT the write.** Each fusion call returns
+either a *batch of read tool_calls* (union) or a *single write tool_call* (synth's pick); the
+client just executes the returned tool_calls (parallel for reads).
 
 Key points the design must honor (from review):
 - **No client changes / no new params** — standard OpenAI call; the synth infers read/write
-  from tool semantics (names/descriptions: `get_/list_/search_/read_/grep` = read;
-  `create_/update_/delete_/cancel_/edit_/commit_/send_` = write). NOT a `mutating_tools` param.
-- **Adaptive spend is real only if reads are single-pass.** Do NOT run the panel on reads.
-  Reads ≈ 1 call; writes ≈ N+1. (Earlier "7 calls every step" was the mistake.)
-- **N is the candidate count, not N synth decisions.** A single generation at the write =
-  solo (≈70%); the oracle headroom (90%) only exists across multiple samples. The synth
-  still *decides once* — over the N candidates.
-- **Per-domain verifier at the gate:** tau2 → LLM self-consistency on the structured write;
-  **coding/opencode → run the tests/typecheck after the proposed edit** (a real executable
-  verifier, stronger than a vote); web/computer-use → a checker or vote.
+  from tool semantics (`get_/list_/search_/read_/grep` = read; `create_/update_/delete_/
+  cancel_/edit_/commit_/send_` = write). NOT a `mutating_tools` param.
+- **The panel's value on reads is BREADTH (union), not redundancy.** Panel calls on read
+  steps are NOT wasted — generating diverse read directions IS the value.
+- **The write is a single synth decision — NOT N candidates.** (Earlier "N candidate writes
+  + verify" was over-engineering; the headroom comes from broad reads, not write-redundancy.)
+- NOTE: the v3 smoke used a *single proposer* that emitted read-batches + an N-verify write.
+  The refined design above (panel-union-reads / synth-select-write) is what to implement & run
+  next — expect it to capture *more* of the oracle (wider read union) at *lower* write cost.
 
 Where in code: `quill-cloud-proxy enclave-go/cmd/enclave/fusion.go`. Today panel → judge →
 synth (`fusionFinalRequest`, tool branch at ~line 1023). Change: synth instruction →
