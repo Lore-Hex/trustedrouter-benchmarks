@@ -22,51 +22,66 @@ evaluator. Companion docs: `fusion_agentic_findings.md`, `agentic_fusion_explore
   READS (fan out in parallel), spend fusion only at irreversible WRITES. **Smoke (tasks
   0,1,2, the hardest): 67% (2/3) — hit the 2-run oracle, 2× solo/per-step-fusion (33%).**
 
-## v3 design (validated on smoke; see gen_retail_explore.py)
-Per step the agent emits `{reads:[...], write:?, message:?}`:
-- `reads` → run ALL in parallel (cheap, reversible — gather complete info, reach more state)
-- `write` → fusion gate: N candidate writes + self-consistency/verify, commit the agreed one
-- `message` → reply to user
-Failures were *premature/under-informed commits* (wrong item_ids, `#`-order-id spiral, wrong
-payment), not "couldn't choose between two good paths" — so gather-then-verified-commit wins.
+## v3 smoke harness (gen_retail_explore.py) — what was actually run
+A SINGLE proposer emits `{reads:[...], write:?, message:?}` each step: reads fan out in
+parallel; the write went through a small verify (the shippable design DROPS that — see below).
+Smoke 2/3 = oracle. Failures were *premature/under-informed commits* (wrong item_ids,
+`#`-order-id spiral, wrong payment), not "couldn't choose between two good paths" — so
+gather-broadly-then-commit wins. The shippable form replaces the single proposer with the
+panel→synth-decides structure (next section); no write-verify, no code classifier.
 
 ## Putting v3 into `trustedrouter/fusion` (the product design — CORRECTED)
 Goal: **drop-in for any harness (opencode unmodified) — a standard OpenAI chat-completions
 call, no new params, no client changes.** The synthesizer self-classifies read vs write.
 
-**The panel runs every step. The asymmetry is in how proposals are AGGREGATED, forced by
-reversibility — NOT in whether the panel runs.** Per call:
-1. Panel (diverse proposers) propose the next action(s) for the current state.
-2. **READ proposals → UNION.** Return the union of all distinct read tool_calls the panel
-   proposed; the client runs them in PARALLEL. Diversity = breadth of exploration (different
-   members look up different things) → more complete info. This is where the oracle headroom
-   lives (the 2 solo runs hit 90% by exploring *differently* — union recovers that). Reads
-   are reversible/additive, so taking many never hurts.
-3. **WRITE → the synth selects ONE and returns it.** You can't union irreversible writes;
-   the synth picks the single action, informed by the now-complete reads. **No N-redundancy**
-   — once exploration is broad the write is basically determined. The synth decided → write it.
+**The synthesizer decides everything, every step. No read/write logic in code; no
+"union-on-any-read" rule.** Structure = panel proposes diverse candidate next-moves →
+**synth decides the single next move**:
+1. Panel (diverse proposers) propose candidate next actions (ideas, some wrong).
+2. **Synth decides** (one judgment, informed by the panel + gathered data):
+   - *still investigating* → return the read/lookup tool call(s) it wants now (it may run
+     several in parallel — the panel's diversity widens what it thinks to look up); OR
+   - *enough info* → return the single state-changing call, exactly correct (ids/values
+     from gathered data); OR
+   - return a message.
+3. The synth — an LLM — classifies read/write implicitly (by what it chooses) and judges
+   *when to stop exploring and commit*. The panel only feeds breadth; the synth makes the call.
 
-So: **same panel both times; UNION the reads, SELECT the write.** Each fusion call returns
-either a *batch of read tool_calls* (union) or a *single write tool_call* (synth's pick); the
-client just executes the returned tool_calls (parallel for reads).
+Each fusion call returns a normal OpenAI `tool_calls` response (a batch of reads, or one
+write, or a message). Client executes whatever comes back (parallel for reads).
 
-Key points the design must honor (from review):
-- **No client changes / no new params** — standard OpenAI call; the synth infers read/write
-  from tool semantics (`get_/list_/search_/read_/grep` = read; `create_/update_/delete_/
-  cancel_/edit_/commit_/send_` = write). NOT a `mutating_tools` param.
-- **The panel's value on reads is BREADTH (union), not redundancy.** Panel calls on read
-  steps are NOT wasted — generating diverse read directions IS the value.
-- **The write is a single synth decision — NOT N candidates.** (Earlier "N candidate writes
-  + verify" was over-engineering; the headroom comes from broad reads, not write-redundancy.)
-- NOTE: the v3 smoke used a *single proposer* that emitted read-batches + an N-verify write.
-  The refined design above (panel-union-reads / synth-select-write) is what to implement & run
-  next — expect it to capture *more* of the oracle (wider read union) at *lower* write cost.
+Design rules (from review — DO NOT regress):
+- **NO code heuristic for read vs write** (no `isMutating()` string match — brittle, breaks on
+  odd tool names). The synth (LLM) decides, far more flexibly. No client annotation/param.
+- **The synth decides read-vs-write AND when to commit** — not a code rule like "union if any
+  panel member proposed a read" (that loops forever). It's the synth's per-step judgment.
+- **The panel's value is breadth of ideas** (it widens what the synth investigates / which
+  write it considers); the synth converges to one move.
+- **No N-candidate write redundancy** — the synth decides the write once; the headroom comes
+  from broad *exploration*, not write-resampling.
+- Standard OpenAI chat-completions call → drop-in for opencode unmodified.
+- NOTE: the v3 smoke used a SINGLE proposer (no panel) emitting {reads,write,message}, and it
+  worked (2/3 = oracle). The shippable form adds the panel feeding the synth's decision. Run
+  that on the full 20 + the diverse open-weight panel before touching the enclave.
 
 Where in code: `quill-cloud-proxy enclave-go/cmd/enclave/fusion.go`. Today panel → judge →
-synth (`fusionFinalRequest`, tool branch at ~line 1023). Change: synth instruction →
-`evidence_decide` + "emit all needed reads at once; only emit a mutating call when the data
-supports it"; add a `runFusionWriteVerify` stage that fires only when the chosen tool is
-mutating (N re-derivations + majority). Gate deploy on Joseph's go (NOT deployed).
+synth (`runFusionFinal`/`fusionFinalRequest`, tool branch at ~line 1023). The agentic version
+barely touches the Go: **the synth's `tool_calls` response is returned to the client AS-IS —
+no classifier, no read/write partition, no extra stage.** The ONLY real change is the SYNTH
+PROMPT (the decision wording) + allowing the synth to emit MULTIPLE read tool_calls in one
+response (parallel reads):
+
+    <policy + tools with descriptions>
+    Conversation + data gathered so far: <transcript>
+    Other assistants proposed these next actions (ideas, some may be wrong): <panel proposals>
+    Decide the SINGLE next move:
+      - need info -> return the lookup/read tool call(s) to run now (several at once is fine);
+      - enough    -> return the one state-changing call, exactly correct (ids from the data);
+      - otherwise -> return a message.
+    Don't keep investigating once you can correctly act.
+
+The judge stays as-is. NO `isMutating()` heuristic, NO write-verify stage — the synth decides.
+Gate deploy on Joseph's go (NOT deployed).
 
 ## Open questions / next steps
 1. **Full-20 explore run** (vs solo 75% and oracle 90%) — quota-limited; `python
@@ -76,8 +91,9 @@ mutating (N re-derivations + majority). Gate deploy on Joseph's go (NOT deployed
    Claude models are capability-ordered so a Claude panel always has a dominant member.
 3. **opencode validation** — port the read/write loop with test-execution as the write
    verifier; measure lift (expect bigger lift on mid models than frontier).
-4. **Reliable read/write self-classification** — the name heuristic is good-enough; confirm
-   the synth can self-classify robustly with no annotation.
+4. **Synth self-classification** — confirm the synth reliably decides read-vs-write AND when
+   to stop exploring and commit, with NO code heuristic and NO client annotation (the brittle
+   `isMutating()` string match is dropped — the LLM judges it).
 
 ## Repro / scripts (in trustedrouter-benchmarks)
 - `scripts/tau2_grade.py` — score a trajectory with tau2's REAL evaluator (run in tau2 venv:
