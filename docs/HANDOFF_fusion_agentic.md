@@ -18,9 +18,21 @@ evaluator. Companion docs: `fusion_agentic_findings.md`, `agentic_fusion_explore
   - **The headroom is real & at the trajectory level:** two independent Sonnet *solo* runs
     disagree on 7/20 tasks; **2-run oracle = 90%** vs solo 75%. Even one model's
     stochasticity has ~15 pts of latent headroom.
-- **v3 = read/write-asymmetric "explore" (THE direction):** explore broadly on reversible
-  READS (fan out in parallel), spend fusion only at irreversible WRITES. **Smoke (tasks
-  0,1,2, the hardest): 67% (2/3) — hit the 2-run oracle, 2× solo/per-step-fusion (33%).**
+- **v3 = read/write-asymmetric "explore" (THE direction):** broad reversible reads (fan out
+  in parallel) + synth-decided commit. Two smokes on tasks 0,1,2 (the hardest):
+
+  | approach | tasks 0,1,2 | cost |
+  |---|---|---|
+  | solo run1 / run2 | 33% / 33% | 1× |
+  | per-step fusion | 33% | ~2× |
+  | 2-run oracle (ceiling) | 67% | — |
+  | single-proposer explore (smoke) | 67% (2/3) | ~1.5× |
+  | **panel→synth-decides (shippable)** | **100% (3/3)** | **~3× (3 panel + 1 synth/step)** |
+
+  **Panel→synth EXCEEDED the 2-run oracle** — it solved task 1 that *neither* solo run got, so
+  the diverse-panel breadth finds paths single-model resampling doesn't. The skeptical stance
+  ("watch for a leading-hash order id; look ids up from the order list") cracked the `#`-spiral
+  on task 0. n=3 → directional, not proof; validate on the full 20 next.
 
 ## v3 smoke harness (gen_retail_explore.py) — what was actually run
 A SINGLE proposer emits `{reads:[...], write:?, message:?}` each step: reads fan out in
