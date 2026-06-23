@@ -42,3 +42,16 @@ deliverable trajectory by committing well-informed, verified writes.
   write-fusion), `python scripts/gen_retail_explore.py "<ids>" "_EXP" sonnet`.
 - Needs model calls → run after the Claude-Code session quota reset (was 11:20pm PT).
 - Start with a 2–3 task smoke to confirm the loop works, then the full 20.
+
+## Smoke result (tasks 0,1,2 — the hardest, all-prior-approaches-failed)
+| approach | reward |
+|---|---|
+| solo run1 / run2 | 33% / 33% (1/3) |
+| per-step fusion | 33% (1/3) |
+| 2-run oracle (ceiling) | 67% (2/3) |
+| **EXPLORE v3** | **67% (2/3) — hits the oracle, 2× the baselines** |
+
+Mechanism confirmed: task 1 & 2 recovered by fanning out all orders in parallel →
+complete info → verified commit. Task 0 still lost the `#`-spiral (fan-out helps but
+doesn't guarantee recovery; stochastic). n=3, but a clean 2× on the exact failures.
+Next: full 20 vs solo 75% and oracle 90%.
