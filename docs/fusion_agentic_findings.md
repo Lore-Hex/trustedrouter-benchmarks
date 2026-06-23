@@ -25,6 +25,15 @@ out), orchestrated with the Workflow tool. They isolate two questions:
 - **Agentic fusion (tau2 retail, Haiku).** Per-step `evidence_decide` fusion **beats solo
   by ~+10 pts** on the 20-task mixed set (writes-only 25 vs 15; strict 15 vs 5). Fusion's
   win mechanism: it keeps the agent from stalling/drifting mid-sequence.
+- **Agentic fusion (tau2 retail, Sonnet) ≈ solo — does NOT beat it.** On the 8 hardest
+  exchange tasks (0–7, real evaluator, DB): fusion 50% vs solo 50% & 62.5% (avg ~56%).
+  This is the SAME rule as single-shot: a 5-stance panel of *one strong model* (Sonnet)
+  mostly agrees, so there's no complementary diversity to exploit and the judge/synth
+  overhead is a small tax. Fusion helped at Haiku tier precisely because the weaker model's
+  stances disagreed more. **Unifying rule: fusion beats solo only with a no-dominant-member,
+  *diverse* panel (different models, or a weak model whose stances genuinely disagree); a
+  strong model fused against its own stances ≈ solo.** (Sonnet n=8, partial — full 20 was
+  cut off by a session quota limit.)
 - **Reward is the REAL tau2 reward.** `scripts/tau2_grade.py` builds a `SimulationRun` from a
   trajectory and calls tau2's own `evaluate_simulation` (env-replay + DB-state compare +
   action + communicate). Validated: feeding the **gold actions → reward 1.0**. DB component
