@@ -7,32 +7,40 @@ SciCode's **own** test runner against the 1.05 GB numeric ground truth. Two sett
 **without-background** (model must recall the science — the "realistic" leaderboard setting)
 and **with-background** (gold science is given — easier).
 
-## Haiku 4.5 — test split, WITHOUT background
-| metric | score |
-|---|---|
-| subproblem | **68/288 = 23.6%** |
-| main problem | **1/65 = 1.5%** |
+## Haiku 4.5 — test split (65 problems / 288 steps)
+| setting | subproblem | main |
+|---|---|---|
+| without-background (realistic) | **68/288 = 23.6%** | 1/65 = 1.5% |
+| with-background (science given) | **101/288 = 35.1%** | 2/65 = 3.1% |
 
-**Calibration.** This is the *hard* setting. On the same setting the old leaderboard has
-Claude-3.5-Sonnet at 26% subproblem, so Haiku-4.5 at 23.6% is in-band (a small model can lag
-a larger older one on deep science recall). The **published Haiku-4.5 ≈ 43.3 is almost
-certainly the *with-background* setting** — a `with_background` run is queued to confirm
-(`scicode_gen.py test _TESTBG haiku 12 bg`). Harness is sound: validation split = 25/50 sub
-(50%) on the same venv, only 2/288 timeouts (not a timeout-deflation artifact), 218 genuine
-fails. Gold solutions are withheld from the public HF dataset (0/291), so no direct gold-check.
+**Calibration.** with-background lifts Haiku **+11.5 pts** (23.6 → 35.1), confirming the
+**published ~43.3 is the with-background setting** (Haiku does much better when handed the
+science). The residual **35.1 vs 43.3** (~8 pts) is the **generation backend**: this harness
+drives generation with Claude Code *subagents* (full agentic system prompt, non-zero temp),
+not a clean temperature-0 API call. For *agentic* tau2 that matched the leaderboard (Sonnet
+70–75 ≈ 74); for SciCode *single-shot code-gen* the agentic wrapper + temp deflates absolute
+scores ~8 pts (also 5/288 with-bg timeouts at 120 s). **So absolute SciCode numbers here run
+~8 pts low vs a clean-API leaderboard run, but RELATIVE comparisons are valid** (with-vs-
+without-bg, fusion-vs-solo share the backend). Harness otherwise sound: validation = 25/50
+(50%), only 2/288 without-bg timeouts; gold is withheld from the HF dataset (0/291) so no
+direct gold-check.
 
 ## Sonnet — solo vs fusion (per-step 5-panel → judge → evidence_decide synth)
-3 problems (53, 59, 65), without-background, 15 steps:
-| | subproblem | main | per-problem |
-|---|---|---|---|
-| solo | 9/15 (60%) | 0/3 | 53:2/4 · 59:2/5 · 65:5/6 |
-| **fusion** | **11/15 (73%)** | **1/3** | 53:**4/4** · 59:2/5 · 65:5/6 |
+Two runs, without-background:
 
-**Fusion edged solo (+2 sub, +1 main)** — driven entirely by problem 53 (2/4 → fully solved).
-Unlike tau2 tool-calling (where 5 Sonnet stances converge → fusion ≈ solo), **code-gen has
-real diversity surface**: stances write genuinely different implementations and the synth can
-re-derive the correct one. n=3 → directional, not proof (the win is one problem); a larger
-subset is needed to confirm.
+| run | solo subproblem | fusion subproblem | solo main | fusion main |
+|---|---|---|---|---|
+| small (3 problems / 15 steps) | 9/15 (60%) | **11/15 (73%)** | 0/3 | 1/3 |
+| **big (23 problems / 71 steps)** | **20/71 (28.2%)** | 18/71 (25.4%) | 0/23 | 0/23 |
+
+**The small run's fusion "+2" was NOISE** (it landed on problem 53, 2/4→4/4). At scale fusion
+is **slightly WORSE than solo** (18 vs 20; won 2 problems 24/32, lost 3: 35/41/45) — the synth
+sometimes steers to a worse consensus than solo's own answer (same failure mode as tau2 5/6).
+
+**Unified rule confirmed on a SECOND benchmark.** Same-model (single-model) fusion ≈ solo —
+holds for agentic tool-calling (tau2) AND research code-gen (SciCode). A genuinely diverse,
+no-dominant-member multi-MODEL panel is required to beat solo; same-model stance diversity is
+not enough. Lesson: validate fusion deltas on ≥20 items — small subsets give false positives.
 
 ## Run
 ```bash
