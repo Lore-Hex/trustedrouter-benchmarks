@@ -85,3 +85,20 @@ can't match it exactly because the gold solutions are withheld from the public H
 pseudo-gold with a strong model, then score each subproblem independently).
 Tools: `scripts/scicode_tr_gen.py` (clean temp-0 generation via TR), `scripts/scicode_score.py`
 (now uses `sys.executable` env; numpy-1.26 env = `scicode/.venv312`).
+
+## Tier-diverse fusion (Sonnet + 2 Haiku + 1 Opus → Sonnet synth) — confirms the rule
+Problems 21–28 (24 steps, without-background, subagents):
+| | subproblem | main |
+|---|---|---|
+| Sonnet solo | 4/24 (16.7%) | 0/8 |
+| **tier-fusion** | **6/24 (25.0%)** | 0/8 |
+| Opus solo | 9/24 (37.5%) | 2/8 |
+
+**Tier diversity DID lift fusion over Sonnet solo (+8.3)** — different Claude TIERS make
+different errors, so the Sonnet synth had real complementary signal (unlike 5 same-Sonnet
+stances, which tied solo). **BUT fusion < Opus solo** — the panel had a dominant member
+(Opus), so fusion landed BETWEEN the synth's tier and the best member, not above all. You'd
+just run Opus. Confirms the unified rule a 3rd time (tau2 tool-calling, SciCode same-model,
+SciCode tier-mix): **fusion beats solo only with a NO-dominant-member panel; the lever is
+panel composition, not the synth prompt.** n=24 → noisy, ordering clear. Harness:
+`scripts/scicode_fusion_mix.py` (per-member model panel; subagents, no TR $).
