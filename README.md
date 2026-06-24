@@ -28,6 +28,15 @@ Companion to [PrometheusBench](https://github.com/Lore-Hex/PrometheusBench)
 (refusal/permissiveness) — that one measures whether a model *will* answer; these
 measure whether it *can*.
 
+## Agentic fusion + SciCode (research threads)
+
+Beyond the single-shot panel evals, this repo hosts two deeper studies of **whether
+TrustedRouter Fusion beats the best single model** — in **agentic** (tau2-bench retail) and
+**code-generation** (SciCode, vendored under [`scicode/`](scicode/)) settings.
+**Start at [`docs/HANDOFF.md`](docs/HANDOFF.md).** Headline: *fusion beats solo only with a
+no-dominant-member, diverse multi-model panel — same-model panels (even diverse "stances")
+≈ solo, and the lever is panel composition, not the synth prompt.*
+
 ## The panel
 
 TrustedRouter model ids, in `trbench/panel.py`. Chinese open-weight models plus a

@@ -1,7 +1,22 @@
-# Handoff result trajectories (tau2 retail, graded by tau2's REAL evaluator)
-Grade with: cd ../../../tau2-bench && TAU2_DB_ONLY=1 .venv/bin/python <repo>/scripts/tau2_grade.py grade <file>
+# Handoff replays
 
-- sonnet_solo_run1.json / run2.json      — near-identical Sonnet solo (70% / 75%); 2-run oracle 90%
-- sonnet_solo_loosejson_45pct.json       — earlier loose-JSON harness Sonnet solo (45%) — shows harness gap
-- sonnet_perstep_fusion_8tasks.json      — per-step fusion, Sonnet, 8 tasks (50%) ~= solo
-- explore_v3_smoke.json                  — v3 read/write-asymmetric explore, tasks 0,1,2 (67% = oracle, 2x baseline)
+Raw run outputs + graded trajectories. See `docs/HANDOFF.md` for the full story.
+
+## tau2 retail (grade with tau2's REAL evaluator)
+`cd ../../../tau2-bench && TAU2_DB_ONLY=1 .venv/bin/python <repo>/scripts/tau2_grade.py grade <file>`
+- `sonnet_solo_run1.json` / `run2.json`     — near-identical Sonnet solo (70% / 75%); 2-run oracle 90%
+- `sonnet_solo_loosejson_45pct.json`        — earlier loose-JSON harness Sonnet solo (45%) — shows harness gap
+- `sonnet_perstep_fusion_8tasks.json`       — per-step fusion, Sonnet, 8 tasks (~50%) ≈ solo
+- `explore_v3_smoke.json`                    — read/write-asymmetric explore, tasks 0,1,2 (67% = oracle, 2× baseline)
+- `panel_synth_smoke_3of3.json`             — panel→synth (3-stance) smoke, tasks 0,1,2 (3/3 — unrepresentative)
+- `panel5_fullA_tasks0-1_2of2.json`         — 5-stance panel→synth, salvaged tasks 0,1 (2/2)
+- `panel5_full20_traj_75pct.json`           — ⭐ 5-stance panel→synth FULL 20 = 75% (ties best-solo)
+- `tau2_panel_evid_decide_retest_3of7.json` — backward-chaining evidence_decide synth retest (3/7 = old prompt; prompt isn't the lever)
+
+## SciCode (raw workflow outputs `[{problem_id, code|solo|fusion...}]`; score with scicode_score.py)
+- `scicode_haiku_test_gen.json`             — Haiku 4.5 test-split gen, without-bg (scored 23.6% sub)
+- `scicode_haiku_test_withbg_gen.json`      — Haiku 4.5 test-split gen, with-bg (35.1% sub)
+- `scicode_haiku_tr_cleanapi_withbg.json`   — Haiku 4.5 via clean temp-0 TR API, with-bg (34.7% — = subagent, rules out backend)
+- `scicode_sonnet_solo_vs_fusion.json`      — Sonnet solo vs same-model fusion, 3 problems (fusion 11 vs 9 — NOISE)
+- `scicode_sonnet_solo_vs_fusion_big.json`  — ⭐ same, 23 problems (solo 28.2% > fusion 25.4%)
+- `scicode_tier_diverse_fusion.json`        — ⭐ Sonnet+2Haiku+1Opus fusion vs Sonnet/Opus solo (16.7% < 25.0% < 37.5%)
