@@ -93,8 +93,22 @@ Problems 21–28 (24 steps, without-background, subagents):
 **Tier diversity DID lift fusion over Sonnet solo (+8.3)** — different Claude TIERS make
 different errors, so the Sonnet synth had real complementary signal (unlike 5 same-Sonnet
 stances, which tied solo). **BUT fusion < Opus solo** — the panel had a dominant member
-(Opus), so fusion landed BETWEEN the synth's tier and the best member, not above all. You'd
-just run Opus. Confirms the unified rule a 3rd time (tau2 tool-calling, SciCode same-model,
-SciCode tier-mix): **fusion beats solo only with a NO-dominant-member panel; the lever is
-panel composition, not the synth prompt.** n=24 → noisy, ordering clear. Harness:
-`scripts/scicode_fusion_mix.py` (per-member model panel; subagents, no TR $).
+(Opus), so fusion landed BETWEEN the synth's tier and the best member, not above all.
+
+### Drop the dominant Opus → fusion BEATS the best member (the rule's positive case)
+Same 24 steps, panel = **Sonnet + Sonnet + Haiku + Haiku** (no Opus) → Sonnet synth:
+| | subproblem |
+|---|---|
+| Haiku solo | 2/24 (8.3%) |
+| Sonnet solo (best member) | 4/24 (16.7%) |
+| **Sonnet+Haiku fusion** | **7/24 (29.2%)** |
+| _Opus solo (ref)_ | _9/24 (37.5%)_ |
+
+⭐ **First clean fusion > solo win:** with no dominant member, fusion (29.2%) beat BOTH members
+(+12.5 over the best, Sonnet) — Haiku's *different* errors gave the synth correct approaches
+Sonnet-solo missed. It even edged the with-Opus fusion (25%) — a dominant member didn't help.
+**The unified rule, demonstrated both directions on the same problems:** dominant member
+(Opus) → fusion < best member; no dominant member (Sonnet+Haiku) → fusion > best member. The
+lever is panel composition, not the synth prompt. n=24 (7 vs 4) → directional; needs a bigger
+run to firm up. Harness `scripts/scicode_fusion_mix.py` presets: `sh` (Sonnet+Haiku),
+`tier` (+Opus), `shf`/`tierf` (fusion-only — reuse saved solo replays, don't recompute).

@@ -19,7 +19,28 @@ from scicode.parse.parse import (read_from_hf_dataset, extract_function_name,
 
 PICK = (sys.argv[1] if len(sys.argv) > 1 else "21,22,23,24,25,26,27,28").split(",")
 SUF = sys.argv[2] if len(sys.argv) > 2 else "_MIX"
-CONC = int(sys.argv[3]) if len(sys.argv) > 3 else 2
+PRESET = sys.argv[3] if len(sys.argv) > 3 else "sh"
+CONC = int(sys.argv[4]) if len(sys.argv) > 4 else 2
+
+STANCES = [
+    'Derive the math/algorithm carefully from first principles; get formulas and constants exactly right.',
+    'Write the simplest implementation that exactly satisfies the spec.',
+    'Be careful with array shapes/broadcasting, units, and numerical stability; handle edge cases.',
+    'Consider the non-obvious/alternative correct formulation in case the obvious approach is subtly wrong.',
+]
+# panel = list of member models; SOLO = baselines to ALSO run (leave [] to reuse saved solo
+# replays instead of recomputing — fusion-only is much cheaper).
+PRESETS = {
+    "sh":    (["sonnet", "sonnet", "haiku", "haiku"], ["sonnet", "haiku"]),         # NO dominant member
+    "shf":   (["sonnet", "sonnet", "haiku", "haiku"], []),                          # ^ FUSION-ONLY (reuse saved solos)
+    "tier":  (["sonnet", "haiku", "haiku", "opus"], ["sonnet", "opus"]),            # Opus dominates
+    "tierf": (["sonnet", "haiku", "haiku", "opus"], []),                            # ^ fusion-only
+}
+PANEL_MODELS, SOLO_MODELS = PRESETS[PRESET]
+PANEL_JS = json.dumps([{"model": m, "stance": STANCES[i % len(STANCES)]} for i, m in enumerate(PANEL_MODELS)])
+SOLO_JS = json.dumps(SOLO_MODELS)
+PANEL_DESC = "+".join(PANEL_MODELS)   # quote-free, for the JS meta string
+SOLO_DESC = "/".join(SOLO_MODELS)
 
 TEMPLATE = (SCI / "eval/data/background_comment_template.txt").read_text()  # without-background
 SPECIAL = {"13": 6, "62": 1, "76": 3}
@@ -39,19 +60,14 @@ for pid in PICK:
 
 js = f"""export const meta = {{
   name: 'scicode-fusion-mix',
-  description: 'SciCode tier-diverse fusion (Sonnet+2Haiku+1Opus -> Sonnet synth) vs Sonnet/Opus solo',
+  description: 'SciCode diverse-panel fusion (preset={PRESET}: {PANEL_DESC}) -> Sonnet synth, vs {SOLO_DESC} solo',
   phases: [{{title:'MixFusion'}}],
 }}
 const PROBLEMS = {json.dumps(problems)}
 const TEMPLATE = {json.dumps(TEMPLATE)}
 // tier-diverse panel: different Claude tiers make DIFFERENT errors (real complementarity)
-const PANEL = [
-  {{model:'sonnet', stance:'Derive the math/algorithm carefully from first principles; get formulas and constants exactly right.'}},
-  {{model:'haiku',  stance:'Write the simplest implementation that exactly satisfies the spec.'}},
-  {{model:'haiku',  stance:'Be careful with array shapes/broadcasting, units, and numerical stability; handle edge cases.'}},
-  {{model:'opus',   stance:'Consider the non-obvious/alternative correct formulation in case the obvious approach is subtly wrong.'}},
-]
-const SOLO_MODELS = ['sonnet','opus']   // baseline (under test) + best-member reference
+const PANEL = {PANEL_JS}   // preset={PRESET}
+const SOLO_MODELS = {SOLO_JS}   // baselines: model-under-test + best-member reference
 const JUDGE='sonnet', SYNTH='sonnet'
 function extractPython(resp){{
   resp = resp || ''
@@ -105,5 +121,5 @@ return out
 outp = Path(f"results/_scicode_fusionmix{SUF}.js")
 outp.write_text(js)
 ns = sum(len(p["steps"]) for p in problems)
-print(f"wrote {outp} | problems={[p['problem_id'] for p in problems]} steps={ns} | "
-      f"per step: 2 solo + (4 panel+judge+synth=6) fusion = 8 calls | model mix sonnet/haiku/opus | bytes={len(js)}")
+print(f"wrote {outp} | preset={PRESET} panel={PANEL_MODELS} solo={SOLO_MODELS} | "
+      f"problems={[p['problem_id'] for p in problems]} steps={ns} bytes={len(js)}")

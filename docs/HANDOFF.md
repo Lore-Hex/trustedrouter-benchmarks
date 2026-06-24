@@ -11,6 +11,9 @@ single-shot tool-calling.
   share the model's errors, so the synth has no complementary signal).
 - A **tier-mixed Claude** panel (Sonnet+Haiku+Opus) beats the *synth's* tier but **loses to
   the dominant member** (Opus) — you'd just run Opus.
+- ⭐ **Remove the dominant member and fusion WINS:** a **Sonnet+Haiku** panel (no dominant
+  member) → Sonnet synth = **29.2% > best-member Sonnet-solo 16.7%** (> Haiku-solo 8.3%) on the
+  same 24 steps — **the first clean fusion>solo win**, the rule's positive case.
 - **The lever is panel composition, not the synth prompt.** Multiple synth-prompt variants
   (`evidence_decide`, backward-chaining "derive→ground→commit") all tie at same-model tier.
 
@@ -20,7 +23,8 @@ Evidence:
 | tau2 retail, Sonnet solo | 70–75% (real evaluator); **2-run oracle 90%** |
 | tau2, panel→synth (5 Sonnet stances), full-20 | **75% = ties best-solo** (won task 1 neither solo got; lost task 5 both solo got) |
 | SciCode, Sonnet solo vs same-model fusion (23 problems) | solo 28.2% vs fusion 25.4% — **fusion slightly worse** (small-sample +2 was noise) |
-| SciCode, tier-mix fusion (24 steps) | Sonnet-solo 16.7% < **fusion 25.0%** < Opus-solo 37.5% |
+| SciCode, tier-mix fusion (24 steps) | Sonnet-solo 16.7% < **fusion 25.0%** < Opus-solo 37.5% (dominant member) |
+| ⭐ SciCode, **Sonnet+Haiku** fusion (24 steps, no dominant member) | Haiku-solo 8.3% < Sonnet-solo 16.7% < **fusion 29.2%** — beats best member |
 
 The one configuration the rule says **should** win and we have **not** run: a panel of
 **comparable, different-family open-weight models with no dominant member** (qwen3 /
