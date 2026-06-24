@@ -69,9 +69,19 @@ every controllable variable; the gap is NOT in our harness:
 | harness | gencode vs inspect_ai | identical generation+scoring logic |
 
 The TR call uses the exact official params (temp 0, max_tokens 4096, no system prompt). Most
-fails are genuine `AssertionError`s (wrong values = real model errors). **The residual ~8 pts
-to the published 43.3 is unexplained by any controllable factor** — most likely a **direct-
-Anthropic-API serving/snapshot** difference (we have no Anthropic key; both available paths —
-TR routing + CC subagent — agree at ~35%, but neither is a pure direct Anthropic call).
+fails are genuine `AssertionError`s (wrong values = real model errors).
+
+**RESOLVED — it's the methodology, not a bug or serving.** The published 43.3 is from
+[Artificial Analysis](https://artificialanalysis.ai/evaluations/scicode), whose documented
+SciCode method is **independent subproblems**: the model is given the **gold/correct previous-
+step code** (errors don't cascade), with background, temp 0, pass@1. The **official public
+harness we reproduced uses the model's OWN previous code (cascading)** → strictly harder. That
+is the whole gap (AA's top model = 60.2% vs the official subproblem ceiling ~34%). Evidence
+from our own run: per-step capability *once predecessors are correct* = **65/127 = 51.2%**, and
+**161/288 steps were made unreachable by an earlier broken step** — AA gives those gold
+predecessors so they score independently. **43.3 sits inside our [34.7%, 51.2%] bracket.** We
+can't match it exactly because the gold solutions are withheld from the public HF dataset
+(0/291); a true AA-style run needs gold predecessors (obtain gold, or generate verified
+pseudo-gold with a strong model, then score each subproblem independently).
 Tools: `scripts/scicode_tr_gen.py` (clean temp-0 generation via TR), `scripts/scicode_score.py`
 (now uses `sys.executable` env; numpy-1.26 env = `scicode/.venv312`).
