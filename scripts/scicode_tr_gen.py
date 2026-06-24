@@ -3,17 +3,20 @@ numbers that the CC-subagent backend can't match (subagents aren't temp-0 / carr
 system prompt). Faithful to gencode.py; produces the same [{problem_id, code}] JSON that
 scicode_score.py consumes.
 
-Run:  python scripts/scicode_tr_gen.py test anthropic/claude-haiku-4.5 bg _TRBG
-      python scripts/scicode_tr_gen.py test anthropic/claude-haiku-4.5 nobg _TR "21,22,23"
+Uses the TrustedRouter SDK (`trustedrouter.TrustedRouter`). COST GUARD: refuses to run
+unless SCICODE_TR_CONFIRM=1 is set, because TR calls bill the operator's account.
+
+Run:  SCICODE_TR_CONFIRM=1 python scripts/scicode_tr_gen.py test anthropic/claude-haiku-4.5 bg _TRBG
 """
 import json
 import os
 import re
 import sys
 import time
-import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+
+from trustedrouter import TrustedRouter
 
 SCI = Path(os.environ.get("SCICODE_HOME") or (Path(__file__).resolve().parent.parent / "scicode"))
 sys.path.insert(0, str(SCI / "src"))
@@ -28,26 +31,29 @@ PICK = sys.argv[5].split(",") if len(sys.argv) > 5 else None
 CONC = int(sys.argv[6]) if len(sys.argv) > 6 else 12
 
 TR_KEY = Path(os.path.expanduser("~/claude/.tr_key")).read_text().strip()
-TR_URL = "https://api.trustedrouter.com/v1/chat/completions"
 TEMPLATE = (SCI / ("eval/data/multistep_template.txt" if BG else
                    "eval/data/background_comment_template.txt")).read_text()
 SPECIAL = {"13": 6, "62": 1, "76": 3}
 
+# COST GUARD: TrustedRouter calls bill the operator's account. This harness stays DORMANT
+# (makes no network call) unless explicitly opted in with SCICODE_TR_CONFIRM=1. Safe to
+# commit/import; it will not spend money on its own.
+if not os.environ.get("SCICODE_TR_CONFIRM"):
+    sys.exit("scicode_tr_gen: refusing to call TrustedRouter (it costs money). "
+             "Re-run with SCICODE_TR_CONFIRM=1 to proceed.")
 
-def tr_call(prompt, model=MODEL, temperature=0, max_tokens=4096, _tries=5):
-    body = json.dumps({"model": model, "temperature": temperature, "max_tokens": max_tokens,
-                       "messages": [{"role": "user", "content": prompt}]}).encode()
-    req = urllib.request.Request(TR_URL, data=body, headers={
-        "Authorization": f"Bearer {TR_KEY}", "Content-Type": "application/json"})
-    for t in range(_tries):
-        try:
-            with urllib.request.urlopen(req, timeout=240) as r:
-                return json.loads(r.read())["choices"][0]["message"]["content"] or ""
-        except Exception as e:
-            if t == _tries - 1:
-                print(f"  tr_call failed: {str(e)[:120]}", file=sys.stderr)
-                return ""
-            time.sleep(2 * (t + 1))
+_client = TrustedRouter(api_key=TR_KEY)  # SDK handles retries + regional failover
+
+
+def tr_call(prompt, model=MODEL, temperature=0, max_tokens=4096):
+    try:
+        resp = _client.chat_completions(
+            model=model, temperature=temperature, max_tokens=max_tokens,
+            messages=[{"role": "user", "content": prompt}])
+        return resp.choices[0].message.content or ""
+    except Exception as e:
+        print(f"  tr_call failed: {str(e)[:140]}", file=sys.stderr)
+        return ""
 
 
 def extract_python_script(response):  # verbatim from scicode.gen.models
