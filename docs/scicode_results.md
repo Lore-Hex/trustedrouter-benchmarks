@@ -55,3 +55,23 @@ SCICODE_TIMEOUT=120 python scripts/scicode_score.py results/_scicode_TESTBG_out.
 python scripts/scicode_fusion_gen.py "53,59,65" _SF sonnet 3
 ```
 See `scicode/VENDOR_SETUP.md` for the one-time `test_data.h5` fetch.
+
+## Replication diagnosis (why our Haiku ≈ 35%, published ≈ 43.3)
+With-background Haiku 4.5 = **34.7% (100/288)**, and it is ROCK-SOLID — reproduces across
+every controllable variable; the gap is NOT in our harness:
+| variable | tested | result |
+|---|---|---|
+| backend / temperature | CC subagent vs TR clean **temp-0** | 35.1% vs 34.7% (same) |
+| truncation | max_tokens 4096 | 0 cut-offs |
+| class-based problems | pass rate | pass *more* (44%) not less |
+| numpy / Python | 2.5/3.14 vs **1.26/3.12** | 100/288 both (identical) |
+| prompt | vs official `process_problem_steps` | line-for-line match |
+| harness | gencode vs inspect_ai | identical generation+scoring logic |
+
+The TR call uses the exact official params (temp 0, max_tokens 4096, no system prompt). Most
+fails are genuine `AssertionError`s (wrong values = real model errors). **The residual ~8 pts
+to the published 43.3 is unexplained by any controllable factor** — most likely a **direct-
+Anthropic-API serving/snapshot** difference (we have no Anthropic key; both available paths —
+TR routing + CC subagent — agree at ~35%, but neither is a pure direct Anthropic call).
+Tools: `scripts/scicode_tr_gen.py` (clean temp-0 generation via TR), `scripts/scicode_score.py`
+(now uses `sys.executable` env; numpy-1.26 env = `scicode/.venv312`).

@@ -52,7 +52,7 @@ print(f"wrote {nfiles} step files to {code_root}")
 
 # run the OFFICIAL test runner with the venv python on PATH (test subprocess calls bare `python`)
 os.chdir(SCI)
-os.environ["PATH"] = str(SCI / ".venv" / "bin") + os.pathsep + os.environ["PATH"]
+os.environ["PATH"] = os.path.dirname(sys.executable) + os.pathsep + os.environ["PATH"]
 spec = importlib.util.spec_from_file_location("tgc", str(SCI / "eval/scripts/test_generated_code.py"))
 tgc = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(tgc)
