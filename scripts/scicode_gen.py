@@ -24,8 +24,12 @@ SPLIT = sys.argv[1] if len(sys.argv) > 1 else "validation"
 SUF = sys.argv[2] if len(sys.argv) > 2 else "_VAL"
 MODEL = sys.argv[3] if len(sys.argv) > 3 else "haiku"
 CONC = int(sys.argv[4]) if len(sys.argv) > 4 else 12
+BG = len(sys.argv) > 5 and sys.argv[5] in ("bg", "1", "with_background")  # with-background setting
 
-TEMPLATE = (SCI / "eval/data/background_comment_template.txt").read_text()  # WITHOUT-background
+# with-background: the gold scientific background is GIVEN (multistep template + step_background
+# appended to each description). without-background (default): model must recall the science.
+TEMPLATE = (SCI / ("eval/data/multistep_template.txt" if BG else
+                   "eval/data/background_comment_template.txt")).read_text()
 SPECIAL = {"13": 6, "62": 1, "76": 3}  # prob_id -> 1-indexed step that is skipped (use gold)
 
 data = read_from_hf_dataset(SPLIT)
@@ -34,7 +38,8 @@ for prob in data:
     pid = prob["problem_id"]
     steps = []
     for ss in prob["sub_steps"]:
-        steps.append({"desc": ss["step_description_prompt"],
+        desc = ss["step_description_prompt"] + ("\n" + ss["step_background"] if BG else "")
+        steps.append({"desc": desc,
                       "header": ss["function_header"], "ret": ss["return_line"]})
     skip = {}
     if pid in SPECIAL:
