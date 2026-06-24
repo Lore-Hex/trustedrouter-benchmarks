@@ -33,6 +33,7 @@ STANCES = [
 PRESETS = {
     "sh":    (["sonnet", "sonnet", "haiku", "haiku"], ["sonnet", "haiku"]),         # NO dominant member
     "shf":   (["sonnet", "sonnet", "haiku", "haiku"], []),                          # ^ FUSION-ONLY (reuse saved solos)
+    "sf":    (["sonnet", "sonnet", "haiku", "haiku"], ["sonnet"]),                  # ^ fusion + Sonnet-solo paired (reuse Haiku)
     "tier":  (["sonnet", "haiku", "haiku", "opus"], ["sonnet", "opus"]),            # Opus dominates
     "tierf": (["sonnet", "haiku", "haiku", "opus"], []),                            # ^ fusion-only
 }

@@ -95,26 +95,36 @@ different errors, so the Sonnet synth had real complementary signal (unlike 5 sa
 stances, which tied solo). **BUT fusion < Opus solo** — the panel had a dominant member
 (Opus), so fusion landed BETWEEN the synth's tier and the best member, not above all.
 
-### Drop Opus → Sonnet+Haiku fusion: PILOT looked like a win, but the powered run says TIE
-Panel = **Sonnet + Sonnet + Haiku + Haiku** (no Opus) → Sonnet synth.
+### Drop Opus → Sonnet+Haiku fusion: PILOT looked like a win, but the FULL test split is a dead TIE
+Panel = **Sonnet + Sonnet + Haiku + Haiku** (no Opus) → Sonnet synth. Powered up in three steps;
+each scale-up shrank the error bar and erased the apparent win:
 
-**Pilot (8 problems / 24 steps):** Haiku 8.3% · Sonnet 16.7% · fusion **29.2%** — looked like a
-clean +12.5 win. **But it was small-sample noise** (those 8 problems are a hard subset; Sonnet
-drew an anomalously low 16.7%).
+**1. Pilot (8 problems / 24 steps):** Haiku 8.3% · Sonnet 16.7% · fusion **29.2%** — looked like a
+clean +12.5 win. **Small-sample noise** (a hard subset; Sonnet drew an anomalously low 16.7%).
 
-**Powered run (23 problems / 71 steps, cluster bootstrap over problems, B=10,000):**
-| | rate | 95% CI |
+**2. Powered run (23 problems / 71 steps, cluster bootstrap over problems, B=10,000):**
+Haiku 12.7% · Sonnet 28.2% [18.3, 38.4] · fusion **29.6%** [19.2, 40.8] — diff +1.4, 95% CI
+**[−11.0, +14.1]**, P=54%. Not significant, but the ±12.5 bar was too wide to be decisive.
+
+**3. FULL test split (65 problems / 288 scored steps, same cluster bootstrap, B=10,000):**
+| | rate (×/288) | 95% CI |
 |---|---|---|
-| Haiku solo | 12.7% | [5.6, 20.5] |
-| Sonnet solo (best member) | 28.2% | [18.3, 38.4] |
-| **Sonnet+Haiku fusion** | **29.6%** | [19.2, 40.8] |
+| Haiku solo | 23.4% | [17.1, 29.8] |
+| Sonnet solo (best member) | **35.7%** (104) | [27.5, 44.1] |
+| **Sonnet+Haiku fusion** | **35.7%** (104) | [27.4, 44.1] |
 
-**FUSION − Sonnet-solo = +1.4 pts, 95% CI [−11.0, +14.1], P(fusion>solo)=54%** (McNemar 6 vs 5).
-**No significant difference — fusion ≈ Sonnet-solo.** The rule is *reinforced*, not broken:
-Sonnet+Haiku still has a **dominant member** (Sonnet 28% ≫ Haiku 13%), so fusion tracks the best
-member. "No dominant member" requires *comparable-strength* models — which Sonnet/Haiku aren't.
-⭐ LESSON (again): validate fusion deltas on ≥20 items; the 8-problem pilot false-positived
-exactly as warned. The genuinely-untested winning config = a comparable, different-family
-**open-weight** panel (qwen3/deepseek/glm/kimi/minimax) via TR — gated on $. Harness
-`scripts/scicode_fusion_mix.py` presets: `sh`/`tier` (+solo baselines), `shf`/`tierf`
-(fusion-only — reuse saved solo replays).
+**FUSION − Sonnet-solo = +0.0 pts, 95% CI [−4.6, +4.7], P(fusion>solo)=46.8%.** Per-problem it is
+a perfect wash: **fusion wins 7 problems, solo wins 7, 51 tie** (main/fully-correct: fusion 6 vs
+solo 5). At full power the synth nets **exactly zero** — the +1.4 / +12.5 from smaller runs were
+noise, and the difference CI tightened **±12.5 → ±4.7 (~2.6×)** going 23 → 65 problems.
+
+**Rule reinforced, not broken.** Sonnet+Haiku still has a **dominant member** (Sonnet 36% ≫ Haiku
+23%), so fusion tracks the best member — no lift. "No dominant member" requires *comparable-
+strength* models, which Sonnet/Haiku aren't. ⭐ LESSON (again, now 3×): validate fusion deltas on
+the FULL set — the 8- and 23-problem runs both over-stated the delta exactly as warned. The
+genuinely-untested winning config = a comparable, different-family **open-weight** panel
+(qwen3/deepseek/glm/kimi/minimax) via TR — gated on $. Harness `scripts/scicode_fusion_mix.py`
+presets: `sh`/`tier` (+solo baselines), `shf`/`tierf` (fusion-only — reuse saved solo replays),
+`sf` (fusion + Sonnet-solo paired, reuse Haiku). Reproduce the verdict:
+`scripts/scicode_merge65.py` (merge the batch dicts) → `scripts/scicode_bootstrap.py all65_fusion
+all65_sonnet,haiku <65 pids> test nobg`.
