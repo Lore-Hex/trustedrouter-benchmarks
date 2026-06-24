@@ -13,17 +13,13 @@ and **with-background** (gold science is given — easier).
 | without-background (realistic) | **68/288 = 23.6%** | 1/65 = 1.5% |
 | with-background (science given) | **101/288 = 35.1%** | 2/65 = 3.1% |
 
-**Calibration.** with-background lifts Haiku **+11.5 pts** (23.6 → 35.1), confirming the
-**published ~43.3 is the with-background setting** (Haiku does much better when handed the
-science). The residual **35.1 vs 43.3** (~8 pts) is the **generation backend**: this harness
-drives generation with Claude Code *subagents* (full agentic system prompt, non-zero temp),
-not a clean temperature-0 API call. For *agentic* tau2 that matched the leaderboard (Sonnet
-70–75 ≈ 74); for SciCode *single-shot code-gen* the agentic wrapper + temp deflates absolute
-scores ~8 pts (also 5/288 with-bg timeouts at 120 s). **So absolute SciCode numbers here run
-~8 pts low vs a clean-API leaderboard run, but RELATIVE comparisons are valid** (with-vs-
-without-bg, fusion-vs-solo share the backend). Harness otherwise sound: validation = 25/50
-(50%), only 2/288 without-bg timeouts; gold is withheld from the HF dataset (0/291) so no
-direct gold-check.
+**Calibration.** with-background lifts Haiku **+11.5 pts** (23.6 → 35.1). The published ~43.3
+is a **different test, not a backend gap** — see *Replication diagnosis* below: it's Artificial
+Analysis's **independent-subproblem (gold-context)** methodology vs the **official cascading**
+harness we reproduce. (An earlier guess blaming the CC-subagent backend was DISPROVEN — a
+clean temp-0 TR API call also gives 34.7%.) RELATIVE comparisons here are valid (with-vs-
+without-bg, fusion-vs-solo share the backend). Harness sound: validation = 25/50 (50%), only
+2/288 without-bg timeouts; gold withheld from the HF dataset (0/291) so no direct gold-check.
 
 ## Sonnet — solo vs fusion (per-step 5-panel → judge → evidence_decide synth)
 Two runs, without-background:
