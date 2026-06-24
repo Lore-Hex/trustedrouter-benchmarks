@@ -95,10 +95,29 @@ response (parallel reads):
 The judge stays as-is. NO `isMutating()` heuristic, NO write-verify stage — the synth decides.
 Gate deploy on Joseph's go (NOT deployed).
 
+## Run status / resume (2026-06-23 20:00 PT)
+**Full-20 panel→synth (5-stance) is IN PROGRESS, blocked on the Claude Code WEEKLY cap**
+(not the nightly session limit — resets 5pm PT on its weekly reset day; 923 calls failed at
+8pm, so it's still active). Split into two 10-task batches to stay under the 1000-agent cap:
+- **Batch A** (tasks 0–9): `results/_retail_panel_FULLA.js`, runId `wf_076233b2-428`. Hit the
+  cap mid-run — **tasks 0 & 1 completed and graded 1.0 (2/2, 5-panel)**; 2–3 got the auth step
+  only; 4–9 never started. Raw: `results/_panel_fullA_raw.json`.
+- **Batch B** (tasks 10–19): `results/_retail_panel_FULLB.js` — not started.
+
+**To finish when the weekly cap resets:**
+1. `Workflow({scriptPath:".../results/_retail_panel_FULLA.js", resumeFromRunId:"wf_076233b2-428"})`
+   — cached agents (0,1) return instantly; only 2–9 consume quota.
+2. Then run `results/_retail_panel_FULLB.js` (10–19) — AFTER A finishes (never two Sonnet
+   workflows at once → rate-limit death).
+3. Grade both with `tau2_grade.py` (TAU2_DB_ONLY=1); combine for the full-20 vs solo 75% / oracle 90%.
+
+**Cost lever if the weekly budget is tight:** make the PANEL Haiku, keep the SYNTH Sonnet
+(per-member model in `gen_retail_panel.py`). Much cheaper, and per our earlier finding Haiku
+stances DISAGREE more → likely MORE read-breadth. (5 Sonnet panel + Sonnet synth = 6 calls/step
+is what burned the weekly cap on ~4 tasks of retries.)
+
 ## Open questions / next steps
-1. **Full-20 explore run** (vs solo 75% and oracle 90%) — quota-limited; `python
-   scripts/gen_retail_explore.py "0..19" "_EXP20" sonnet` → run the `.js` via Workflow →
-   grade.
+1. **Finish the full-20 panel→synth run** (see Run status above) vs solo 75% and oracle 90%.
 2. **Diverse open-weight panel** (the genuine fusion>solo demo) — needs TR credits back;
    Claude models are capability-ordered so a Claude panel always has a dominant member.
 3. **opencode validation** — port the read/write loop with test-execution as the write

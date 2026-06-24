@@ -98,6 +98,8 @@ const PANEL = [
   {{name:'thorough', stance:'STANCE: Be thorough. Before acting, gather ALL potentially relevant data first — look up the user, EVERY one of their orders, and every candidate product/variant. Prefer proposing several reads at once.'}},
   {{name:'direct', stance:'STANCE: Be direct and efficient. Identify the minimal information actually needed to fulfill the request, then propose the action. Avoid unnecessary lookups.'}},
   {{name:'skeptical', stance:'STANCE: Be skeptical and precise. Verify every id and precondition against the gathered data before any change. Watch for exact order-id formatting (e.g. a leading hash), the correct payment method, item availability, and pending-vs-delivered status. When unsure of an id, look it up from the user order list rather than guessing.'}},
+  {{name:'policy', stance:'STANCE: Be policy-driven. Check the policy before any action: authenticate the user FIRST; only PENDING orders can be modified/cancelled; DELIVERED orders can be exchanged or returned (once each); refunds go only to the original payment method or a gift card. Propose the reads/actions that keep the request strictly within policy, and redirect anything it disallows.'}},
+  {{name:'alternative', stance:'STANCE: Consider the non-obvious interpretation and edge cases. The user may have MULTIPLE matching orders, items may span different orders, a requested variant may be unavailable or only partially in stock, or an id may be formatted unexpectedly. Propose reads that surface these possibilities (list ALL the user orders, check EVERY candidate variant) rather than assuming the simplest case.'}},
 ]
 function execTool(name,a){{
   try{{
