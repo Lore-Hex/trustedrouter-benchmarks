@@ -95,29 +95,27 @@ response (parallel reads):
 The judge stays as-is. NO `isMutating()` heuristic, NO write-verify stage — the synth decides.
 Gate deploy on Joseph's go (NOT deployed).
 
-## Run status / resume (2026-06-23 20:00 PT)
-**Full-20 panel→synth (5-stance) is IN PROGRESS, blocked on the Claude Code WEEKLY cap**
-(not the nightly session limit — resets 5pm PT on its weekly reset day; 923 calls failed at
-8pm, so it's still active). Split into two 10-task batches to stay under the 1000-agent cap:
-- **Batch A** (tasks 0–9): `results/_retail_panel_FULLA.js`, runId `wf_076233b2-428`. Hit the
-  cap mid-run — **tasks 0 & 1 completed and graded 1.0 (2/2, 5-panel)**; 2–3 got the auth step
-  only; 4–9 never started. Raw: `results/_panel_fullA_raw.json`.
-- **Batch B** (tasks 10–19): `results/_retail_panel_FULLB.js` — not started.
+## FINAL full-20 result (2026-06-23) — panel→synth ties solo, does NOT beat it
+Completed (batch A `wf_076233b2-428` resumed past the weekly cap, batch B `wf_46a92886-05b`).
+Full 20 tasks, real evaluator (DB):
 
-**To finish when the weekly cap resets:**
-1. `Workflow({scriptPath:".../results/_retail_panel_FULLA.js", resumeFromRunId:"wf_076233b2-428"})`
-   — cached agents (0,1) return instantly; only 2–9 consume quota.
-2. Then run `results/_retail_panel_FULLB.js` (10–19) — AFTER A finishes (never two Sonnet
-   workflows at once → rate-limit death).
-3. Grade both with `tau2_grade.py` (TAU2_DB_ONLY=1); combine for the full-20 vs solo 75% / oracle 90%.
+| approach | full-20 | note |
+|---|---|---|
+| solo run1 / run2 | 70% / 75% | |
+| **panel→synth (5-stance Sonnet)** | **75%** | ties best-solo, ~3× cost |
+| 2-run oracle | 90% | ceiling |
 
-**Cost lever if the weekly budget is tight:** make the PANEL Haiku, keep the SYNTH Sonnet
-(per-member model in `gen_retail_panel.py`). Much cheaper, and per our earlier finding Haiku
-stances DISAGREE more → likely MORE read-breadth. (5 Sonnet panel + Sonnet synth = 6 calls/step
-is what burned the weekly cap on ~4 tasks of retries.)
+Per-task, panel→synth **traded wins for losses** vs solo: it SOLVED task 1 (neither solo run
+got it — the panel-breadth win) but LOST task 5 (both solo runs pass it) plus 3,4,6. Net = 75%
+= best-solo. **This confirms the unifying rule in the agentic setting: a same-model (Sonnet)
+stance-panel ≈ solo** — the 3/3 smoke (tasks 0,1,2) was unrepresentative cherry-picking. To
+actually beat solo you need a genuinely diverse multi-MODEL panel (TR open-weights), OR try the
+Haiku-panel + Sonnet-synth mix (cheaper, stances disagree more — untested). Trajectories:
+`results/_panel_full20_traj.json`; raw `results/_panel_full{A,B}_raw.json`.
 
 ## Open questions / next steps
-1. **Finish the full-20 panel→synth run** (see Run status above) vs solo 75% and oracle 90%.
+1. **DONE: full-20 panel→synth = 75% = ties solo** (see FINAL result above). The open lever to
+   actually BEAT solo: a diverse multi-MODEL panel, or Haiku-panel+Sonnet-synth.
 2. **Diverse open-weight panel** (the genuine fusion>solo demo) — needs TR credits back;
    Claude models are capability-ordered so a Claude panel always has a dominant member.
 3. **opencode validation** — port the read/write loop with test-execution as the write
