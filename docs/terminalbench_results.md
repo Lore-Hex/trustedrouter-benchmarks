@@ -12,25 +12,26 @@ the **official** harness and grader and swap only the model backend.
 
   | model | backend | default budget (360–600 s) | **generous budget (1800 s)** |
   |---|---|---|---|
-  | Haiku 4.5 | `claude -p` | 20% (2/10) | _(not rerun)_ |
-  | Sonnet 4.6 | `claude -p` | 50% (5/10) | _(not rerun)_ |
+  | Haiku 4.5 | `claude -p` | 20% (2/10) | 20% (timeouts genuine) |
+  | Sonnet 4.6 | `claude -p` | 50% (5/10) | 50% (timeouts genuine) |
   | Opus 4.8 | `claude -p` | 40% (4/10) | **70% (7/10)** |
   | Opus 4.7 | `claude -p` | 70% (7/10) | **80% (8/10)** |
-  | **gemini-3.1-pro** | `agy` (Antigravity) | **80% (8/10)** | _(not rerun; 1 timeout)_ |
+  | **gemini-3.1-pro** | `agy` (Antigravity) | **80% (8/10)** | _(1 timeout; not rerun)_ |
 
   ⭐ **gemini-3.1-pro = 80% at the default budget** — best of any model on this subset, and the
   **only** one to solve `nginx-request-logging` (every Claude model fails it). Its sole timeout was
   count-dataset-tokens; fix-git its only other miss.
 
-- ⭐ **On the free CLI path the score is latency-bound, not capability-bound, for slow models.**
-  Opus 4.8's *default-budget* 40% landed **below** Sonnet's 50% — not because it's weaker (it
-  uniquely solved `fix-git`) but because its slower per-turn `claude -p` latency hit **5
-  `agent_timeout`s**. Re-running just the timed-out tasks with `--global-agent-timeout-sec 1800`
-  recovers `csv-to-parquet`, `password-recovery`, `sqlite-db-truncate` → **Opus 4.8 = 70%**, and
-  **Opus 4.7 = 80%**. So the apparent "Opus < Sonnet" inversion was entirely the wall-clock budget,
-  not capability. (Haiku/Sonnet also had 1–2 timeouts each, so their numbers are likewise floors;
-  not yet rerun — the generous-budget comparison was scoped to Opus.) A fast (paid-API / TR)
-  backend removes the penalty outright — see the TrustedRouter backend below.
+- ⭐ **The latency-timeout artifact was real but specific to the slowest model (Opus).** Opus 4.8's
+  *default-budget* 40% landed **below** Sonnet's 50% — not because it's weaker (it uniquely solved
+  `fix-git`) but because its slower per-turn `claude -p` latency hit **5 `agent_timeout`s**.
+  Re-running just the timed-out tasks at `--global-agent-timeout-sec 1800` recovers
+  `csv-to-parquet`, `password-recovery`, `sqlite-db-truncate` → **Opus 4.8 = 70%**, **Opus 4.7 =
+  80%**. The "Opus < Sonnet" inversion was entirely the wall-clock budget. **Crucially, the same
+  1800 s rerun did NOT move Sonnet (50%) or Haiku (20%)** — their timed-out tasks (count-dataset-
+  tokens, password-recovery, sqlite, csv-to-parquet) genuinely fail with 30 min too, so those
+  scores are *real*, not latency-floored. A fast (paid-API / TR / agy) backend removes the penalty
+  for the slow models outright.
 - Remaining failures after the generous budget: `nginx-request-logging` is the only **genuine**
   all-model fail; the rest are **flaky agent errors** (a task that errors for one Opus version
   passes for the other — e.g. count-dataset-tokens 4.7✓/4.8✗, password-recovery 4.8✓/4.7✗).
