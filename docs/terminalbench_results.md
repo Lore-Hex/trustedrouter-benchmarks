@@ -8,14 +8,33 @@ the **official** harness and grader and swap only the model backend.
 ## ⭐ TL;DR
 - **Harness validated end-to-end** on the real Docker + official grader: `oracle` agent = **100%**
   on `hello-world` (uses the reference solution), our Haiku agent = **100%** on `hello-world`.
-- On the same curated 10-task non-qemu subset of terminal-bench-core 0.1.1 (free `claude -p`):
-  **Haiku 4.5 = 20% (2/10)**, **Sonnet 4.6 = 50% (5/10)**. Sonnet's passes are a strict superset
-  of Haiku's. **3 of Sonnet's 5 failures are `agent_timeout`** (slower per-turn `claude -p`
-  latency burns the task budget), so its true capability on this subset is likely > 50%.
+- Same curated 10-task non-qemu subset of terminal-bench-core 0.1.1, free `claude -p` backend:
+
+  | model | score | passes |
+  |---|---|---|
+  | Haiku 4.5 | 20% (2/10) | fix-permissions, heterogeneous-dates |
+  | **Sonnet 4.6** | **50% (5/10)** | + simple-web-scraper, openssl-selfsigned-cert, csv-to-parquet |
+  | Opus 4.8 | 40% (4/10) | fix-permissions, heterogeneous-dates, openssl-selfsigned-cert, **fix-git** |
+  | Opus 4.7 | _(running)_ | |
+
+- ⭐ **The score is latency-bound, not capability-bound, for slow models.** Opus 4.8 (40%) scores
+  *below* Sonnet (50%) — not because it's weaker (it uniquely solved `fix-git`, which Sonnet
+  failed) but because its slower per-turn `claude -p` latency hit **5 `agent_timeout`s**, losing
+  `csv-to-parquet` and `simple-web-scraper` that Sonnet finished in time. On the free CLI path the
+  task's wall-clock budget caps the bigger models. A fast (paid-API / TR) backend would remove
+  this — see the TrustedRouter backend below.
 - This is **"our harness," not the published 27.3%.** Artificial Analysis's *Terminal-Bench Hard*
   (Haiku 4.5 = **27.3%**) is a **different test**: a **secret 47-task subset** run with the real
   **Terminus-2 agent over a paid API**. We can't reproduce that figure exactly — same
   methodology-opacity lesson as SciCode's "43.3" (AA's subset + scaffold are undisclosed).
+
+## Backends (how the model is called)
+Three ways to drive the **same** real Terminus-2 scaffold + official grader:
+| backend | script / agent | cost | faithfulness | notes |
+|---|---|---|---|---|
+| free `claude -p` | `tb_haiku_agent.py` → `HaikuCliTerminus` | **free** (CC quota) | "our harness" (CC runtime wrap + per-turn latency) | used for all Haiku/Sonnet/Opus numbers above; `-m claude-{haiku-4-5,sonnet-4-6,opus-4-8,opus-4-7}` |
+| **TrustedRouter SDK** | `tb_tr_agent.py` → `TRTerminus` | **TR $ (gated)** | faithful Terminus-2-over-API | any of TR's ~230 models: `-m anthropic/claude-haiku-4.5`, `-m google/gemini-3.1-pro`, the Chinese open-weight panel, … **Cost-guarded: dormant unless `TB_TR_CONFIRM=1`.** Needs `trustedrouter` in the tb venv (`uv run --with trustedrouter ...`). This is the path that could chase the published 27.3% (fast API removes the latency-timeout penalty). |
+| gemini-cli (in-container) | built-in `--agent gemini-cli` | Google API $ | faithful (real Gemini CLI agent) | ⚠️ **BLOCKED**: the host `~/.gemini` OAuth now returns `IneligibleTierError` ("no longer supported for Gemini Code Assist for individuals — migrate to Antigravity"). Google killed the free individual gemini-cli tier, and the tb agent only injects `GEMINI_API_KEY`/`GOOGLE_API_KEY` into the container (not host OAuth). Needs a paid `GEMINI_API_KEY`, or route gemini-3.1-pro via the TR backend instead. |
 
 ## What we built
 - **Vendored** official Terminal-Bench **v0.2.18** (commit `1a6ffa9`), dataset
