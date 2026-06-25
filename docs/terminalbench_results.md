@@ -10,12 +10,17 @@ the **official** harness and grader and swap only the model backend.
   on `hello-world` (uses the reference solution), our Haiku agent = **100%** on `hello-world`.
 - Same curated 10-task non-qemu subset of terminal-bench-core 0.1.1, free `claude -p` backend:
 
-  | model | default budget (360–600 s) | **generous budget (1800 s)** | passes (default) |
+  | model | backend | default budget (360–600 s) | **generous budget (1800 s)** |
   |---|---|---|---|
-  | Haiku 4.5 | 20% (2/10) | _(not rerun)_ | fix-permissions, heterogeneous-dates |
-  | Sonnet 4.6 | 50% (5/10) | _(not rerun)_ | + simple-web-scraper, openssl, csv-to-parquet |
-  | Opus 4.8 | 40% (4/10) | **70% (7/10)** | + fix-git |
-  | **Opus 4.7** | 70% (7/10) | **80% (8/10)** | the most |
+  | Haiku 4.5 | `claude -p` | 20% (2/10) | _(not rerun)_ |
+  | Sonnet 4.6 | `claude -p` | 50% (5/10) | _(not rerun)_ |
+  | Opus 4.8 | `claude -p` | 40% (4/10) | **70% (7/10)** |
+  | Opus 4.7 | `claude -p` | 70% (7/10) | **80% (8/10)** |
+  | **gemini-3.1-pro** | `agy` (Antigravity) | **80% (8/10)** | _(not rerun; 1 timeout)_ |
+
+  ⭐ **gemini-3.1-pro = 80% at the default budget** — best of any model on this subset, and the
+  **only** one to solve `nginx-request-logging` (every Claude model fails it). Its sole timeout was
+  count-dataset-tokens; fix-git its only other miss.
 
 - ⭐ **On the free CLI path the score is latency-bound, not capability-bound, for slow models.**
   Opus 4.8's *default-budget* 40% landed **below** Sonnet's 50% — not because it's weaker (it
@@ -40,7 +45,7 @@ Three ways to drive the **same** real Terminus-2 scaffold + official grader:
 |---|---|---|---|---|
 | free `claude -p` | `tb_haiku_agent.py` → `HaikuCliTerminus` | **free** (CC quota) | "our harness" (CC runtime wrap + per-turn latency) | used for all Haiku/Sonnet/Opus numbers above; `-m claude-{haiku-4-5,sonnet-4-6,opus-4-8,opus-4-7}` |
 | **TrustedRouter SDK** | `tb_tr_agent.py` → `TRTerminus` | **TR $ (gated)** | faithful Terminus-2-over-API | any of TR's ~230 models: `-m anthropic/claude-haiku-4.5`, `-m google/gemini-3.1-pro`, the Chinese open-weight panel, … **Cost-guarded: dormant unless `TB_TR_CONFIRM=1`.** Needs `trustedrouter` in the tb venv (`uv run --with trustedrouter ...`). This is the path that could chase the published 27.3% (fast API removes the latency-timeout penalty). |
-| Antigravity CLI (`agy`) | `tb_agy_agent.py` → `AgyTerminus` | Google account (OAuth) | "our harness" (agy runtime wrap + latency) | gemini via the official **`agy -p`** (replaces the dead consumer gemini-cli). Same host-side Terminus pattern as `claude -p`. **Requires a one-time `agy` browser sign-in** (only the account owner can do it); then `-m gemini-3.1-pro`. Built + installed (`brew install --cask antigravity-cli`), pending sign-in. |
+| Antigravity CLI (`agy`) | `tb_agy_agent.py` → `AgyTerminus` | Google account (OAuth) | "our harness" (agy runtime wrap; agy `-p` is fast ~5 s/turn) | gemini via the official **`agy -p`** (replaces the dead consumer gemini-cli). Same host-side Terminus pattern as `claude -p`. One-time `agy` browser sign-in done. **Live: `-m gemini-3.1-pro` → 80% (8/10).** Install: `brew install --cask antigravity-cli`. |
 | gemini-cli (in-container) | built-in `--agent gemini-cli` | Google API $ | faithful (real Gemini CLI agent) | ⚠️ **DEAD for OAuth**: host `~/.gemini` OAuth returns `IneligibleTierError` (Google killed the free individual gemini-cli tier → migrate to `agy`). Would need a paid `GEMINI_API_KEY`, or route gemini-3.1-pro via the TR backend. |
 
 ## What we built
@@ -59,19 +64,19 @@ Default budget = each task's own `max_agent_timeout_sec` (360–600 s), max_epis
 also show the **generous-budget rerun** (`--global-agent-timeout-sec 1800`, max_episodes=60) of the
 timed-out tasks. `TO`=agent_timeout, `ERR`=flaky agent error, `✅*`=passed despite a late timeout.
 
-| task | Haiku | Sonnet | Opus 4.8 | Opus 4.8 (1800s) | Opus 4.7 | Opus 4.7 (1800s) |
-|---|---|---|---|---|---|---|
-| fix-permissions | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| heterogeneous-dates | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| openssl-selfsigned-cert | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| fix-git | ❌ | ❌ | ✅ | ✅ | ✅ | ✅ |
-| simple-web-scraper | ❌ | ✅ | TO | TO/crash | ✅ | ✅ |
-| csv-to-parquet | TO | ✅ | TO | ✅ | ✅* | ✅ |
-| sqlite-db-truncate | ❌ | TO | TO | ✅ | ✅* | ✅ |
-| password-recovery | TO | TO | TO | ✅ | TO | ERR |
-| count-dataset-tokens | ❌ | TO | TO | ERR | TO | ✅ |
-| nginx-request-logging | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
-| **TOTAL** | **20%** | **50%** | **40%** | **70%** | **70%** | **80%** |
+| task | Haiku | Sonnet | Opus 4.8 | Opus 4.8·1800s | Opus 4.7 | Opus 4.7·1800s | gemini-3.1-pro |
+|---|---|---|---|---|---|---|---|
+| fix-permissions | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| heterogeneous-dates | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| openssl-selfsigned-cert | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| fix-git | ❌ | ❌ | ✅ | ✅ | ✅ | ✅ | ❌ |
+| simple-web-scraper | ❌ | ✅ | TO | TO/crash | ✅ | ✅ | ✅ |
+| csv-to-parquet | TO | ✅ | TO | ✅ | ✅* | ✅ | ✅ |
+| sqlite-db-truncate | ❌ | TO | TO | ✅ | ✅* | ✅ | ✅ |
+| password-recovery | TO | TO | TO | ✅ | TO | ERR | ✅ |
+| count-dataset-tokens | ❌ | TO | TO | ERR | TO | ✅ | TO |
+| nginx-request-logging | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ |
+| **TOTAL** | **20%** | **50%** | **40%** | **70%** | **70%** | **80%** | **80%** |
 
 `nginx-request-logging` is the only task no model solves (genuine). The generous-budget reruns turn
 most `TO`s into `✅`; the leftover `ERR`s are flaky (the same task passes for the other Opus build).
