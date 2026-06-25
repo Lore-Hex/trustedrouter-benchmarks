@@ -8,8 +8,10 @@ the **official** harness and grader and swap only the model backend.
 ## ⭐ TL;DR
 - **Harness validated end-to-end** on the real Docker + official grader: `oracle` agent = **100%**
   on `hello-world` (uses the reference solution), our Haiku agent = **100%** on `hello-world`.
-- **Haiku 4.5 (free `claude -p`) smoke = 20% (2/10)** on a curated non-qemu subset of
-  terminal-bench-core 0.1.1. PASS: `fix-permissions`, `heterogeneous-dates`.
+- On the same curated 10-task non-qemu subset of terminal-bench-core 0.1.1 (free `claude -p`):
+  **Haiku 4.5 = 20% (2/10)**, **Sonnet 4.6 = 50% (5/10)**. Sonnet's passes are a strict superset
+  of Haiku's. **3 of Sonnet's 5 failures are `agent_timeout`** (slower per-turn `claude -p`
+  latency burns the task budget), so its true capability on this subset is likely > 50%.
 - This is **"our harness," not the published 27.3%.** Artificial Analysis's *Terminal-Bench Hard*
   (Haiku 4.5 = **27.3%**) is a **different test**: a **secret 47-task subset** run with the real
   **Terminus-2 agent over a paid API**. We can't reproduce that figure exactly — same
@@ -27,19 +29,23 @@ the **official** harness and grader and swap only the model backend.
   cwd (no CLAUDE.md / auto-memory leakage). No API key, no $ — uses the CC quota.
 
 ## Smoke result (terminal-bench-core 0.1.1, 10 tasks, n_concurrent=3, max_episodes=40)
-| task | result | note |
-|---|---|---|
-| fix-permissions | ✅ PASS | |
-| heterogeneous-dates | ✅ PASS | |
-| fix-git | ❌ fail | tests failed |
-| nginx-request-logging | ❌ fail | tests failed |
-| count-dataset-tokens | ❌ fail | tests failed |
-| simple-web-scraper | ❌ fail | tests failed |
-| openssl-selfsigned-cert | ❌ fail | tests failed |
-| sqlite-db-truncate | ❌ fail | tests failed |
-| csv-to-parquet | ❌ fail | **agent_timeout** (hit the task's 360 s budget) |
-| password-recovery | ❌ fail | **agent_timeout** |
-| **TOTAL** | **2/10 = 20.0%** | |
+| task | Haiku 4.5 | Sonnet 4.6 | note |
+|---|---|---|---|
+| fix-permissions | ✅ | ✅ | |
+| heterogeneous-dates | ✅ | ✅ | |
+| simple-web-scraper | ❌ | ✅ | Sonnet only |
+| openssl-selfsigned-cert | ❌ | ✅ | Sonnet only |
+| csv-to-parquet | ❌ timeout | ✅ | Sonnet passed despite hitting the agent budget (work already done) |
+| fix-git | ❌ | ❌ | tests failed |
+| nginx-request-logging | ❌ | ❌ | tests failed |
+| count-dataset-tokens | ❌ | ❌ timeout | Sonnet `agent_timeout` |
+| sqlite-db-truncate | ❌ | ❌ timeout | Sonnet `agent_timeout` |
+| password-recovery | ❌ timeout | ❌ timeout | both `agent_timeout` |
+| **TOTAL** | **2/10 = 20.0%** | **5/10 = 50.0%** | Sonnet ⊃ Haiku passes |
+
+Latency note: 3 of Sonnet's 5 failures are `agent_timeout` — the free `claude -p` per-turn overhead
+(~3-5 s Haiku, more for Sonnet) eats the task's wall-clock budget. A faster (paid-API) backend
+would let the same agent finish more of these, so both rates understate capability, Sonnet more so.
 
 ## Why 20% ≠ 27.3% (and why it's not apples-to-apples)
 1. **Different scaffold.** AA uses Terminus-2 driving the model over a raw API. Our free route runs
