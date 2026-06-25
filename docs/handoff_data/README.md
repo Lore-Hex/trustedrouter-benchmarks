@@ -22,4 +22,8 @@ Raw run outputs + graded trajectories. See `docs/HANDOFF.md` for the full story.
 - `scicode_tier_diverse_fusion.json`        — ⭐ Sonnet+2Haiku+1Opus fusion vs Sonnet/Opus solo (16.7% < 25.0% < 37.5%)
 - `scicode_sonnet_haiku_fusion_nodominant.json`   — Sonnet+Haiku panel→synth, 8-problem pilot (fusion 29.2% — FALSE positive, small-sample noise)
 - `scicode_sonnet_haiku_fusion_powered_23prob.json` — Sonnet+Haiku fusion code, 23 problems (powered run → TIE)
+## Terminal-Bench (official harness, free `claude -p` Haiku agent)
+- `terminalbench_haiku_smoke10.json` — Haiku 4.5 via free `claude -p` on a curated 10-task subset of terminal-bench-core 0.1.1 = **20% (2/10)**; harness validated (oracle + Haiku both 100% on hello-world). NOT AA's 27.3% (different scaffold + secret 47-task subset). See `docs/terminalbench_results.md`.
+
+## SciCode (cont.)
 - `scicode_sonnet_haiku_fusion_full65.json` — ⭐⭐ **FULL 65-problem / 288-step verdict** (self-contained: `verdict` + `correct_dicts` {fusion,sonnet,haiku} + per-problem `generated_code`). **fusion 35.7% = Sonnet-solo 35.7%** (104=104 steps; diff +0.0, 95% CI [−4.6,+4.7]) — dead TIE. To re-bootstrap: write `correct_dicts.{fusion,sonnet,haiku}` to `scicode/eval_results/{all65_fusion,all65_sonnet,haiku}_without_background.json`, then `python scripts/scicode_bootstrap.py all65_fusion all65_sonnet,haiku <pids> test nobg`. The 42 batch problems are fully re-scorable from `generated_code` via `scicode_score.py`.

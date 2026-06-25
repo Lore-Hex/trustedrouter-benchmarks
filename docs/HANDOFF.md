@@ -71,6 +71,12 @@ different test. Can't match AA exactly: gold solutions are **withheld** from the
 
 **single-shot fusion synth-prompt research** (BFCL/GSM8K): `fusion_*.py` (see `project_fusion_synth_research` memory).
 
+**Terminal-Bench** (official Docker harness + grader; vendored per `TERMINALBENCH_SETUP.md`):
+- `tb_haiku_agent.py` — `HaikuCliTerminus`: real Terminus-2 scaffold, LLM swapped to the **free
+  `claude -p`** Claude-Code subscription (Haiku 4.5, no API $). Smoke = **20% (2/10)** on a curated
+  subset; harness validated (oracle=100%). NOT AA's 27.3% (secret 47-task subset + API Terminus-2).
+  Full writeup: `docs/terminalbench_results.md`.
+
 ## How to run
 ### tau2 agentic fusion
 ```bash
