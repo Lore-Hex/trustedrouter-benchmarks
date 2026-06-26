@@ -83,6 +83,7 @@ Oracle ceilings:
 | TaskIQ deterministic source/task meta-policy | 26 | 14/26 | `results/mixed_bio_reasoning_packet_26_taskiq_deterministic_meta.json` | Replaced failing Kimi classifier/router meta-calls with deterministic source/task typing and adjusted-TaskIQ selection. Improved over fixed TaskIQ by recovering `hle_bio_2` and `litqa2_1`, while losing `gpqa_bio_10`. |
 | `trustedrouter/synth` direct endpoint | 26 | invalid | `results/mixed_bio_reasoning_packet_26_trustedrouter_synth.json`, `results/mixed_bio_reasoning_packet_26_trustedrouter_synth_request.json` | Endpoint did not produce a valid reference because the workspace billing was paused. Raw streaming showed synth starting its default panel (`minimax`, `kimi`, `glm`, `gemma`, `deepseek`) and each panel call failing with `Workspace billing is paused`; non-streaming collapsed this to `http_503: fusion failed`. Do not compare as a model score. |
 | `trustedrouter/fusion` direct endpoint | 26 | invalid | `results/mixed_bio_reasoning_packet_26_trustedrouter_fusion.json`, `results/mixed_bio_reasoning_packet_26_trustedrouter_fusion_request.json` | Older endpoint name; ignore going forward. It showed the same billing-paused failure pattern as synth. |
+| `trustedrouter/synth` direct endpoint after billing restored | 26 | 13/26 | `results/mixed_bio_reasoning_packet_26_trustedrouter_synth_retry.json` | Clean deployed synth reference. By set: GPQA 3/4, HLE 0/6, IFBench 5/6, LitQA2 5/10. Tied fixed TaskIQ but underperformed deterministic source/task TaskIQ by 1. Strong on IFBench, failed every HLE Bio item. |
 
 ## Current Best Methods
 
@@ -95,6 +96,7 @@ Best on expanded 26:
 
 - Deterministic source/task TaskIQ selector: 14/26
 - Fixed TaskIQ selector: 13/26
+- TrustedRouter Synth: 13/26
 
 Compared with frontier references on expanded 26:
 
@@ -102,6 +104,7 @@ Compared with frontier references on expanded 26:
 - GPT-5.5: 14/26
 - Grok: 14/26
 - Deterministic source/task TaskIQ OS selector: 14/26
+- TrustedRouter Synth: 13/26
 - Fixed TaskIQ OS selector: 13/26
 
 ## Key Lessons
@@ -161,6 +164,14 @@ Compared with frontier references on expanded 26:
     route with default panel members observed in SSE as `minimax/minimax-m3`,
     `moonshotai/kimi-k2.6`, `z-ai/glm-5.2`, `google/gemma-4-31b-it`, and
     `deepseek/deepseek-v4-pro`.
+
+11. **TrustedRouter Synth is a strong reference but not best on this packet.**
+    After billing was restored, deployed `trustedrouter/synth` ran cleanly and
+    scored 13/26. It was excellent on IFBench (5/6), matched fixed TaskIQ, but
+    failed all HLE Bio questions (0/6) and trailed deterministic source/task
+    TaskIQ (14/26). Versus deterministic meta-policy, synth gained
+    `gpqa_bio_10`, `ifbench_1`, `ifbench_3`, and `litqa2_9`, but lost
+    `gpqa_bio_7`, `hle_bio_2`, `ifbench_70`, `litqa2_4`, and `litqa2_7`.
 
 ## Recommended Next Experiment
 
