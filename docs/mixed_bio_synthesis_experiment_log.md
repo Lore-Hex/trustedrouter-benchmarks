@@ -81,8 +81,8 @@ Oracle ceilings:
 | TaskIQ domain + task-type classifier, fixed prompt/fallback | 26 | pending | `results/mixed_bio_reasoning_packet_26_taskiq_domain_tasktype_selector_fixed_classifier.json` | Patched classifier prompt to treat benchmark text as data, not a task to answer; source-aware fallback now routes HLE failures to judgment-under-uncertainty. Run blocked locally because `TRUSTEDROUTER_API_KEY` was not present. |
 | TaskIQ fixed classifier live Kimi meta reruns | 26 | invalid/interrupted | `results/mixed_bio_reasoning_packet_26_taskiq_domain_tasktype_selector_fixed_classifier_v2.json`, `results/mixed_bio_reasoning_packet_26_taskiq_domain_tasktype_selector_fixed_classifier_v3.json` | Diagnostic only. Classifier/router outputs were empty or unparseable, so runs collapsed to fallback selection and were stopped before completion. Do not use as scored comparisons. |
 | TaskIQ deterministic source/task meta-policy | 26 | 14/26 | `results/mixed_bio_reasoning_packet_26_taskiq_deterministic_meta.json` | Replaced failing Kimi classifier/router meta-calls with deterministic source/task typing and adjusted-TaskIQ selection. Improved over fixed TaskIQ by recovering `hle_bio_2` and `litqa2_1`, while losing `gpqa_bio_10`. |
-| `trustedrouter/synth` direct endpoint | 26 | invalid | `results/mixed_bio_reasoning_packet_26_trustedrouter_synth.json`, `results/mixed_bio_reasoning_packet_26_trustedrouter_synth_request.json` | Endpoint did not produce a valid reference. Streaming path returned empty visible content for all rows; request path returned `http_503: fusion failed`. A one-word smoke prompt showed the same behavior, so this is an endpoint/invocation failure rather than a benchmark score. |
-| `trustedrouter/fusion` direct endpoint | 26 | invalid | `results/mixed_bio_reasoning_packet_26_trustedrouter_fusion.json`, `results/mixed_bio_reasoning_packet_26_trustedrouter_fusion_request.json` | Same failure pattern as synth: streaming path returned empty visible content, request path returned `http_503: fusion failed`, including on a one-word smoke prompt. Do not compare as a model score. |
+| `trustedrouter/synth` direct endpoint | 26 | invalid | `results/mixed_bio_reasoning_packet_26_trustedrouter_synth.json`, `results/mixed_bio_reasoning_packet_26_trustedrouter_synth_request.json` | Endpoint did not produce a valid reference because the workspace billing was paused. Raw streaming showed synth starting its default panel (`minimax`, `kimi`, `glm`, `gemma`, `deepseek`) and each panel call failing with `Workspace billing is paused`; non-streaming collapsed this to `http_503: fusion failed`. Do not compare as a model score. |
+| `trustedrouter/fusion` direct endpoint | 26 | invalid | `results/mixed_bio_reasoning_packet_26_trustedrouter_fusion.json`, `results/mixed_bio_reasoning_packet_26_trustedrouter_fusion_request.json` | Older endpoint name; ignore going forward. It showed the same billing-paused failure pattern as synth. |
 
 ## Current Best Methods
 
@@ -141,11 +141,12 @@ Compared with frontier references on expanded 26:
    fallback behavior. The deterministic meta-policy was more reliable and
    reached 14/26 without additional model calls.
 
-8. **Deployed synth/fusion endpoint needs separate validation before scoring.**
-   Direct calls to `trustedrouter/synth` and `trustedrouter/fusion` did not
-   produce valid answers in the current harness: streaming returned empty
-   visible content and non-streaming returned `http_503: fusion failed`, even
-   for a one-word smoke prompt. Treat endpoint failures separately from model
+8. **Deployed synth endpoint needs billing validation before scoring.**
+   Direct calls to `trustedrouter/synth` did not produce valid answers because
+   workspace billing was paused. Raw SSE output confirmed the endpoint starts
+   its panel, but each upstream model authorization fails with
+   `Workspace billing is paused`; the non-streaming path reports only
+   `http_503: fusion failed`. Treat this as infrastructure state, not model
    quality.
 
 9. **Fusion methodology in this repo still looks useful.**
@@ -154,6 +155,12 @@ Compared with frontier references on expanded 26:
    the final answer from original prompt + panel evidence + judge guidance.
    Prior lessons are that fusion helps only when panel members provide
    complementary signal and no dominant model already covers the task.
+
+10. **Use `trustedrouter/synth`, not the older fusion slug.**
+    The live model catalog exposes `trustedrouter/synth` as a `fusion_panel`
+    route with default panel members observed in SSE as `minimax/minimax-m3`,
+    `moonshotai/kimi-k2.6`, `z-ai/glm-5.2`, `google/gemma-4-31b-it`, and
+    `deepseek/deepseek-v4-pro`.
 
 ## Recommended Next Experiment
 

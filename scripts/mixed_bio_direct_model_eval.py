@@ -1,8 +1,8 @@
 """Run direct model baselines on the mixed bio expanded packet.
 
-This is for model slugs such as trustedrouter/synth or trustedrouter/fusion.
-It scores the same 16 mixed-bio tasks plus the saved 10 LitQA2 tasks used by
-the synthesis experiments.
+This is primarily for direct reference runs of trustedrouter/synth. It scores
+the same 16 mixed-bio tasks plus the saved 10 LitQA2 tasks used by the synthesis
+experiments.
 """
 from __future__ import annotations
 
@@ -109,6 +109,7 @@ def payload(
         "summary": summarize(responses),
         "notes": [
             "Direct model call on the expanded mixed bio packet.",
+            "Use trustedrouter/synth for the deployed synthesis endpoint; trustedrouter/fusion is an older endpoint name.",
             "Expanded packet is 16 mixed-bio tasks plus the saved 10 LitQA2 tasks.",
             "Scoring uses the same deterministic scorers as the synthesis experiments.",
             "Existing rows in this output file are reused on rerun.",
