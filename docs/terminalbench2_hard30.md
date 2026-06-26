@@ -39,6 +39,24 @@ PYTHONPATH=<repo>/scripts TB_AGY_TIMEOUT=1800 harbor run \
   -n 4 --agent-timeout-multiplier 5 --agent-setup-timeout-multiplier 6
 ```
 
+## ⚠️ Setup fix — `AgentSetupTimeoutError` on Apple Silicon (arm64)
+A few TB2 tasks (e.g. **gpt2-codegolf**) build their env `FROM ubuntu:24.04` + apt instead of
+shipping a prebuilt image. On arm64 Macs the Ubuntu **ports mirror** (`ports.ubuntu.com`)
+intermittently fails to fetch `.deb` archives, and apt's default retry count is too low — so the
+trial dies with `AgentSetupTimeoutError`. It bites in **two** places:
+1. the task's environment Docker **build** (`apt-get install -y curl gcc`), and
+2. Harbor terminus-2's **runtime** install of **tmux + asciinema** at tmux-session start
+   (`TmuxSession._attempt_tmux_installation`) — bare ubuntu images have neither.
+
+**Diagnosis:** plain `apt-get install` failed 6/6 builds; `apt-get install -o Acquire::Retries=10`
+succeeded reliably. So it's retry count, not connectivity.
+
+**Fix (token-free, no benchmark edits): `bash scripts/harbor_fix_arm64_apt.sh`** — bakes
+`Acquire::Retries "15"` into the local `ubuntu:24.04` base. Both the build apt and the runtime
+tmux/asciinema install then inherit the retry config and succeed. After running it, re-run the
+affected task with `-i terminal-bench/<task>` (Harbor rebuilds its env FROM the patched base).
+Verified: gpt2-codegolf builds first-try and gets past agent setup into the agent loop.
+
 ## Notes
 - **High reasoning is intentional** (to match the published benchmark); it's slow (agy calls 7s–5min,
   occasionally >30min), so the full 30-hard run is multi-hour. Checkpointed per-task — a kill
