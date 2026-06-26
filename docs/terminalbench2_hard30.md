@@ -6,18 +6,18 @@ subset (the `difficulty = "hard"` tasks; human expert estimates 6–16 hrs each)
 **gemini-3.1-pro at HIGH reasoning** via the free Antigravity CLI (`agy`), on Harbor's real
 **terminus-2** scaffold + official verifier.
 
-## ⭐ Result
-**gemini-3.1-pro (high reasoning) = 18/30 = 60%** on the hard subset (29 scored; `gpt2-codegolf`
-is a harness setup-timeout being re-run, so **18/29 = 62%** of cleanly-scored). Faithful Harbor
+## ⭐ Result (FINAL — all 30 scored)
+**gemini-3.1-pro (high reasoning) = 19/30 = 63.3%** on the hard subset. Faithful Harbor
 terminus-2 harness; free `agy` backend.
 
 | | tasks |
 |---|---|
-| ✅ **PASS (18)** | bn-fit-modify, cancel-async-tasks, circuit-fibsqrt, configure-git-webserver, extract-moves-from-video, feal-differential-cryptanalysis, feal-linear-cryptanalysis, fix-code-vulnerability, fix-ocaml-gc, llm-inference-batching-scheduler, make-doom-for-mips, mcmc-sampling-stan, password-recovery, path-tracing, path-tracing-reverse, protein-assembly, regex-chess, sparql-university, torch-pipeline-parallelism, torch-tensor-parallelism _(see bundle for the exact 18)_ |
-| ❌ **FAIL (11)** | dna-assembly, install-windows-3-11, make-mips-interpreter, model-extraction-relu-logits, polyglot-rust-c, sam-cell-seg, train-fasttext, video-processing, write-compressor _(see bundle)_ |
-| ⚠️ harness-error | gpt2-codegolf (AgentSetupTimeoutError — container setup, not capability; re-running) |
+| ✅ **PASS (19)** | bn-fit-modify, cancel-async-tasks, circuit-fibsqrt, extract-moves-from-video, feal-differential-cryptanalysis, feal-linear-cryptanalysis, fix-code-vulnerability, fix-ocaml-gc, **gpt2-codegolf**, llm-inference-batching-scheduler, mcmc-sampling-stan, password-recovery, path-tracing, path-tracing-reverse, protein-assembly, regex-chess, sparql-university, torch-pipeline-parallelism, torch-tensor-parallelism |
+| ❌ **FAIL (11)** | configure-git-webserver, dna-assembly, install-windows-3-11, make-doom-for-mips, make-mips-interpreter, model-extraction-relu-logits, polyglot-rust-c, sam-cell-seg, train-fasttext, video-processing, write-compressor |
 
-Exact, machine-read pass/fail in `docs/handoff_data/terminalbench2_hard30_gemini.json`.
+`gpt2-codegolf` needed the arm64 apt-retry setup fix (see below) to get past `AgentSetupTimeoutError`;
+once setup was unblocked it **passed**. Exact machine-read pass/fail in
+`docs/handoff_data/terminalbench2_hard30_gemini.json`.
 
 ## Harness
 - **Harbor** `uv tool install harbor` (0.15.0); dataset `terminal-bench/terminal-bench-2`
