@@ -70,13 +70,17 @@ class HaikuCliLLM(BaseLLM):
                 cwd=NEUTRAL_CWD, capture_output=True, text=True, timeout=CALL_TIMEOUT,
             )
 
-        proc = await asyncio.to_thread(_run)
-        out = (proc.stdout or "").strip()
-        if not out:
-            raise RuntimeError(
-                f"claude -p returned empty output (rc={proc.returncode}): {(proc.stderr or '')[:400]}"
-            )
-        return LLMResponse(content=out, model_name=self._model)
+        # `claude -p` occasionally returns empty stdout (rc=0) on a transient hiccup — retry a few
+        # times with backoff before giving up, so one blank turn doesn't error the whole task.
+        last_stderr = ""
+        for attempt in range(4):
+            proc = await asyncio.to_thread(_run)
+            out = (proc.stdout or "").strip()
+            if out:
+                return LLMResponse(content=out, model_name=self._model)
+            last_stderr = (proc.stderr or "")[:300]
+            await asyncio.sleep(2 * (attempt + 1))
+        raise RuntimeError(f"claude -p empty output after 4 tries (rc={proc.returncode}): {last_stderr}")
 
     def get_model_context_limit(self) -> int:
         return 200_000
