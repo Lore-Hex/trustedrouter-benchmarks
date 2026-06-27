@@ -17,6 +17,9 @@ Run (only with explicit go — costs $):
     -t hello-world --no-livestream --output-path runs/_tr
 """
 import os
+import json
+import time
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -30,6 +33,10 @@ def _content_to_str(c) -> str:
     if isinstance(c, list):
         return "".join(p.get("text", "") if isinstance(p, dict) else str(p) for p in c)
     return c or ""
+
+
+def _write_json(path: Path, value: Any) -> None:
+    path.write_text(json.dumps(value, indent=2, ensure_ascii=False, default=str) + "\n")
 
 
 class TrustedRouterLLM(BaseLLM):
@@ -58,21 +65,61 @@ class TrustedRouterLLM(BaseLLM):
         logging_path=None,
         **kwargs,
     ) -> str:
+        started = time.monotonic()
+        started_at = datetime.now(UTC).isoformat()
         messages = [
             {"role": m.get("role", "user"), "content": _content_to_str(m.get("content"))}
             for m in message_history
         ]
         messages.append({"role": "user", "content": prompt})
-        resp = self._client.chat_completions(
-            model=self._model,
-            temperature=self._temperature,
-            max_tokens=self._max_tokens,
-            messages=messages,
-        )
+        try:
+            resp = self._client.chat_completions(
+                model=self._model,
+                temperature=self._temperature,
+                max_tokens=self._max_tokens,
+                messages=messages,
+            )
+        except Exception as exc:
+            if logging_path is not None:
+                try:
+                    _write_json(Path(logging_path), {
+                        "started_at": started_at,
+                        "elapsed_ms": round((time.monotonic() - started) * 1000),
+                        "model": self._model,
+                        "error": type(exc).__name__,
+                        "message": str(exc),
+                    })
+                except Exception:
+                    pass
+            raise
+
+        elapsed_ms = round((time.monotonic() - started) * 1000)
+        dumped = resp.model_dump(mode="json")
         out = (resp.choices[0].message.content or "").strip()
         if logging_path is not None:
             try:
-                logging_path.write_text(out)
+                log_path = Path(logging_path)
+                full_response_path = log_path.with_name("tr_response.json")
+                _write_json(full_response_path, dumped)
+                _write_json(log_path, {
+                    "started_at": started_at,
+                    "elapsed_ms": elapsed_ms,
+                    "model": self._model,
+                    "temperature": self._temperature,
+                    "max_tokens": self._max_tokens,
+                    "message_count": len(messages),
+                    "message_chars": sum(len(m["content"]) for m in messages),
+                    "response_id": dumped.get("id"),
+                    "response_model": dumped.get("model"),
+                    "finish_reason": (
+                        dumped.get("choices", [{}])[0].get("finish_reason")
+                        if dumped.get("choices")
+                        else None
+                    ),
+                    "usage": dumped.get("usage"),
+                    "trustedrouter": dumped.get("trustedrouter"),
+                    "full_response_path": full_response_path.name,
+                })
             except Exception:
                 pass
         return out
