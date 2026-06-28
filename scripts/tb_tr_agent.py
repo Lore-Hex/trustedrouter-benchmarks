@@ -27,6 +27,7 @@ from terminal_bench.agents.terminus_2.terminus_2 import Terminus2
 from terminal_bench.llms.base_llm import BaseLLM
 
 TR_KEY_PATH = os.environ.get("TB_TR_KEY_PATH", "~/claude/.tr_key")
+TR_BASE_URL = os.environ.get("TRUSTEDROUTER_BASE_URL") or None
 
 
 def _content_to_str(c) -> str:
@@ -43,7 +44,14 @@ class TrustedRouterLLM(BaseLLM):
     """BaseLLM backed by the TrustedRouter SDK. Cost-guarded: refuses to construct unless
     TB_TR_CONFIRM=1 (so importing this module never spends money)."""
 
-    def __init__(self, model: str, temperature: float = 0.7, max_tokens: int = 4096, **kwargs):
+    def __init__(
+        self,
+        model: str,
+        temperature: float = 0.7,
+        max_tokens: int = 4096,
+        base_url: str | None = None,
+        **kwargs,
+    ):
         super().__init__(**kwargs)
         if not os.environ.get("TB_TR_CONFIRM"):
             raise RuntimeError(
@@ -55,7 +63,11 @@ class TrustedRouterLLM(BaseLLM):
         self._model = model
         self._temperature = temperature
         self._max_tokens = max_tokens
-        self._client = TrustedRouter(api_key=Path(os.path.expanduser(TR_KEY_PATH)).read_text().strip())
+        self._base_url = base_url or TR_BASE_URL
+        api_key = os.environ.get("TRUSTEDROUTER_API_KEY")
+        if not api_key:
+            api_key = Path(os.path.expanduser(TR_KEY_PATH)).read_text().strip()
+        self._client = TrustedRouter(api_key=api_key, base_url=self._base_url)
 
     def call(
         self,
@@ -86,6 +98,7 @@ class TrustedRouterLLM(BaseLLM):
                         "started_at": started_at,
                         "elapsed_ms": round((time.monotonic() - started) * 1000),
                         "model": self._model,
+                        "base_url": self._base_url,
                         "error": type(exc).__name__,
                         "message": str(exc),
                     })
@@ -105,6 +118,7 @@ class TrustedRouterLLM(BaseLLM):
                     "started_at": started_at,
                     "elapsed_ms": elapsed_ms,
                     "model": self._model,
+                    "base_url": self._base_url,
                     "temperature": self._temperature,
                     "max_tokens": self._max_tokens,
                     "message_count": len(messages),
@@ -131,10 +145,19 @@ class TrustedRouterLLM(BaseLLM):
 class TRTerminus(Terminus2):
     """Terminus-2 with the LLM call routed through the TrustedRouter SDK (any TR model id)."""
 
-    def __init__(self, model_name: str, max_tokens: int = 4096, **kwargs):
+    def __init__(
+        self,
+        model_name: str,
+        max_tokens: int = 4096,
+        base_url: str | None = None,
+        **kwargs,
+    ):
         super().__init__(model_name=model_name, **kwargs)
         self._llm = TrustedRouterLLM(
-            model=model_name, temperature=self._llm._temperature, max_tokens=max_tokens
+            model=model_name,
+            temperature=self._llm._temperature,
+            max_tokens=max_tokens,
+            base_url=base_url,
         )
 
     @staticmethod

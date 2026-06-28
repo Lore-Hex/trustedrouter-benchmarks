@@ -32,6 +32,41 @@ from harbor.models.metric import UsageInfo
 from harbor.models.trial.paths import EnvironmentPaths
 
 TR_KEY_PATH = os.environ.get("TB_TR_KEY_PATH", "~/claude/.tr_key")
+TR_BASE_URL = os.environ.get("TRUSTEDROUTER_BASE_URL") or None
+TERMINUS_CONTROL_KEY_SPEC_TEXT = (
+    "Shell commands must end with \\n. Special keys must be sent alone without \\n, "
+    'e.g. {"keystrokes":"C-c","duration":0.5}.'
+)
+TERMINUS_CONTROL_KEY_SPEC_TEMPLATE = TERMINUS_CONTROL_KEY_SPEC_TEXT.replace(
+    "{", "{{"
+).replace("}", "}}")
+
+
+def _patch_terminus_prompt_template(template: str) -> str:
+    """Add the tmux control-key contract to Harbor's model-facing prompt."""
+    if TERMINUS_CONTROL_KEY_SPEC_TEMPLATE in template:
+        return template
+
+    for marker in (
+        'The "duration" attribute specifies',
+        "The `duration` attribute",
+        "Task Description:",
+    ):
+        if marker in template:
+            return template.replace(
+                marker, TERMINUS_CONTROL_KEY_SPEC_TEMPLATE + "\n\n" + marker, 1
+            )
+
+    return template.rstrip() + "\n\n" + TERMINUS_CONTROL_KEY_SPEC_TEMPLATE + "\n"
+
+
+def _ensure_control_key_spec(prompt: str, messages: list[dict[str, str]]) -> str:
+    """Keep the terminal protocol visible after Harbor context rebuilds."""
+    if TERMINUS_CONTROL_KEY_SPEC_TEXT in prompt:
+        return prompt
+    if any(TERMINUS_CONTROL_KEY_SPEC_TEXT in m["content"] for m in messages):
+        return prompt
+    return prompt.rstrip() + "\n\n" + TERMINUS_CONTROL_KEY_SPEC_TEXT
 
 
 def _content_to_str(content: Any) -> str:
@@ -101,6 +136,7 @@ class TrustedRouterHarborLLM(BaseLLM):
         max_empty_retries: int = 2,
         panel_prompt: str | None = None,
         synthesis_prompt: str | None = None,
+        base_url: str | None = None,
     ):
         super().__init__()
         if not os.environ.get("TB_TR_CONFIRM"):
@@ -115,7 +151,8 @@ class TrustedRouterHarborLLM(BaseLLM):
         if not api_key:
             api_key = Path(os.path.expanduser(TR_KEY_PATH)).read_text().strip()
 
-        self._client = TrustedRouter(api_key=api_key)
+        self._base_url = base_url or TR_BASE_URL
+        self._client = TrustedRouter(api_key=api_key, base_url=self._base_url)
         self._model = model
         self._temperature = temperature
         self._max_tokens = max_tokens
@@ -138,6 +175,7 @@ class TrustedRouterHarborLLM(BaseLLM):
             {"role": m.get("role", "user"), "content": _content_to_str(m.get("content"))}
             for m in (message_history or [])
         ]
+        prompt = _ensure_control_key_spec(prompt, messages)
         messages.append({"role": "user", "content": prompt})
 
         request: dict[str, Any] = {
@@ -175,6 +213,7 @@ class TrustedRouterHarborLLM(BaseLLM):
                         "started_at": started_at,
                         "elapsed_ms": round((time.monotonic() - started) * 1000),
                         "model": self._model,
+                        "base_url": self._base_url,
                         "temperature": self._temperature,
                         "max_tokens": self._max_tokens,
                         "has_panel_prompt": bool(self._panel_prompt),
@@ -203,6 +242,7 @@ class TrustedRouterHarborLLM(BaseLLM):
                     "started_at": started_at,
                     "elapsed_ms": elapsed_ms,
                     "model": self._model,
+                    "base_url": self._base_url,
                     "temperature": self._temperature,
                     "max_tokens": self._max_tokens,
                     "has_panel_prompt": bool(self._panel_prompt),
@@ -243,6 +283,7 @@ class TrustedRouterHarborLLM(BaseLLM):
                 logging_path,
                 {
                     "model": self._model,
+                    "base_url": self._base_url,
                     "message_count": len(messages),
                     "message_chars": sum(len(m["content"]) for m in messages),
                     "final_attempt": final_attempt,
@@ -313,11 +354,13 @@ class TRHarborTerminus(Terminus2):
         max_empty_retries: int = 2,
         panel_prompt: str | None = None,
         synthesis_prompt: str | None = None,
+        base_url: str | None = None,
         **kwargs: Any,
     ):
         if model_name is None:
             raise ValueError("model_name is required")
         super().__init__(logs_dir=logs_dir, model_name=model_name, **kwargs)
+        self._prompt_template = _patch_terminus_prompt_template(self._prompt_template)
         self._llm = TrustedRouterHarborLLM(
             model=model_name,
             logs_dir=logs_dir,
@@ -328,6 +371,7 @@ class TRHarborTerminus(Terminus2):
             max_empty_retries=int(max_empty_retries),
             panel_prompt=panel_prompt,
             synthesis_prompt=synthesis_prompt,
+            base_url=base_url,
         )
 
     async def setup(self, environment: BaseEnvironment) -> None:
