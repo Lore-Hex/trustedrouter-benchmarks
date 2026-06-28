@@ -17,6 +17,7 @@ Harbor's native Terminus-2 scaffold so it can run Terminal-Bench 2.x datasets.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import time
@@ -83,6 +84,37 @@ def _write_json(path: Path, value: Any) -> None:
     path.write_text(json.dumps(value, indent=2, ensure_ascii=False, default=str) + "\n")
 
 
+def _append_jsonl(path: Path, value: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(value, ensure_ascii=False, default=str) + "\n")
+
+
+def _redacted_text(value: Any) -> Any:
+    if not isinstance(value, str):
+        return value
+    return {
+        "redacted": True,
+        "chars": len(value),
+        "sha256": hashlib.sha256(value.encode("utf-8")).hexdigest(),
+    }
+
+
+def _request_for_replay(request: dict[str, Any]) -> dict[str, Any]:
+    """Copy the request for repo-safe replay without secret prompt bodies."""
+    replay = json.loads(json.dumps(request, default=str))
+    for tool in replay.get("tools") or []:
+        if not isinstance(tool, dict):
+            continue
+        params = tool.get("parameters")
+        if not isinstance(params, dict):
+            continue
+        for key in ("panel_prompt", "synthesis_prompt"):
+            if key in params:
+                params[key] = _redacted_text(params[key])
+    return replay
+
+
 def _usage_from_response(dumped: dict[str, Any]) -> UsageInfo | None:
     usage = dumped.get("usage") or {}
     if not isinstance(usage, dict):
@@ -122,6 +154,134 @@ def _message_content(dumped: dict[str, Any]) -> str:
     return (message.get("content") or "").strip()
 
 
+def _as_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    return str(value).strip().lower() not in {"", "0", "false", "no", "off"}
+
+
+def _chunk_text(chunk: dict[str, Any]) -> str:
+    choices = chunk.get("choices") or []
+    if not choices:
+        return ""
+    delta = choices[0].get("delta") or {}
+    content = delta.get("content")
+    return content if isinstance(content, str) else ""
+
+
+def _chunk_reasoning(chunk: dict[str, Any]) -> str:
+    choices = chunk.get("choices") or []
+    if not choices:
+        return ""
+    delta = choices[0].get("delta") or {}
+    for key in ("reasoning_content", "reasoning", "thinking"):
+        value = delta.get(key)
+        if isinstance(value, str):
+            return value
+    return ""
+
+
+def _collect_chat_completion(chunks: list[dict[str, Any]]) -> dict[str, Any]:
+    """Reconstruct a chat.completion object from streamed chunk frames."""
+    if not chunks:
+        return {
+            "id": "",
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": ""},
+                    "finish_reason": "stop",
+                }
+            ],
+        }
+
+    text_parts: list[str] = []
+    reasoning_parts: list[str] = []
+    finish_reason: str | None = None
+    role = "assistant"
+    usage: dict[str, Any] | None = None
+    trustedrouter: Any = None
+    tool_calls: dict[int, dict[str, Any]] = {}
+
+    for chunk in chunks:
+        if isinstance(chunk.get("usage"), dict):
+            usage = chunk["usage"]
+        if chunk.get("trustedrouter") is not None:
+            trustedrouter = chunk["trustedrouter"]
+
+        choices = chunk.get("choices") or []
+        if not choices:
+            continue
+        choice0 = choices[0]
+        delta = choice0.get("delta") or {}
+        if isinstance(delta.get("role"), str):
+            role = delta["role"]
+        if isinstance(delta.get("content"), str):
+            text_parts.append(delta["content"])
+        reasoning = _chunk_reasoning(chunk)
+        if reasoning:
+            reasoning_parts.append(reasoning)
+
+        for tc in delta.get("tool_calls") or []:
+            if not isinstance(tc, dict):
+                continue
+            idx = int(tc.get("index", 0) or 0)
+            slot = tool_calls.setdefault(
+                idx,
+                {
+                    "index": idx,
+                    "type": "function",
+                    "function": {"name": "", "arguments": ""},
+                },
+            )
+            if tc.get("id"):
+                slot["id"] = tc["id"]
+            if tc.get("type"):
+                slot["type"] = tc["type"]
+            fn = tc.get("function")
+            if isinstance(fn, dict):
+                if fn.get("name"):
+                    slot["function"]["name"] = fn["name"]
+                if isinstance(fn.get("arguments"), str):
+                    slot["function"]["arguments"] += fn["arguments"]
+
+        if choice0.get("finish_reason"):
+            finish_reason = choice0["finish_reason"]
+
+    last = chunks[-1]
+    content = "".join(text_parts)
+    message: dict[str, Any] = {
+        "role": role,
+        "content": content if content else (None if tool_calls else ""),
+    }
+    if reasoning_parts:
+        message["reasoning_content"] = "".join(reasoning_parts)
+    if tool_calls:
+        message["tool_calls"] = [tool_calls[i] for i in sorted(tool_calls)]
+
+    result: dict[str, Any] = {
+        "id": last.get("id", ""),
+        "object": "chat.completion",
+        "created": last.get("created", 0),
+        "model": last.get("model", ""),
+        "choices": [
+            {
+                "index": 0,
+                "message": message,
+                "finish_reason": finish_reason or "stop",
+            }
+        ],
+    }
+    if usage is not None:
+        result["usage"] = usage
+    if trustedrouter is not None:
+        result["trustedrouter"] = trustedrouter
+    return result
+
+
 class TrustedRouterHarborLLM(BaseLLM):
     """Harbor BaseLLM implementation backed by TrustedRouter chat completions."""
 
@@ -137,6 +297,7 @@ class TrustedRouterHarborLLM(BaseLLM):
         panel_prompt: str | None = None,
         synthesis_prompt: str | None = None,
         base_url: str | None = None,
+        stream: bool = True,
     ):
         super().__init__()
         if not os.environ.get("TB_TR_CONFIRM"):
@@ -161,8 +322,107 @@ class TrustedRouterHarborLLM(BaseLLM):
         self._max_empty_retries = max_empty_retries
         self._panel_prompt = panel_prompt
         self._synthesis_prompt = synthesis_prompt
+        self._stream = _as_bool(stream)
         self._calls_dir = logs_dir / "trustedrouter-calls"
         self._call_index = 0
+
+    def _stream_label(self, call_id: int, chunk: dict[str, Any]) -> tuple[str, str]:
+        tr = chunk.get("trustedrouter") or {}
+        socrates = tr.get("socrates") if isinstance(tr, dict) else None
+        if isinstance(socrates, dict):
+            stage = socrates.get("stage") or "socrates"
+            model = socrates.get("model") or chunk.get("model") or self._model
+            return f"call-{call_id:04d}:{stage}:{model}", socrates.get("event") or ""
+        return f"call-{call_id:04d}:{chunk.get('model') or self._model}", ""
+
+    def _write_stream_live(
+        self,
+        *,
+        call_id: int,
+        chunk: dict[str, Any],
+        live_file: Any,
+    ) -> None:
+        label, event = self._stream_label(call_id, chunk)
+        tr = chunk.get("trustedrouter") or {}
+        socrates = tr.get("socrates") if isinstance(tr, dict) else None
+
+        text = ""
+        if isinstance(socrates, dict):
+            for key in ("text", "delta", "content"):
+                if isinstance(socrates.get(key), str):
+                    text = socrates[key]
+                    break
+        if not text:
+            text = _chunk_text(chunk)
+
+        reasoning = _chunk_reasoning(chunk)
+        if not reasoning and isinstance(socrates, dict):
+            for key in ("thinking", "reasoning", "reasoning_content"):
+                if isinstance(socrates.get(key), str):
+                    reasoning = socrates[key]
+                    break
+        if event and not text and not reasoning:
+            detail = ""
+            if isinstance(socrates, dict):
+                raw_detail = socrates.get("detail")
+                if isinstance(raw_detail, dict):
+                    finish = raw_detail.get("finish_reason")
+                    cost = raw_detail.get("cost_microdollars")
+                    detail = f" finish={finish} cost_microdollars={cost}"
+            line = f"\n[tr-stream {label}] {event}{detail}\n"
+            live_file.write(line)
+            live_file.flush()
+            print(line, end="", flush=True)
+            return
+
+        if reasoning:
+            line = f"[tr-thinking {label}] {reasoning}\n"
+            live_file.write(line)
+            live_file.flush()
+            print(line, end="", flush=True)
+
+        if text:
+            line = f"[tr-stream {label}] {text}\n"
+            live_file.write(line)
+            live_file.flush()
+            print(line, end="", flush=True)
+
+    def _stream_completion(
+        self,
+        request: dict[str, Any],
+        *,
+        call_id: int,
+        stream_path: Path,
+        live_path: Path,
+    ) -> dict[str, Any]:
+        stream_path.parent.mkdir(parents=True, exist_ok=True)
+        chunks: list[dict[str, Any]] = []
+        request = dict(request)
+        stream_options = dict(request.get("stream_options") or {})
+        stream_options.setdefault("include_usage", True)
+        request["stream_options"] = stream_options
+
+        with stream_path.open("w", encoding="utf-8") as stream_file, live_path.open(
+            "w", encoding="utf-8"
+        ) as live_file:
+            print(
+                f"\n[tr-stream call-{call_id:04d}] start model={self._model} base_url={self._base_url}\n",
+                end="",
+                flush=True,
+            )
+            for chunk in self._client.chat_completions_chunk_stream(**request):
+                dumped = chunk.model_dump(mode="json")
+                chunks.append(dumped)
+                stream_file.write(json.dumps(dumped, ensure_ascii=False) + "\n")
+                stream_file.flush()
+                self._write_stream_live(
+                    call_id=call_id,
+                    chunk=dumped,
+                    live_file=live_file,
+                )
+            print(f"[tr-stream call-{call_id:04d}] end\n", end="", flush=True)
+
+        return _collect_chat_completion(chunks)
 
     async def call(
         self,
@@ -202,10 +462,46 @@ class TrustedRouterHarborLLM(BaseLLM):
             started = time.monotonic()
             started_at = datetime.now(UTC).isoformat()
             response_path = self._calls_dir / f"call-{call_id:04d}.response.json"
+            request_path = self._calls_dir / f"call-{call_id:04d}.request.json"
             meta_path = self._calls_dir / f"call-{call_id:04d}.meta.json"
+            stream_path = self._calls_dir / f"call-{call_id:04d}.stream.jsonl"
+            live_path = self._calls_dir / f"call-{call_id:04d}.live.txt"
+            manifest_path = self._calls_dir / "manifest.jsonl"
+
+            _write_json(request_path, _request_for_replay(request))
+            _append_jsonl(
+                manifest_path,
+                {
+                    "event": "started",
+                    "call_id": call_id,
+                    "started_at": started_at,
+                    "model": self._model,
+                    "base_url": self._base_url,
+                    "attempt": attempt,
+                    "message_count": len(messages),
+                    "message_chars": sum(len(m["content"]) for m in messages),
+                    "request_path": request_path.name,
+                    "response_path": response_path.name,
+                    "meta_path": meta_path.name,
+                    "stream_path": stream_path.name if self._stream else None,
+                    "live_path": live_path.name if self._stream else None,
+                },
+            )
 
             try:
-                resp = await asyncio.to_thread(self._client.chat_completions, **request)
+                if self._stream:
+                    dumped = await asyncio.to_thread(
+                        self._stream_completion,
+                        request,
+                        call_id=call_id,
+                        stream_path=stream_path,
+                        live_path=live_path,
+                    )
+                else:
+                    resp = await asyncio.to_thread(
+                        self._client.chat_completions, **request
+                    )
+                    dumped = resp.model_dump(mode="json")
             except Exception as exc:
                 _write_json(
                     meta_path,
@@ -218,6 +514,7 @@ class TrustedRouterHarborLLM(BaseLLM):
                         "max_tokens": self._max_tokens,
                         "has_panel_prompt": bool(self._panel_prompt),
                         "has_synthesis_prompt": bool(self._synthesis_prompt),
+                        "stream": self._stream,
                         "panel_prompt_chars": len(self._panel_prompt or ""),
                         "synthesis_prompt_chars": len(self._synthesis_prompt or ""),
                         "message_count": len(messages),
@@ -225,12 +522,34 @@ class TrustedRouterHarborLLM(BaseLLM):
                         "attempt": attempt,
                         "error": type(exc).__name__,
                         "message": str(exc),
+                        "request_path": request_path.name,
+                        "full_response_path": response_path.name,
+                        "stream_path": stream_path.name if self._stream else None,
+                        "live_path": live_path.name if self._stream else None,
+                    },
+                )
+                _append_jsonl(
+                    manifest_path,
+                    {
+                        "event": "error",
+                        "call_id": call_id,
+                        "started_at": started_at,
+                        "elapsed_ms": round((time.monotonic() - started) * 1000),
+                        "model": self._model,
+                        "base_url": self._base_url,
+                        "attempt": attempt,
+                        "error": type(exc).__name__,
+                        "message": str(exc),
+                        "request_path": request_path.name,
+                        "response_path": response_path.name,
+                        "meta_path": meta_path.name,
+                        "stream_path": stream_path.name if self._stream else None,
+                        "live_path": live_path.name if self._stream else None,
                     },
                 )
                 raise
 
             elapsed_ms = round((time.monotonic() - started) * 1000)
-            dumped = resp.model_dump(mode="json")
             choice = (dumped.get("choices") or [{}])[0]
             content = _message_content(dumped)
             empty_retry = content == "" and attempt <= self._max_empty_retries
@@ -247,6 +566,7 @@ class TrustedRouterHarborLLM(BaseLLM):
                     "max_tokens": self._max_tokens,
                     "has_panel_prompt": bool(self._panel_prompt),
                     "has_synthesis_prompt": bool(self._synthesis_prompt),
+                    "stream": self._stream,
                     "panel_prompt_chars": len(self._panel_prompt or ""),
                     "synthesis_prompt_chars": len(self._synthesis_prompt or ""),
                     "message_count": len(messages),
@@ -258,9 +578,35 @@ class TrustedRouterHarborLLM(BaseLLM):
                     "content_chars": len(content),
                     "usage": dumped.get("usage"),
                     "trustedrouter": dumped.get("trustedrouter"),
+                    "request_path": request_path.name,
                     "full_response_path": response_path.name,
+                    "stream_path": stream_path.name if self._stream else None,
+                    "live_path": live_path.name if self._stream else None,
                     "empty_response_retry": empty_retry,
                     "retry_reason": "empty_content" if empty_retry else None,
+                },
+            )
+            _append_jsonl(
+                manifest_path,
+                {
+                    "event": "completed",
+                    "call_id": call_id,
+                    "started_at": started_at,
+                    "elapsed_ms": elapsed_ms,
+                    "model": self._model,
+                    "base_url": self._base_url,
+                    "attempt": attempt,
+                    "response_id": dumped.get("id"),
+                    "response_model": dumped.get("model"),
+                    "finish_reason": choice.get("finish_reason"),
+                    "content_chars": len(content),
+                    "usage": dumped.get("usage"),
+                    "empty_response_retry": empty_retry,
+                    "request_path": request_path.name,
+                    "response_path": response_path.name,
+                    "meta_path": meta_path.name,
+                    "stream_path": stream_path.name if self._stream else None,
+                    "live_path": live_path.name if self._stream else None,
                 },
             )
 
@@ -289,6 +635,7 @@ class TrustedRouterHarborLLM(BaseLLM):
                     "final_attempt": final_attempt,
                     "has_panel_prompt": bool(self._panel_prompt),
                     "has_synthesis_prompt": bool(self._synthesis_prompt),
+                    "stream": self._stream,
                     "panel_prompt_chars": len(self._panel_prompt or ""),
                     "synthesis_prompt_chars": len(self._synthesis_prompt or ""),
                     "response_id": dumped.get("id"),
@@ -298,6 +645,20 @@ class TrustedRouterHarborLLM(BaseLLM):
                     "usage": dumped.get("usage"),
                     "trustedrouter": dumped.get("trustedrouter"),
                     "full_response_path": str(response_path),
+                    "stream_path": str(
+                        response_path.with_name(
+                            response_path.name.replace(".response.json", ".stream.jsonl")
+                        )
+                    )
+                    if self._stream
+                    else None,
+                    "live_path": str(
+                        response_path.with_name(
+                            response_path.name.replace(".response.json", ".live.txt")
+                        )
+                    )
+                    if self._stream
+                    else None,
                 },
             )
 
@@ -355,6 +716,7 @@ class TRHarborTerminus(Terminus2):
         panel_prompt: str | None = None,
         synthesis_prompt: str | None = None,
         base_url: str | None = None,
+        stream: bool = True,
         **kwargs: Any,
     ):
         if model_name is None:
@@ -372,6 +734,7 @@ class TRHarborTerminus(Terminus2):
             panel_prompt=panel_prompt,
             synthesis_prompt=synthesis_prompt,
             base_url=base_url,
+            stream=stream,
         )
 
     async def setup(self, environment: BaseEnvironment) -> None:
