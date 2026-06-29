@@ -137,3 +137,32 @@ modify `bottle.py` or create the required `/app/report.jsonl` before the episode
 cap. Exclude DeepSeek from the main hard-short panel for now. Treat future
 DeepSeek rows as valid only if run with the SDK shim, provider pin, JSON parser,
 and context override.
+
+## 2026-06-29 handoff
+
+Latest reliable hard-short additions:
+
+- Grok 4.3 passed `cancel-async-tasks` and `fix-code-vulnerability`.
+- Grok 4.3 timed out on `polyglot-rust-c`.
+- TR Prometheus failed `cancel-async-tasks`, passed `fix-code-vulnerability`,
+  and timed out / infra-failed on `polyglot-rust-c`.
+
+We briefly tried two parallel Terminal-Bench processes to reduce wall-clock time.
+That made Docker cleanup/resume state unreliable: orphan polyglot containers were
+left behind and zero-token rows were written for tasks that were not actually
+attempted. The active sidecar was cleaned so `--resume` will not skip those
+future tasks. Suspect rows are preserved in:
+
+- `results/terminal_bench_hard_short_quarantined_rows.jsonl`
+
+Current pickup recommendation:
+
+- Keep DeepSeek V4 Pro and old TR Synth excluded.
+- Resume serially, not parallel, for the remaining Grok and Prometheus cells.
+- Use the cleaned main sidecar:
+  `results/terminal_bench_hard_short_remaining_safe_tasks.jsonl`
+- Remaining real tasks:
+  - Grok 4.3: `configure-git-webserver`, `feal-linear-cryptanalysis`,
+    `password-recovery`
+  - TR Prometheus: `configure-git-webserver`, `feal-linear-cryptanalysis`,
+    `password-recovery`
