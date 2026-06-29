@@ -43,6 +43,41 @@ def _sdk() -> TrustedRouter:
     return _client
 
 
+def _env_int(name: str) -> int | None:
+    value = os.environ.get(name)
+    if not value:
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        return None
+
+
+def _env_float(name: str) -> float | None:
+    value = os.environ.get(name)
+    if not value:
+        return None
+    try:
+        return float(value)
+    except ValueError:
+        return None
+
+
+def _provider_filter() -> dict[str, list[str]] | None:
+    provider = os.environ.get("TRBENCH_PROVIDER")
+    if not provider:
+        return None
+    providers = [p.strip() for p in provider.split(",") if p.strip()]
+    return {"only": providers} if providers else None
+
+
+def _api_model_name(model: str) -> str:
+    # LiteLLM strips the custom-provider prefix before calling completion().
+    # Normal catalog models still contain their org/model slash after stripping,
+    # but the Synth endpoint is itself named `trustedrouter/synth`.
+    return "trustedrouter/synth" if model == "synth" else model
+
+
 class TrustedRouterSDKLLM(CustomLLM):
     """litellm CustomLLM whose completion() delegates to the TrustedRouter SDK."""
 
@@ -50,12 +85,21 @@ class TrustedRouterSDKLLM(CustomLLM):
         model_response: ModelResponse = kwargs.get("model_response") or (args[3] if len(args) > 3 else ModelResponse())
         optional_params: dict = kwargs.get("optional_params") or (args[8] if len(args) > 8 else {})
 
-        body: dict[str, Any] = {"model": model, "messages": messages}
+        body: dict[str, Any] = {"model": _api_model_name(model), "messages": messages}
         for k in _PASSTHROUGH:
             if optional_params.get(k) is not None:
                 body[k] = optional_params[k]
+        max_tokens = _env_int("TRBENCH_MAX_TOKENS")
+        if max_tokens is not None and "max_tokens" not in body:
+            body["max_tokens"] = max_tokens
+        temperature = _env_float("TRBENCH_TEMPERATURE")
+        if temperature is not None:
+            body["temperature"] = temperature
         if optional_params.get("tools"):
             body["tools"] = optional_params["tools"]
+        provider = _provider_filter()
+        if provider and "provider" not in body:
+            body["provider"] = provider
 
         # Direct POST via the SDK client (preserves tool_calls, which the SDK's
         # streaming chat_completions assembly drops).

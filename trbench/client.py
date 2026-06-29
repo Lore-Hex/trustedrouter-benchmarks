@@ -15,6 +15,7 @@ import json
 import os
 import time
 import urllib.request
+from pathlib import Path
 from typing import Any
 
 from trustedrouter import TrustedRouter
@@ -30,9 +31,33 @@ _API_KEY_ENV = (
 )
 
 
+def _load_dotenv_if_needed() -> None:
+    if any(os.environ.get(name) for name in _API_KEY_ENV):
+        return
+
+    candidates = [
+        Path.cwd() / ".env",
+        Path(__file__).resolve().parents[1] / ".env",
+    ]
+    for path in candidates:
+        if not path.exists():
+            continue
+        for raw_line in path.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            if key in _API_KEY_ENV and not os.environ.get(key):
+                os.environ[key] = value.strip().strip("\"'")
+        if any(os.environ.get(name) for name in _API_KEY_ENV):
+            return
+
+
 def api_key_from_env(explicit: str | None = None) -> str:
     if explicit:
         return explicit
+    _load_dotenv_if_needed()
     for name in _API_KEY_ENV:
         value = os.environ.get(name)
         if value:
