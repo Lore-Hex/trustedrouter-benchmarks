@@ -108,6 +108,7 @@ Probe results:
 | PONG smoke | gmi | JSON | 3 | passed | 13,441 in / 2,370 out |
 | PONG smoke | tinfoil | XML | 3 | timed out | not scored |
 | `cancel-async-tasks` | gmi | JSON | 12 | failed one subtest | 58,706 in / 3,958 out |
+| `fix-code-vulnerability` | gmi | JSON | 12 | failed; no code fix/report | 74,003 in / 1,848 out |
 
 Recommended DeepSeek config for the next controlled run:
 
@@ -129,6 +130,10 @@ uv run python -m trbench.evals.terminal_bench.run \
   --resume
 ```
 
-This is now runnable without the old runaway timeout behavior, but the first
-real task still failed under Terminus. Treat future DeepSeek rows as valid only
-if run with the SDK shim, provider pin, JSON parser, and context override.
+This is now runnable without the old runaway timeout behavior, but both real
+task probes failed under Terminus. `fix-code-vulnerability` is the stronger
+signal because the model inspected the right Bottle header code path but did not
+modify `bottle.py` or create the required `/app/report.jsonl` before the episode
+cap. Exclude DeepSeek from the main hard-short panel for now. Treat future
+DeepSeek rows as valid only if run with the SDK shim, provider pin, JSON parser,
+and context override.
