@@ -1,0 +1,298 @@
+
+[tr-stream call-0132:socrates:trustedrouter/socrates-pro-plus-1.0] socrates.started
+
+[tr-stream call-0132:worker:xiaomi/mimo-v2.5-pro-ultraspeed] worker.started
+[tr-thinking call-0132:worker:xiaomi/mimo-v2.5-pro-ultraspeed] The lwl/lwr with the formula-based approach works correctly. Now I need to also derive correct swl/swr formulas and apply all four to vm.js.
+
+For the common case `lwl 3(base)` + `lwr 0(base)`, it correctly loads the full word 0x44332211.
+
+Let me also derive swl/swr:
+
+swl stores high bytes (from mem position to end of word):
+- swl rt, 3(base): stores 1 byte (MSB) from rt to mem[3]
+- swl rt, 2(base): stores 2 bytes from rt to mem[2..
+[tr-thinking call-0132:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 3]
+- swl rt, 1(base): stores 3 bytes from rt to mem[1..3]
+- swl rt, 0(base): stores 4 bytes (full word)
+
+For LE, swl at addr A with bo=A&3:
+- Writes (4-bo) bytes starting at A into memory
+- These are the HIGH bytes of rt (most significant)
+
+Let me think about this:
+- For bo=3: only byte at A=mem[3] gets the LSB of the high part... wait.
+
+Actually for LE MIPS, let me think about it differently. The WAD parsing code does:
+```
+lwl at, 3(s1)   ; load word left from addr s1+3
+lwr at, 0(s1)   ; load
+[tr-thinking call-0132:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  word right from addr s1
+```
+
+This loads a full 4-byte value from address s1 into register `at`. Since lwl/lwr can handle unaligned access, but s1 is likely aligned (WAD directory entries are 16 bytes each with 4-byte offset and size fields).
+
+Actually wait - looking at the WAD directory:
+- Each entry is 16 bytes: offset(4) + size(4) + name(8)
+- The code loads at s1+0..3 (offset) and s1+4..7 (size)
+- Since s1 points to start of
+[tr-thinking call-0132:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  16-byte entry, offset and size are at aligned addresses
+
+So the lwl/lwr pair at 3(s1)+0(s1) should load from aligned address. With bo=0 for both (if s1 is 4-byte aligned), lwl would shift by 24 (just MSB) and lwr would do nothing shift (load all 4 bytes).
+
+Wait no, lwl at 3(s1) means addr = s1+3, bo = 3, and lwr at 0(s1) means addr = s1, bo = 0.
+
+With my formula:
+- lwl(rt
+[tr-thinking call-0132:worker:xiaomi/mimo-v2.5-pro-ultraspeed] , s1+3): sh = (3-3)*8 = 0, mask = 0. Result = mv (full word). ✓
+- lwr(rt, s1+0): sh = 0*8 = 0, mask = 0. Result = mv (full word). ✓
+
+So for aligned data, both lwl and lwr load the full word. That's correct - the first lwl already loads the full word, and lwr overwrites with the same full word. This is expected for aligned data.
+
+So my lwl/lwr implementation should be fine. The problem is likely elsewhere.
+
+Let me look
+[tr-thinking call-0132:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  at the trace output more carefully:
+- R fd=4 from=0 n=12 got=12: Reading WAD header (12 bytes: 4 magic + 4 numlumps + 4 dir_offset)
+- R fd=4 from=4175796 n=20224 got=20224: Reading directory (1264*16 = 20224 bytes)
+- R fd=4 from=20 n=244 got=244: Reading lump data at offset 20
+
+The lump being read at offset 20 with 244 bytes... this
+[tr-thinking call-0132:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  isn't the first lump (PLAYPAL at offset 12 with size 10752). This seems like a different lump. The question is - what is it trying to read?
+
+Actually, looking at the trace: b0=7 b4=255 at dst=0x5e7f88. The WAD file at offset 20 would be... bytes 12-19 are PLAYPAL (offset 12, size 10752). Wait no - the WAD header is 12 bytes, then PLAYPAL starts at offset 12. So offset 20 is within PLAYPAL.
+
+But
+[tr-thinking call-0132:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  wait - the first lump (PLAYPAL) has offset=12, size=10752. So why is it reading 244 bytes from offset 20? That's reading into the middle of PLAYPAL. This doesn't match the expected lumpinfo structure parsing.
+
+Actually, looking at the R_InitTextures code flow and the W_CacheLumpNum code:
+```
+00438040:       8c720014        lw      s2,20(v1)     <- load size from lumpinfo+20
+```
+
+This loads `lumpinfo[i].size` which is at offset 20 in the 
+[tr-thinking call-0132:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 28-byte structure. Looking at the W_AddFile code, the structure is 28 bytes (0x1c) with these fields:
+- offset 0: name (8 bytes, from strncpy)
+- offset 8: file pointer
+- offset 12: offset (loaded with lwl/lwr from WAD dir+0)
+- offset 16: size (loaded with lwl/lwr from WAD dir+4)  
+- offset 20: data pointer (set to 0 initially)
+
+Wait, that's what I see in the W_AddFile code:
+```
+437cb4: ae560008  sw  s6,8(s2)      ;
+[tr-thinking call-0132:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  store file* at offset 8
+437cc4: lwl at,3(s1) / lwr at,0(s1)  ; load offset from dir entry
+437ccc: ae41000c  sw  at,12(s2)     ; store at struct offset 12
+437cd0: lwl at,7(s1) / lwr at,4(s1)  ; load size from dir entry
+437cd8: ae410010  sw  at,16(s2)     ; store at struct offset 16
+437cdc: strncpy(a0=s2, a1=s
+[tr-thinking call-0132:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 1+8, a2=8) ; copy name
+437ce0: ae400014  sw  zero,20(s2)   ; set data ptr to NULL
+437cf8: addiu s2,s2,28              ; advance by 28 bytes
+```
+
+So the lumpinfo structure (28 bytes each):
+- +0: name (8 bytes)
+- +8: file pointer
+- +12: offset in WAD
+- +16: size
+- +20: data pointer (cache)
+
+And in W_CacheLumpNum at 0x438040
+[tr-thinking call-0132:worker:xiaomi/mimo-v2.5-pro-ultraspeed] :
+```
+438040: lw  s2,20(v1)   <- loads data pointer from offset 20
+```
+
+So if the data pointer is NULL (which it is initially), the code proceeds to allocate and read.
+
+The issue is that the WAD directory entries are being read correctly (b0=12 b4=0 for the first entry). The first 4 bytes should be the offset (12 = 0x0000000C), and bytes 4-7 should be the size (10752 = 0x00002A00).
+
+Wait,
+[tr-thinking call-0132:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  b0=12, b4=0... b0 is the byte at dst (the first byte of the directory buffer). The directory entry's first 4 bytes are the offset (12, little-endian: 0x0C 0x00 0x00 0x00). b4 is the 5th byte, which would be byte 4 = first byte of the size field (10752 = 0x00002A00, so byte 4 = 0x00). But the size is 10752 (
+[tr-thinking call-0132:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 0x2A00), so bytes 4-7 should be 0x00, 0x2A, 0x00, 0x00. But b4=0, which is correct.
+
+Hmm, but then the question is - what does W_CacheLumpNum read as the size? It loads from lumpinfo[...].size at offset 16 of the 28-byte struct. Let me add a trace to see what lumpinfo size value is loaded.
+
+Actually, looking more carefully at W_CacheLumpNum:
+```
+43800c: sll  at,s1,2     ; at = lumpnum * 4
+438010: sll  v0,s1,5
+[tr-thinking call-0132:worker:xiaomi/mimo-v2.5-pro-ultraspeed]      ; v0 = lumpnum * 32
+438014: subu s3,v0,at    ; s3 = lumpnum * 28 (32-4=28)
+438018: lw   v0,1476(at) ; v0 = lumpinfo pointer (from BSS at 0x4b05c4)
+43801c: addu v1,v0,s3    ; v1 = lumpinfo + lumpnum*28
+438020: lw   at,8(v1)    ; at = lumpinfo[lumpnum].file (offset 8)
+438024: lw   a0
+[tr-thinking call-0132:worker:xiaomi/mimo-v2.5-pro-ultraspeed] ,4(at)    ; a0 = file->handle (offset 4 of file struct?)
+```
+
+Wait, it loads from offset 8 of the 28-byte struct, which should be the file pointer. Then loads from offset 4 of that file struct. But if the file pointer is wrong, everything breaks.
+
+Actually I think the issue might be that my lwl/lwr is actually wrong for LE, or there's another instruction that's buggy. The data at the directory location should have:
+- bytes 0-3: offset=12 (0C 00 00 00)
+- bytes 4-7: size=10752 (00 2A 00 00)
+- bytes 8-15: name=PLAYPAL
+
+But my trace
+[tr-thinking call-0132:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  shows b0=12, b4=0 at the directory buffer. b0=12 means the first byte of the directory is 0x0C, and b4=0 means byte 4 is 0x00. For size=10752 (0x2A00), bytes 4-7 should be 0x00, 0x2A, 0x00, 0x00. So b4 should be 0x00, which matches.
+
+Wait, maybe the issue is that `lwl/lwr` is reading the WRONG data
+[tr-thinking call-0132:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  because the directory IS at the right place but my lwl/lwr isn't extracting the value correctly. Let me verify by reading memory directly after the directory is loaded.
+
+Actually, maybe the issue is completely different. Let me look at where Z_Malloc gets called. The ra=0x427c58 is in R_InitTextures. Let me look at what's happening there more carefully.
+
+Actually, I think the real problem might be with the `sltiu` instruction at case 11. Let me check if `sltiu` is implemented correctly. `sltiu rt, rs, imm` should do an unsigned comparison of rs with sign-extended immediate.
+
+Wait
+[tr-thinking call-0132:worker:xiaomi/mimo-v2.5-pro-ultraspeed] , looking at my code for case 11:
+```
+case 11: R[rt] = R[rs] < (si >>> 0) ? 1 : 0; break;
+```
+
+This is wrong! `sltiu` should sign-extend the immediate first, then do unsigned comparison. So the immediate `si` should be sign-extended (which it already is since `(I<<16)>>16` sign-extends), then compared as unsigned.
+
+Actually `R[rs] < (si >>> 0)` does: convert si to unsigned, then compare. Since si is already sign-extended (negative
+[tr-thinking call-0132:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  values remain negative as Int32), `>>> 0` converts to unsigned. And R[rs] is already from a Uint32Array so it's unsigned. So `R[rs] < (si >>> 0)` should be correct for unsigned comparison.
+
+But wait - in JavaScript, when comparing a Uint32 value with `>>> 0`, both are compared as floating-point numbers. If `si` is -8026 (like in the D_FindIWAD code), then `si >>> 0` is 4294959270 (0xFFFFE0A6). And R[rs] would be some address. `R[rs] < 42
+[tr-thinking call-0132:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 94959270` should work as unsigned comparison for typical addresses. This seems fine.
+
+Hmm, let me think about what else could be wrong. The issue is that the WAD directory entries are being parsed into the lumpinfo struct, but the size field ends up with a garbage value.
+
+Let me trace the actual lwl/lwr execution during the W_AddFile loop. The issue is I can't easily trace individual instructions. Let me instead verify the memory content after the directory is loaded.
+
+Actually, wait. Looking at the trace again:
+```
+R fd=4 from=4175796 n=20224 got=2022
+[tr-thinking call-0132:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 4 dst=0x5e6bb0 b0=12 b4=0
+```
+
+So the directory data starts at guest memory 0x5e6bb0. The first entry should be at 0x5e6bb0:
+- Bytes 0-3: offset = 12 (0x0C, 0x00, 0x00, 0x00) -> b0=0x0C=12 ✓
+- Bytes 4-7: size = 10752 (0x00, 0x2A, 0x00, 0x00) -> b4=0x00 ✓
+
+But the second
+[tr-thinking call-0132:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  read at `from=20 n=244` is a lump read. And the Z_Malloc call happens after that. So maybe the issue isn't with the directory parsing at all, but with how a particular lump is read.
+
+Actually, let me re-read the W_CacheLumpNum disassembly more carefully:
+
+```
+438040: lw   s2,20(v1)    <- loads size from lumpinfo+20 (NOT offset 16!)
+```
+
+Wait, offset 20 of the 28-byte struct is the data pointer (cache), not the size! Let me re-check the struct layout
+[tr-thinking call-0132:worker:xiaomi/mimo-v2.5-pro-ultraspeed] .
+
+From W_AddFile:
+```
+437cb4: sw  s6,8(s2)     ; offset 8: file pointer
+437ccc: sw  at,12(s2)    ; offset 12: offset in WAD
+437cd8: sw  at,16(s2)    ; offset 16: size
+437cdc: strncpy(...)      ; offset 0: name
+437ce0: sw  zero,20(s2)  ; offset 20: cache/data pointer
+```
+
+So struct layout:
+- +0: name (8 bytes)
+- +8: file*
+- +12: offset
+- +16: size
+
+[tr-thinking call-0132:worker:xiaomi/mimo-v2.5-pro-ultraspeed] - +20: data/cache pointer
+
+And in W_CacheLumpNum:
+```
+438040: lw  s2,20(v1)    <- loads cache pointer from offset 20
+```
+
+So it's loading the cache pointer. If this is NULL (0), it falls through to the allocation path. That's correct - first time it should be 0.
+
+Then:
+```
+438090: lw   at,1476(at)   <- loads something from BSS
+438094: addu at,v0,s3
+
+[tr-thinking call-0132:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 438098: lw   a0,16(at)     <- loads size from lumpinfo+16
+4380a0: jal  Z_Malloc      <- allocates size bytes
+```
+
+Wait, at 0x438090-0x4380a0, this is actually in a different code path. Let me re-read more carefully.
+
+Actually the code at 0x438040 is:
+```
+438040: lw   s2,20(v1)     <- cache ptr (should be 0 for uncached)
+438044: beqz s2,43806c     <- if
+[tr-thinking call-0132:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  NULL, jump to uncached path
+```
+
+Then at 0x43806c (presumably, the uncached path):
+```
+43806c: ...
+```
+
+Let me look at what happens after 0x43806c. I need more disassembly. Let me trace the actual Z_Malloc call with more context.
+
+Actually, the key issue is: the Z_Malloc gets called with size 0x2D2D2C1C = 757935132 bytes. This is clearly a corrupted value. Let me trace where the size comes from - it
+[tr-thinking call-0132:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  should be loaded from lumpinfo[i].size at offset 16.
+
+Let me add a trace at the Z_Malloc call to also dump the lump number and the lumpinfo entry content.
+
+Actually, let me take a completely different approach. Let me verify that my r32 function works correctly by reading the WAD directory bytes and checking they match the expected values. If r32 at the right address returns the right value, then lwl/lwr should work too.
+
+Let me just trace the memory reads during the WAD parsing loop. I'll add a trace to read the first few lumpinfo entries after they're populated.
+[tr-stream call-0132:worker:xiaomi/mimo-v2.5-pro-ultraspeed] The lwl/lwr formula
+[tr-stream call-0132:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  works correctly. Now let me apply the correct formulas to vm.js and fix the issue. Let me also trace what's happening at the W_CacheLumpNum level:
+
+{
+  "analysis": "The lwl/lwr formula-based approach works correctly. The issue must be elsewhere. Let me apply the correct lwl/lwr formulas to vm.js and also trace the actual lumpinfo data being read by W_CacheLumpNum.",
+  "plan": "Apply correct lwl/lwr formulas and add a trace at Z_Malloc to dump the lumpinfo entry.",
+  "commands": [
+    {
+      "keystrokes": "python3 << 'PYEOF'\nwith open('/app/vm.js', 'r') as f:\n    c = f.read()\n\n# Replace lwl with formula-based approach\nold_lwl = c
+[tr-stream call-0132:worker:xiaomi/mimo-v2.5-pro-ultraspeed] [c.index('case 34: {'):c.index('case 34: {')+200]\nnew_lwl = 'case 34: { const a = (R[rs] + si) >>> 0, al = a & ~3, bo = a & 3, mv = r32(al); const sh = (3 - bo) * 8; const mask = sh === 0 ? 0 : ((1 << sh) - 1) >>> 0; R[rt] = ((mv << sh) >>> 0 | (R[rt] & mask)) >>> 0; break; }
+[tr-stream call-0132:worker:xiaomi/mimo-v2.5-pro-ultraspeed] '\nc = c.replace(old_lwl, new_lwl)\nprint('Fixed lwl')\n\n# Replace lwr with formula-based approach\nold_lwr_start = c.index('case 38: { const a')\nold_lwr = c[old_lwr_start:old_lwr_start+200]\nnew_lwr = 'case 38: { const a = (R[rs] + si) >>> 0, al = a & ~3, bo = a & 3, mv = r32(al); const sh = bo * 8; const mask = sh === 0 ? 0 : (0xFFFFFFFF << (32 - sh)) >>> 0; R[rt] = ((mv >>> sh) | (R[rt] & mask))
+[tr-stream call-0132:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  >>> 0; break; }'\nc = c.replace(old_lwr, new_lwr)\nprint('Fixed lwr')\n\nwith open('/app/vm.js', 'w') as f:\n    f.write(c)\nprint('Done')\nPYEOF\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "node -c /app/vm.js && echo 'OK'\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "grep 'case 34:' /app/vm.js | grep -c 'sh ='\n",
+      "duration": 0.1
+
+[tr-stream call-0132:worker:xiaomi/mimo-v2.5-pro-ultraspeed]     },
+    {
+      "keystrokes": "timeout 15 node vm.js > /tmp/trace7.txt 2>&1; grep -aE 'Z_Malloc size|^R fd=' /tmp/trace7.txt | head -10\n",
+      "duration": 20.0
+    }
+  ]
+}
+
+[tr-stream call-0132:worker:xiaomi/mimo-v2.5-pro-ultraspeed] worker.done finish=stop cost_microdollars=319433
+[tr-stream call-0132:xiaomi/mimo-v2.5-pro-ultraspeed] The lwl/lwr formula works correctly. Now let me apply the correct formulas to vm.js and fix the issue. Let me also trace what's happening at the W_CacheLumpNum level:
+
+{
+  "analysis": "The lwl/lwr formula-based approach works correctly. The issue must be elsewhere. Let me apply the correct lwl/lwr formulas to vm.js and also trace the actual lumpinfo data being read by W_CacheLumpNum.",
+  "plan": "Apply correct lwl/lwr formulas and add a trace at Z_Malloc to dump the lumpinfo entry.",
+  "commands": [
+    {
+      "keystrokes": "python3 << 'PYEOF'\nwith open('/app/vm.js', 'r') as f:\n    c = f.read()\n\n# Replace lwl with formula-based approach\nold_lwl = c[c.index('case 34: {'):c.index('case 34: {')+200]\nnew_lwl = 'case 34: { const a = (R[rs] + si) >>> 0, al = a & ~3, bo = a & 3, mv = r32(al); const sh = (3 - bo) * 8; const mask = sh === 0 ? 0 : ((1 << sh) - 1) >>> 0; R[rt] = ((mv << sh) >>> 0 | (R[rt] & mask)) >>> 0; break; }'\nc = c.replace(old_lwl, new_lwl)\nprint('Fixed lwl')\n\n# Replace lwr with formula-based approach\nold_lwr_start = c.index('case 38: { const a')\nold_lwr = c[old_lwr_start:old_lwr_start+200]\nnew_lwr = 'case 38: { const a = (R[rs] + si) >>> 0, al = a & ~3, bo = a & 3, mv = r32(al); const sh = bo * 8; const mask = sh === 0 ? 0 : (0xFFFFFFFF << (32 - sh)) >>> 0; R[rt] = ((mv >>> sh) | (R[rt] & mask)) >>> 0; break; }'\nc = c.replace(old_lwr, new_lwr)\nprint('Fixed lwr')\n\nwith open('/app/vm.js', 'w') as f:\n    f.write(c)\nprint('Done')\nPYEOF\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "node -c /app/vm.js && echo 'OK'\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "grep 'case 34:' /app/vm.js | grep -c 'sh ='\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "timeout 15 node vm.js > /tmp/trace7.txt 2>&1; grep -aE 'Z_Malloc size|^R fd=' /tmp/trace7.txt | head -10\n",
+      "duration": 20.0
+    }
+  ]
+}

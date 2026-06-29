@@ -1,0 +1,316 @@
+
+[tr-stream call-0128:socrates:trustedrouter/socrates-pro-plus-1.0] socrates.started
+
+[tr-stream call-0128:worker:xiaomi/mimo-v2.5-pro-ultraspeed] worker.started
+[tr-thinking call-0128:worker:xiaomi/mimo-v2.5-pro-ultraspeed] The Z_Malloc is still reading bad data. Let me analyze the WAD reading trace:
+
+1. R fd=4 from=0 n=12 got=12 - Reads WAD header (12 bytes) at position 0
+2. R fd=4 from=4175796 n=20224 got=20224 - Reads directory (20224 = 1264*16 bytes) at position 4175796
+3. R fd=4 from=20 n=244 got=244 - Reads something at position 20, 
+[tr-thinking call-0128:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 244 bytes
+
+The problem is clear: position 20 is reading from the WAD header area, but the data at position 20 should be the first lump data (PLAYPAL starts at offset 12, with size 10752, so data at offset 20 is within PLAYPAL).
+
+Wait, but the third read is 244 bytes at position 20. Looking at the trace, this seems to be reading lumpinfo data, not lump content. Let me think about this differently.
+
+The Z_Malloc at ra=0x427c58 is called from R_InitTextures. Let me trace what's happening at that address
+[tr-thinking call-0128:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  more carefully.
+
+The issue might not be lwl/lwr at all. The directory data at dst=0x5e6bb0 has b0=12 and b4=0. The first directory entry should have offset=12 (which matches b0=12) and size=10752. Let me check what b4 actually represents.
+
+The lumpinfo structure has:
+- offset (4 bytes)
+- size (4 bytes)  
+- name (8 bytes)
+
+So b0=12 is the first 4 bytes of the directory = offset 12 ✓
+b4=0 is the next 4 bytes... but size should be 10752 (
+[tr-thinking call-0128:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 0x2A00). 
+
+b4 is at address dst+4 = 0x5e6bb4. r8(0x5e6bb4) = 0. But the actual WAD data at offset 4175800 (4175796+4) should be the size field of the first directory entry = 10752 = 0x2A00.
+
+Wait, the trace says `b0='+r8(a1)+' b4='+r8(a1+4)` - this is reading single bytes, not 32-bit words! b0=r8(0x5e6bb0)=12 which is
+[tr-thinking call-0128:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  the first byte of the offset field. b4=r8(0x5e6bb4)=0 which is the first byte of the size field. But the size is 10752=0x2A00, so the first byte (LE) should be 0x00. So b4=0 is actually correct for the size field's first byte!
+
+So the WAD directory IS being read correctly. The problem must be elsewhere - perhaps the lumpinfo structure is not being parsed correctly from the WAD directory, or there's a memory corruption issue.
+
+Actually, let me reconsider. The binary
+[tr-thinking call-0128:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  has `W_CacheLumpNum` which loads from `lumpinfo[i]`. The lumpinfo structure might be different from what I assumed. Let me look at the structure more carefully:
+
+From the disassembly of W_CacheLumpNum:
+```
+sll at,s1,0x2    # at = i*4
+sll v0,s1,0x5    # v0 = i*32
+subu s3,v0,at    # s3 = i*32 - i*4 = i*28
+```
+
+So the lumpinfo structure is 28 bytes, not 16 bytes. This means the binary has
+[tr-thinking call-0128:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  a different struct layout than what the WAD directory stores (which is 16 bytes per entry). There must be a function that converts WAD directory entries into the internal lumpinfo structures.
+
+The lumpinfo struct has:
+- offset 0: pointer to something (4 bytes)
+- offset 4: pointer to something (4 bytes)
+- offset 8: pointer to wad_file (4 bytes)  [used in W_CacheLumpNum at lw at,8(v1)]
+- offset 12: position (4 bytes) [used at lw at,12(v1)]
+- offset 16: ???
+- offset 20: size (4 bytes) [used at lw s2,20(v1)
+[tr-thinking call-0128:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  - the Z_Malloc size]
+- offset 24: name (8 bytes?)
+
+So the structure is 28 bytes and the size field is at offset 20. The binary reads size from lumpinfo[20], not from the WAD directory directly.
+
+The issue might be that W_Init是如何从WAD目录转换到lumpinfo结构的，或者lumpinfo结构的内存没有正确初始化。
+
+让我看看W_Init和W_AddFile的实现，以理解如何初始化lumpinfo。
+
+实际上，现在看来问题可能不是lwl/lwr，而是lumpinfo结构体的填充过程有问题。
+
+从反汇编
+[tr-thinking call-0128:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 中可以看到：
+- lumpinfo结构大小 = 28字节
+- size字段在offset 20
+
+757935132 = 0x2D2D2C1C 看起来像ASCII字符 ',--' ，这说明内存里存的是字符串而非数值。
+
+让我检查lumpinfo结构体的初始化过程。
+
+实际上，从我的追踪结果来看：
+- WAD头部读取正确（12字节）
+- WAD目录读取正确（20224字节=1264*16）
+- 第三个读取在位置20，大小244字节，
+[tr-thinking call-0128:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 这读取的是第一个lump的数据（PLAYPAL从offset 12开始，读取从20开始，即PLAYPAL的第8-251字节）
+
+但Z_Malloc从lumpinfo结构体中读取size=757935132，这说明lumpinfo没有正确填充。
+
+我需要检查W_AddFile函数如何解析WAD目录并填充lumpinfo结构体。
+
+问题可能在于lumpinfo结构体的字段位置。让我分析W_CacheLumpNum的代码：
+
+```asm
+sll at,s1,0x2    # at = i*4
+sll v0
+[tr-thinking call-0128:worker:xiaomi/mimo-v2.5-pro-ultraspeed] ,s1,0x5    # v0 = i*32
+subu s3,v0,at    # s3 = i*28 = i*(32-4)
+```
+
+所以结构体大小是28字节。在W_CacheLumpNum中：
+- lw at,8(v1)   # lumpinfo[i].wad_file (指针)
+- lw a0,4(at)   # wad_file->something
+- lw at,12(v1)  # lumpinfo[i].position
+- lw s2,20(v1)  # lumpinfo[i].size
+
+如果lumpinfo没有正确初始化，size字段
+[tr-thinking call-0128:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 可能是随机值。
+
+问题可能在于W_ReadLump或W_AddFile函数的实现中，我需要查看这些函数如何填充lumpinfo结构体。
+
+从代码来看，如果某个指针为NULL（beqz检查），就跳转到另一段代码加载size。如果这个指针没有被正确设置，可能会导致读取错误的内存位置。
+
+lumpinfo[20]的值是757935132 = 0x2D2D2C1C，这看起来像是ASCII字符（逗号、逗号、减号、减号），说明读取的是字符串数据而不是数字
+[tr-thinking call-0128:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 。
+
+我需要追踪lumpinfo是如何被填充的，特别是这个20偏移量处的值从哪里来。
+
+问题可能在于lumpinfo结构体的大小或字段偏移量与二进制文件中的定义不一致，导致字段被错误地读取。
+
+实际上，从W_CacheLumpNum的代码来看，当某个指针（可能是缓存指针）为NULL时，程序会跳转到加载size字段的代码，这表明lumpinfo结构体包含一个用于缓存数据的指针字段。
+
+关键问题是lumpinfo中的size字段存储的是0x2D2D2C1C这个值，这看起来
+[tr-thinking call-0128:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 像是ASCII字符（逗号和减号），说明读取的位置不对或者数据被破坏了。
+
+我需要追踪lumpinfo的填充过程来找出size字段为什么会包含这样的值。
+
+从我之前的分析来看，size字段位于lumpinfo结构体的offset 20处，但这个值看起来像是字符串数据而不是数值，这表明可能是内存布局的问题或者我在解析结构体时出了错误。
+
+让我仔细检查一下——0x2D2D2C1C实际上是44、45、45、45的十六进制表示，对应ASCII中的逗号和连字符，这显然是不对
+[tr-thinking call-0128:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 的。我认为问题在于offset 20处存储的是name字段的一部分，而不是size字段。
+
+这样的话，结构体的布局应该有所不同。我需要用readelf命令查看符号表中的lumpinfo结构体定义，或者检查二进制文件中是否有相关的调试信息。
+
+现在让我分析W_CacheLumpNum函数中的寄存器操作，看看s3和v1是如何计算的，这可能会揭示结构体的实际布局。
+
+关键的观察是28 = 4*7，这意味着结构体中有7个4字节的字段，而不是我最初假设的那样。
+
+让我看看源代码中的lumpinfo_t定义，它有
+[tr-thinking call-0128:worker:xiaomi/mimo-v2.5-pro-ultraspeed] name、size、position和data等字段，总共应该是20字节。但如果结构体实际大小是28字节，那就意味着还有额外的字段或者对齐填充。
+
+从W_CacheLumpNum的汇编代码来看，似乎有两个指针字段在访问——一个在偏移8处，一个在偏移12处——然后还有偏移20处的size字段。这表明结构体可能有6个4字节的字段，而不是我最初想的5个。如果v1指向lumpinfo[i]，那么我需要理解这些字段的实际含义和布局
+[tr-thinking call-0128:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 。
+
+现在我在检查W_CacheLumpNum中对lumpinfo结构体的访问模式。看起来函数首先检查一个缓存指针，如果缓存为空就分配内存并读取数据。对于像COLORMAP这样的lump，它会检查lumpinfo[i].size来确定需要分配多少内存。这解释了为什么某些访问模式看起来不一致——函数在处理缓存命中和缓存未命中的情况。
+
+现在我在查看size字段的值，发现它包含的是垃圾数据而不是实际大小。这表明lumpinfo结构体中的size字段没有被正确初始化，或者我在识别结构体布局
+[tr-thinking call-0128:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 时出错了。我需要追踪lumpinfo结构体的分配和初始化过程，特别是检查Z_Malloc调用时传入的size参数是如何计算的。
+
+通过反汇编R_InitTextures函数，我可以看到它首先调用R_LoadPname，然后从特定内存位置加载值到寄存器中，最后调用Z_Malloc来分配内存。问题可能在于这些加载指令读取的值来自错误的内存位置，导致size参数完全错误。
+
+我需要检查R_InitTextures的完整实现来追踪这个0x190E5664值的来源，以及理解为什么这个看起来像是ASCII字符
+[tr-thinking call-0128:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 的值会被用作内存分配大小。通过hex转换，0x2D2D2C1C实际上是逗号和连字符的ASCII码，这表明程序可能在读取字符串而不是数值。问题可能出在W_Init或W_AddFile函数中，这些函数负责初始化lumpinfo结构体并填充size字段，我需要检查这些函数的实现来找出数据损坏的根本原因。
+
+我注意到W_CacheLumpNum通过lumpinfo[i]访问lump信息，其中每个lumpinfo条目的大小是28字节，但在查找W_AddFile或W_Init的符号时没有找到，这表明这些函数可能使用
+[tr-thinking call-0128:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 了不同的命名约定或被内联了。
+
+现在我在检查readelf的输出，看看W_InitLoadFiles、W_OpenWad或类似的函数名，同时也在查找R_InitTextures中引用的常量0x444cac，以追踪字符串指针。
+
+我发现了"W_Init: Init WADfiles"和" adding %s"这些输出字符串，这表明W_Init函数确实存在。问题可能是lumpinfo结构体的size字段没有被正确填充，所以我需要检查W_ReadLump中如何使用size字段，或者直接查看W_CacheLumpNum的实现逻辑。
+
+从代码流程来看，W
+[tr-thinking call-0128:worker:xiaomi/mimo-v2.5-pro-ultraspeed] _CacheLumpNum会先检查缓存指针，如果缓存为空就从lumpinfo读取size字段来分配内存。关键问题是lumpinfo[i]的size字段包含垃圾值0x2D2D2C1C，这可能表明WAD文件加载时lumpinfo结构体初始化不完整。
+
+我怀疑根本原因是lseek或read系统调用的实现有问题，导致WAD目录数据没有被正确解析并填充到lumpinfo结构体中。虽然read返回了正确数量的字节（20224字节），但需要验证这些字节的实际内容是否正确写入了内存。
+
+通过
+[tr-thinking call-0128:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 检查目标地址0x5e6bb0处的字节值，我发现第一个目录条目的offset字段（0x0C000000）和size字段（0x002A0000）的字节顺序都正确，这表明字节序处理没有问题。但当我尝试将这些字节组合成32位值时，发
+
+现它们应该分别是12和10752。
+
+让我仔细看看lumpinfo的加载逻辑——从反汇编代码来看，程序似乎在计算数组索引，然后从某个表中读取值。
+[tr-thinking call-0128:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 我需要追踪这些加载指令的源地址，看看实际读取的是什么数据。
+
+通过手动计算，我发现`lumpinfo`表的基地址应该存储在`0x4b05c4`处，而lumpinfo结构体本身的大小是28字节。对于第二个lump（COLORMAP），计算得到的地址是`0x5e6bbc`，该位置的offset字段是10764，size字段是8704——这与WAD文件中定义的值相符，说明数据被正确加载了。
+
+但现在我注意到W_CacheLumpNum函数中访问的结构体偏移量与我预期的不同
+[tr-thinking call-0128:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 。从汇编代码来看，它在偏移8处访问一个指针（可能是wad_file指针），然后通过这个指针在偏移4处访问某个字段，最后在偏移20处读取size。这意味着lumpinfo_t结构体的实际布局与我之前假设的不同——wad_file指针在偏移8，而size在偏移20。
+
+源代码中的定义（name[8]、size、position、data、wad_file等）与二进制代码的访问模式不符，这可能意味着结构体被修改过，或者有版本不匹配的问题。
+
+我需要查看二进制文件中的实际符号
+[tr-thinking call-0128:worker:xiaomi/mimo-v2.5-pro-ultraspeed] ，特别是numlumps和lumpinfo这些全局变量，它们应该能告诉我结构体的真实布局。
+
+从反汇编代码来看，lumpinfo指针存储在0x4b05c4，numlumps存储在0x4b05c0，这两个都是BSS段中的全局变量。
+
+现在让我重新审视size字段的值0x2D2D2C1C，这似乎是问题的关键——这个错误的size值可能来自lumpinfo结构体中的某个字段被错误地解释了。
+
+我需要追踪W_CacheLumpNum函数中0x4b05c4地址存储的
+[tr-thinking call-0128:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 值，以及它是如何指向正确的lumpinfo数组的。如果lumpinfo结构体的初始化有误，那么size字段可能会包含任意的垃圾数据。
+
+我的下一步是检查WAD目录是否被正确解析，以及lumpinfo结构体的各个字段是否按预期填充。我还应该追踪lumpinfo数组的分配过程，确认其内存布局与代码中的访问模式相符。
+
+现在我发现了一个关键问题：size字段的值0x2D2D2C1C被存储在lumpinfo的偏移量20处，但根据我的分析，这个位置应该是某个指针字段。让我重新审视结构体的定义，
+[tr-thinking call-0128:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 看看是否有字段顺序或大小的误解。从readelf输出中我可以看到lumpinfo和lumpcache的地址，这有助于我理解内存布局的实际安排。
+
+现在我需要检查lumpinfo数组的初始化过程，特别是W_Init函数中对numlumps和lumpinfo的设置，以及OpenAndReadWadDirectory函数的实现，这样才能找出为什么size字段包含了错误的值。 我看到当前的系统调用追踪只记录了读取、查找和分配操作，但我需要追踪内存写入来理解数据是如何被填充的。让我添加写入追踪来监控lumpinfo结构体的大小
+[tr-thinking call-0128:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 字段，或者直接用W_CacheLumpNum中的已知偏移量来验证结构体的布局。
+
+通过检查目录读取后存储在0x5e6bb0处的数据，我可以验证各个字段的值——第一个条目显示offset=12、size=10752、name='PLAYPAL'，这与预期相符。
+
+现在看第二个条目在0x5e6bc0处，offset=10764、size=8704、name='COLORMAP'也都正确。但当我检查lumpinfo[1]的访问时，代码从
+[tr-thinking call-0128:worker:xiaomi/mimo-v2.5-pro-ultraspeed] lumpinfo[1]+20处读取size值为16777216（0x01000000），这显然是错误的——应该是8704。这表明偏移量计算或内存布局有问题，size字段在结构体中的实际位置可能与我的假设不符。 Looking at the WAD parsing flow, the directory entries get copied into the lumpinfo structure, and the file offset is set during that same W_AddFile process. So if the position field is showing 0 instead of 12, either the parsing function isn't writing it correctly, or I'm looking at the wrong field entirely.
+
+I
+[tr-thinking call-0128:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  need to trace what actually gets written to that memory address after the directory read completes, since the zero value suggests the field never got populated during initialization. The most practical approach is to add instrumentation that captures what's being written to those critical addresses, or examine the binary's WAD-parsing logic directly to see how it populates the lumpinfo structure. Since debugging in this environment is tricky, I should focus on understanding the initialization sequence first. I'm wondering if the issue is that `lumpinfo` points to a different memory location than where the directory data was actually read into, so the two buffers are out of sync. Let me add some instrumentation to verify that the lumpinfo pointer at
+[tr-thinking call-0128:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  0x4b05c4 actually points to 0x5e6bb0 after the initialization runs. I should add a check in the Z_Malloc handler to see what `lumpinfo_ptr` actually contains and verify whether the size field is being read correctly from the expected memory location. Looking at the call site more carefully, the size parameter for Z_Malloc is being loaded from `lumpinfo[i].size`, so if that's returning garbage, the problem likely stems from either the lumpinfo array pointer being corrupted or the size field not being initialized properly during the WAD loading process.
+
+I'm wondering if the issue could be with how the lump
+[tr-thinking call-0128:worker:xiaomi/mimo-v2.5-pro-ultraspeed] info array is being stored or retrieved—specifically, whether the array pointer at the global address 0x4b05c4 is pointing to the right location where the directory data was actually written.
+
+Let me try adding some instrumentation to trace what's happening: I'll instrument the syscall handler to log writes to addresses near 0x4b05c0-0x4b05d0 to see if lumpinfo and numlumps are being set correctly, or just add a check right at the Z_Malloc call to dump what lumpinfo_ptr actually contains.
+
+I'm realizing the fastest path forward is to dump the actual memory contents at key addresses right
+[tr-thinking call-0128:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  before the Z_Malloc call fails, which will tell me whether the data structure is corrupted or if something else is going wrong. For this specific failing call at ra=0x427c58, I need to verify what's in the lumpinfo array and whether the size field contains valid data.
+
+The issue is that my global variable access won't work directly inside the compiled switch case where R is local, so I need to find a workaround—either access the VM's memory directly or restructure how I'm instrumenting the code. The third read shows data from the first lump starting at position 20, which doesn't match what I'd expect if it were reading the WAD directory directly.
+[tr-thinking call-0128:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  This makes me wonder if there's a second file descriptor involved, or if the binary is opening the file twice for different purposes. Let me trace through the file descriptor operations more carefully to understand what's actually being read and when. I'm realizing the third read at position 20 is actually pulling lump data (PLAYPAL) rather than the directory itself, which means the program must have the directory entries cached in memory from somewhere else. The real question is how the binary gets from that initial read to populating the lumpinfo structure—either there's a syscall I haven't traced yet, or the directory is being read through a different mechanism than standard file I
+[tr-thinking call-0128:worker:xiaomi/mimo-v2.5-pro-ultraspeed] /O. Let me verify whether the directory read and the struct population are actually happening in the same code path by examining what comes right after that 20224-byte read. The read operation correctly pulls the full 20224 bytes into the buffer, and I'm verifying that the first few bytes match what I'd expect from the WAD directory—12 bytes of offset data followed by the lump size. But I'm realizing the real issue might be timing: the binary could be reading the directory entries correctly, but then something goes wrong when those entries get copied into the lumpinfo structure, which is what Z
+[tr-thinking call-0128:worker:xiaomi/mimo-v2.5-pro-ultraspeed] _Malloc actually checks. I should focus on whether the directory-to-struct conversion is happening properly rather than the raw file read itself. I'm realizing the lumpinfo array isn't being populated at all—those bytes I'm reading at positions 0 and 4 are just zeros, meaning no directory entries have been parsed into the structure. This suggests the WAD loading process either didn't run or failed silently. I need to trace back through the initialization sequence to see where the directory should have been read and the lumpinfo array populated, particularly looking at what happens after the main directory read at position 4175796.
+
+Wait, I think
+[tr-thinking call-0128:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  I've found it—what if `wad_file->data` is pointing to offset 0 within the file descriptor, and `lumpinfo[i].position` is relative to that base? Then the absolute position would be calculated as `0 + 12 = 12`, which matches what I'm seeing in the data.
+
+The real issue might be that the `position` field in the lumpinfo structure isn't being set correctly during initialization, or I'm reading from the wrong offset in the structure. Let me trace through W_CacheLumpNum more carefully to verify which field I'm actually accessing. Continuing to trace through the assembly, I'm seeing
+[tr-thinking call-0128:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  the size field loaded and then a function call to `Z_ChangeTag2` with the cache pointer and what looks like a string constant being passed as an argument. I'm working through the assembly code to understand the memory access pattern - the function is loading values from offsets 8 and 12 of the structure, using them as pointers, and then calculating a final address by adding them together. I'm tracking how the size field gets loaded at offset 20 and passed to Z_Malloc, confirming the lumpinfo structure has its size at that position. Now I need to verify that lumpinfo[20] actually contains the expected value when the W
+[tr-thinking call-0128:worker:xiaomi/mimo-v2.5-pro-ultraspeed] AD is initialized.
+
+Checking the directory bytes more carefully — I'm looking at address 0x5e6bc8 which is 24 bytes into the directory data, but that's past the 20-byte boundary I expected. The value there (0x00220000) suggests I'm reading from a different location than the actual size field.
+
+Wait, I think I've found the real issue: lumpinfo[1] isn't actually pointing to the directory data at 0x5e6bc0. The lumpinfo array is stored separately at 0x4b05c4, and the directory buffer is
+[tr-thinking call-0128:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  allocated at 0x5e6bb0. These are two different memory locations, which would explain why the values don't match up.
+
+The directory gets loaded into the temporary buffer at 0x5e6bb0, and then either that pointer becomes lumpinfo directly, or the data gets copied into a newly allocated lumpinfo array. If there's an allocation failure or the copy doesn't happen correctly, lumpinfo would still be pointing to uninitialized memory.
+
+I should verify whether lumpinfo_ptr is actually pointing to 0x5e6bb0 by checking the memory at 0x4b05c4, or trace the full chain
+[tr-thinking call-0128:worker:xiaomi/mimo-v2.5-pro-ultraspeed] : what the directory read's destination pointer contains, what value is stored at the lumpinfo global address, and whether they match up.
+
+Actually, the most direct approach is to disassemble W_Init and see how it processes the directory and sets up lumpinfo. But I realize my read trace only captures the first three reads—there might be additional reads happening that would show lumpinfo being initialized. I'm going to remove the read count limit and increase the lseek trace count instead, which should give me a clearer picture of what's happening.
+
+Though I need to be careful about flooding the output, so I'll add filtering to only show specific addresses or size ranges. Let
+[tr-thinking call-0128:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  me think about this more strategically—I suspect the issue is that lumpinfo[20] contains a pointer instead of an integer, since 0x2D2D2C1C looks like ASCII data rather than a numeric size value.
+
+Looking at the disassembly of W_CacheLumpNum, I'm tracing through what happens when the cache pointer is null versus when it's valid, and I need to understand how the size field is actually being accessed.
+
+The key insight is that W_CacheLumpNum is checking `lumpinfo[i].cache` at offset 8, and if it's non-null, it calculates
+[tr-thinking call-0128:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  the cached data location by adding offset 12 to that pointer. But if the cache pointer is null—which would happen if the data hasn't been loaded yet—it falls back to loading the size from offset 20, which then triggers Z_Malloc to allocate memory for the data. The fact that offset 20 contains garbage suggests that field isn't actually the size, which means either the structure layout is different than expected or the initialization is corrupting that memory location.
+
+Looking at the disassembly more carefully, the size field might be at offset 16 instead of 20, but I need to verify this against the actual WAD initialization code to understand how these fields are being populated in the first place.
+
+Actually, let
+[tr-thinking call-0128:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  me step back and focus on what the binary is actually doing rather than trying to guess the structure layout. I should trace through the W_Init function to see how it processes the WAD file and sets up the directory entries. Actually, I'm overcomplicating this—let me just test a simpler theory: what if the size field is at offset 16 instead of 20? I can verify this by checking if the value at that location matches the expected size for the first lump entry, which it does (0x00002A00 = 10752).
+
+So the structure layout has size at offset 16, name at offset 20, and other fields like
+[tr-thinking call-0128:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  tag and cache pointers elsewhere. Now I need to figure out where the code is actually reading from and adjust the offset accordingly. I'm seeing that W_CacheLumpNum reads the size from offset 16, which means Z_Malloc is being called with size 10752 bytes instead of the corrupted 757935132 value I was seeing before. This suggests the real bug is that my code is reading the size from the wrong offset—it should be reading from offset 16, not offset 20.
+
+The problem is that this is happening inside the compiled binary itself, not in my interpreter code. My
+[tr-thinking call-0128:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  VM is just executing the instructions the compiler generated, so if it's reading from offset 20, that's what the original C source code compiled to. Let me go back and carefully trace through the disassembly of W_CacheLumpNum to verify I'm reading the instruction sequence correctly. I'm realizing the size field might be stored differently than I assumed—let me trace through the assembly more carefully. The offset calculation at 0x438040 is loading from `v1 + 20`, where `v1` points to the lumpinfo entry, but I need to verify whether this is actually reading the size or
+[tr-thinking call-0128:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  if there's a different structure layout at play here. I need to trace through the binary's execution to see what value actually gets loaded into s2 at that memory read, since my manual calculation shows offset 20 contains the letter 'P' rather than a size value. The lumpinfo array might not be pointing to the directory data I expected, so I should instrument the memory read to understand what's really happening.
+
+Now I'm examining the WAD directory entries more carefully—each entry should be 16 bytes with offset, size, and name fields, so I need to verify the data structure is being parsed correctly.
+
+Looking at the
+[tr-thinking call-0128:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  byte layout at address 0x5e6bc0, I see the size field appears to be at offset 4, not offset 20 where I was looking. The value 0x50220000 doesn't make sense as a size either, which suggests the endianness conversion might be the real problem—I may have the byte order reversed when interpreting these fields. to bytes, so the issue must be elsewhere in how I'm interpreting the data or calling the function. So the read is pulling 20224 bytes, and when I map out the directory structure, each entry is 
+[tr-thinking call-0128:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 16 bytes—the first one correctly shows offset=12 and size=10752 for PLAYPAL. But when I check the next entry at offset 16, I'm getting size=0x002A0000 which doesn't match the expected value, suggesting I'm either misreading the byte layout or there's an endianness issue I'm missing.
+
+Wait, let me reconsider—what if the binary uses a different directory format than the standard WAD structure? Or more likely, what if the raw directory data gets parsed into an internal lumpinfo structure where the size field is stored at a
+[tr-thinking call-0128:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  different offset, like byte 20 instead of byte 4?
+
+Let me check what's actually at offset 20 in the first directory entry by interpreting those bytes as a 32-bit little-endian value.
+
+Hmm, that gives me 0x50220000 which is way too large. So the size definitely isn't at offset 20 in the raw directory data. That means the binary must be parsing and reformatting the data as it loads it. I need to find where that conversion happens in the code and see what's going wrong there.
+
+Looking at the strings in the binary, I can see references to
+[tr-thinking call-0128:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  "W_Init: Init WADfiles" and "adding %s", which suggests there's initialization logic that processes the WAD files. Let me trace through the symbol table to find the actual initialization function and understand how it's transforming the directory data. Looking at the rest of the function, I can see the full loop structure that processes each file entry—it's iterating through the array, calling W_AddFile for each one, and then cleaning up the temporary buffer. The loop counter gets decremented and branches back if there are more entries to process, otherwise it jumps to the cleanup code.
+
+Now I need to disassemble W_AddFile to understand how it's actually loading
+[tr-thinking call-0128:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  and parsing the directory data.
+[tr-stream call-0128:worker:xiaomi/mimo-v2.5-pro-ultraspeed] Let me look at this from a completely different angle - let me check what the binary actually stores for the lumpinfo structure and verify my assumptions:
+
+{
+  "analysis": "The directory data is being read correctly (20224 bytes, matching WAD), but the lumpinfo structure at offset 20 contains garbage. I need to understand the actual structure layout by disassembling W_AddFile to see how it parses directory entries into the internal structure.",
+  "plan": "Disassemble W_AddFile and W_Init to understand the actual parsing logic.",
+  "commands": [
+    {
+      "keystrokes": "readelf -s /app/doomgeneric_mips
+[tr-stream call-0128:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  | grep -E ' W_AddFile|W_Init|W_OpenWad|W_LoadWad|W_InitLump'\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "grep -aE 'W_Init|W_LoadWad|W_Open|W_Add' /tmp/trace6.txt | head -5\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "mips-linux-gnu-objdump -d --start-address=0x437c20 --stop-address=0x437e00 /app/doomgeneric_mips | head -80\n",
+      "duration": 0.5
+    }
+  ]
+}
+
+[tr-stream call-0128:worker:xiaomi/mimo-v2.5-pro-ultraspeed] worker.done finish=stop cost_microdollars=319980
+[tr-stream call-0128:xiaomi/mimo-v2.5-pro-ultraspeed] Let me look at this from a completely different angle - let me check what the binary actually stores for the lumpinfo structure and verify my assumptions:
+
+{
+  "analysis": "The directory data is being read correctly (20224 bytes, matching WAD), but the lumpinfo structure at offset 20 contains garbage. I need to understand the actual structure layout by disassembling W_AddFile to see how it parses directory entries into the internal structure.",
+  "plan": "Disassemble W_AddFile and W_Init to understand the actual parsing logic.",
+  "commands": [
+    {
+      "keystrokes": "readelf -s /app/doomgeneric_mips | grep -E ' W_AddFile|W_Init|W_OpenWad|W_LoadWad|W_InitLump'\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "grep -aE 'W_Init|W_LoadWad|W_Open|W_Add' /tmp/trace6.txt | head -5\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "mips-linux-gnu-objdump -d --start-address=0x437c20 --stop-address=0x437e00 /app/doomgeneric_mips | head -80\n",
+      "duration": 0.5
+    }
+  ]
+}

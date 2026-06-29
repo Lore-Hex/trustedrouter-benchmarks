@@ -1,0 +1,159 @@
+[?2004hroot@fc5c75e9ab67:/app# asciinema rec --stdin /logs/agent/recording.cast
+[?2004l[0;32masciinema: recording asciicast to /logs/agent/recording.cast[0m
+[0;32masciinema: press <ctrl-d> or type "exit" when you're done[0m
+[?2004hroot@fc5c75e9ab67:/app# clear
+[?2004l[H[J[3J[?2004hroot@fc5c75e9ab67:/app# cat > /app/parallel_linear.py << 'EOF'
+[?2004l[?2004h> import torch
+[?2004l[?2004h> import torch.nn as nn
+[?2004l[?2004h> from torch.distributed import get_world_size, get_rank
+[?2004l[?2004h> import torch.distributed
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> class ColumnParallelLinear(nn.Module):
+[?2004l[?2004h>     """Column-parallel linear layer.
+[?2004l[?2004h>     
+[?2004l[?2004h>     Splits the weight matrix by rows (output dimension).
+[?2004lut_fe[?2004h>     Each rank computes a subset of output features.
+[?2004l[?2004h>     Outputs from all ranks are concatenated via all_gather.
+[?2004l[?2004h>     """
+[?2004l[?2004h>     
+[?2004l[?2004h>     def __init__(self, in_features, out_features, bias, master_weight):
+[?2004l[?2004h>         super().__init__()
+[?2004l[?2004h>         self.in_features = in_features
+[?2004l[?2004h>         self.out_features = out_features
+[?2004l[?2004h>         self.use_bias = bias
+[?2004l[?2004h>         
+[?2004l[?2004h>         # Get distributed training info
+[?2004l[?2004h>         self.world_size = get_world_size()
+[?2004l[?2004h>         self.rank = get_rank()
+[?2004l[?2004h>         
+[?2004l[?2004h>         # Each rank gets a portion of output features
+[?2004l[?2004h>         assert out_features % self.world_size == 0
+[?2004l[?2004h>         self.out_features_local = out_features // self.world_size
+[?2004l[?2004h>         
+[?2004l[?2004h>         # Split weight matrix along output dimension (rows)
+[?2004l[?2004h>         # master_weight shape: (out_features, in_features)
+[?2004l[?2004h>         start_idx = self.rank * self.out_features_local
+[?2004l[?2004h>         end_idx = start_idx + self.out_features_local
+[?2004l[?2004h>         weight_local = master_weight[start_idx:end_idx, :].clone().detach()
+[?2004l[?2004h>         
+[?2004l[?2004h>         self.weight = nn.Parameter(weight_local)
+[?2004l[?2004h>         
+[?2004l[?2004h>         # Bias is sharded along output dimension (same as output)
+[?2004l[?2004h>         if bias:
+[?2004l[?2004h>             bias_local = torch.zeros(self.out_features_local, dtype=master_weight.dtype, device=master_weight.device)
+[?2004l[?2004h>             self.bias = nn.Parameter(bias_local)
+[?2004l[?2004h>         else:
+[?2004l[?2004h>             self.register_parameter('bias', None)
+[?2004l[?2004h>     
+[?2004l[?2004h>     def forward(self, x):
+[?2004l[?2004h>         """Forward pass for column-parallel linear layer.
+[?2004l[?2004h>         
+[?2004l[?2004h>         Args:
+[?2004l[?2004h>             x: input tensor of shape (batch_size, in_features)
+[?2004l[?2004h>         
+[?2004l[?2004h>         Returns:
+[?2004l[?2004h>             output tensor of shape (batch_size, out_features)
+[?2004l[?2004h>         """
+[?2004l[?2004h>         # Compute local output
+[?2004l[?2004h>         y_local = torch.nn.functional.linear(x, self.weight, self.bias)
+[?2004l[?2004h>         # y_local shape: (batch_size, out_features_local)
+[?2004l[?2004h>         
+[?2004l[?2004h>         # All-gather to concatenate outputs from all ranks
+[?2004l[?2004h>         if self.world_size > 1:
+[?2004l[?2004h>             # Gather outputs from all ranks
+[?2004l[?2004h>             y_list = [torch.empty_like(y_local) for _ in range(self.world_size)]
+[?2004l[?2004h>             torch.distributed.all_gather(y_list, y_local)
+[?2004l[?2004h>             # Concatenate along feature dimension
+[?2004l[?2004h>             y = torch.cat(y_list, dim=-1)
+[?2004l[?2004h>         else:
+[?2004l[?2004h>             y = y_local
+[?2004l[?2004h>         
+[?2004l[?2004h>         return y
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> class RowParallelLinear(nn.Module):
+[?2004l[?2004h>     """Row-parallel linear layer.
+[?2004l[?2004h>     
+[?2004l[?2004h>     Splits the weight matrix by columns (input dimension).
+[?2004l[?2004h>     Each rank receives a scattered slice of the input.
+[?2004l[?2004h>     Partial outputs are summed via all_reduce.
+[?2004l[?2004h>     """
+[?2004l[?2004h>     
+[?2004l[?2004h>     def __init__(self, in_features, out_features, bias, master_weight):
+[?2004l[?2004h>         super().__init__()
+[?2004l[?2004h>         self.in_features = in_features
+[?2004l[?2004h>         self.out_features = out_features
+[?2004l[?2004h>         self.use_bias = bias
+[?2004l[?2004h>         
+[?2004l[?2004h>         # Get distributed training info
+[?2004l[?2004h>         self.world_size = get_world_size()
+[?2004l[?2004h>         self.rank = get_rank()
+[?2004l[?2004h>         
+[?2004l[?2004h>         # Each rank gets a portion of input features
+[?2004l[?2004h>         assert in_features % self.world_size == 0
+[?2004l[?2004h>         self.in_features_local = in_features // self.world_size
+[?2004l[?2004h>         
+[?2004l[?2004h>         # Split weight matrix along input dimension (columns)
+[?2004l[?2004h>         # master_weight shape: (out_features, in_features)
+[?2004l[?2004h>         start_idx = self.rank * self.in_features_local
+[?2004l[?2004h>         end_idx = start_idx + self.in_features_local
+[?2004l[?2004h>         weight_local = master_weight[:, start_idx:end_idx].clone().detach()
+[?2004l[?2004h>         
+[?2004l[?2004h>         self.weight = nn.Parameter(weight_local)
+[?2004l[?2004h>         
+[?2004l[?2004h>         # Bias is full on each rank (not sharded)
+[?2004l[?2004h>         if bias:
+[?2004l[?2004h>             bias_full = torch.zeros(out_features, dtype=master_weight.dtype, device=master_weight.device)
+[?2004l[?2004h>             self.bias = nn.Parameter(bias_full)
+[?2004l[?2004h>         else:
+[?2004l[?2004h>             self.register_parameter('bias', None)
+[?2004l[?2004h>     
+[?2004l[?2004h>     def forward(self, x):
+[?2004l[?2004h>         """Forward pass for row-parallel linear layer.
+[?2004l[?2004h>         
+[?2004l[?2004h>         Args:
+[?2004l[?2004h>             x: scattered input tensor of shape (batch_size, in_features_local)
+[?2004l[?2004h>         
+[?2004l[?2004h>         Returns:
+[?2004l[?2004h>             output tensor of shape (batch_size, out_features)
+[?2004l[?2004h>         """
+[?2004l[?2004h>         # Compute partial output using local input and weight
+[?2004l[?2004h>         y_partial = torch.nn.functional.linear(x, self.weight, None)
+[?2004l[?2004h>         # y_partial shape: (batch_size, out_features)
+[?2004l[?2004h>         
+[?2004l[?2004h>         # All-reduce to sum partial outputs from all ranks
+[?2004l[?2004h>         if self.world_size > 1:
+[?2004l[?2004h>             torch.distributed.all_reduce(y_partial)
+[?2004l[?2004h>         
+[?2004l[?2004h>         # Add bias (same on all ranks)
+[?2004l[?2004h>         if self.bias is not None:
+[?2004l[?2004h>             y_partial = y_partial + self.bias
+[?2004l[?2004h>         
+[?2004l[?2004h>         return y_partial
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@fc5c75e9ab67:/app# python3 -c "import ast; ast.parse(open('/app/parallel_linear.py').read()); print('Syntax OK')"
+[?2004lSyntax OK
+[?2004hroot@fc5c75e9ab67:/app# wc -l /app/parallel_linear.py && head -20 /app/parallel_linear.py
+[?2004l128 /app/parallel_linear.py
+import torch
+import torch.nn as nn
+from torch.distributed import get_world_size, get_rank
+import torch.distributed
+
+
+class ColumnParallelLinear(nn.Module):
+    """Column-parallel linear layer.
+    
+    Splits the weight matrix by rows (output dimension).
+    Each rank computes a subset of output features.
+    Outputs from all ranks are concatenated via all_gather.
+    """
+    
+    def __init__(self, in_features, out_features, bias, master_weight):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.use_bias = bias
+        
+[?2004hroot@fc5c75e9ab67:/app# 

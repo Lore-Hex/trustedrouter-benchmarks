@@ -1,0 +1,1290 @@
+
+[tr-stream call-0083:socrates:trustedrouter/socrates-pro-plus-1.0] socrates.started
+
+[tr-stream call-0083:worker:xiaomi/mimo-v2.5-pro-ultraspeed] worker.started
+[tr-thinking call-0083:worker:xiaomi/mimo-v2.5-pro-ultraspeed] The Z_Malloc error with 420303204 bytes is the key problem. Let me look at the error string and understand what's happening. The error is "Z_Malloc: failed on allocation of %i bytes" and the formatted output shows "420303204". This is clearly a garbage value.
+
+Let me look at the error handler in I_Error which prints this, and then the call chain. The error comes from Z_Malloc being called with a bad size parameter.
+
+420303204 in hex is 0x190C08
+[tr-thinking call-0083:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 64. This doesn't look like a valid screen size. 
+
+Actually wait - let me check what SCREENWIDTH * SCREENHEIGHT is. The DOOM screen is 640x400 = 256000. That's reasonable.
+
+420303204 decimal... Let me think about this differently. The error message says "Z_Malloc: failed on allocation of %i bytes" - but in the output it shows "420303204". The %i format for Z_Malloc is just the size parameter. 
+
+Let me look at what happens just before this. It says "R_Init: Init DOOM refresh daemon -
+[tr-thinking call-0083:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  " and then the Z_Malloc failure. So R_Init calls something that needs Z_Malloc with a huge size.
+
+Let me look at R_Init and R_ExecuteSetViewSize to see what's being allocated.
+
+Actually, the key insight is that the error message is "Z_Malloc: failed on allocation of %i bytes" followed by "Z_Malloc: failed on allocation of 420303204 bytes". This second line is from I_Error which prints the args.
+
+Wait, looking at the output more carefully:
+```
+R_Init: Init DOOM refresh daemon - Z_Malloc: failed on allocation of
+[tr-thinking call-0083:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  %i bytes
+Z_Malloc: failed on allocation of 420303204 bytes
+```
+
+The first line has "%i" literally, not substituted. This suggests printf formatting is broken in the MIPS binary. The second line "Z_Malloc: failed on allocation of 420303204 bytes" is from I_Error which formats correctly.
+
+So Z_Malloc is being called with size 420303204 = 0x190C0864. This is way too large.
+
+Let me think about what the binary expects. R_Init calls R_InitBuffer and R_InitLightTables etc. These
+[tr-thinking call-0083:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  allocate memory based on screen size. 
+
+Actually, wait. The binary has printf defined at 0x439938. The printf in this binary is custom (from my_stdlib.c). The custom printf might have issues with %i or %d format specifiers.
+
+But actually the error message pattern suggests that Z_Malloc is receiving a bad size. The 420303204 = 0x190C0864 doesn't make sense for any DOOM allocation.
+
+Let me think about what might be wrong. The error happens at R_Init. Let me look at R_Init.
+
+Actually, the key question is:
+[tr-thinking call-0083:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  what value should Z_Malloc be getting? In R_Init, the first Z_Malloc call is for R_InitBuffer which allocates the screen buffer.
+
+Wait, I already know that I_InitGraphics is called during I_Init, which is before R_Init. Let me check the call chain.
+
+Actually, looking at the output flow:
+1. I_Init: Setting up machine state.
+2. M_Init: Init miscellaneous info.  
+3. R_Init: Init DOOM refresh daemon - Z_Malloc failed
+
+So I_Init has already succeeded. The failure is in R_Init.
+
+The error comes from Z_Malloc being called with size 42030320
+[tr-thinking call-0083:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 4. Let me figure out where this comes from.
+
+R_Init calls:
+- R_InitData
+- R_InitPointToAngle
+- R_InitTables
+- R_InitLightTables
+- R_InitPlanes (or R_InitBuffer, R_InitTextureMapping, etc.)
+
+R_ExecuteSetViewSize sets up various tables based on screen dimensions. It allocates screen buffers.
+
+Hmm, 420303204 decimal = 0x190C0864. This doesn't look like any reasonable DOOM allocation.
+
+Wait, maybe the issue is that the `sltiu` instruction is not
+[tr-thinking call-0083:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  being handled correctly. Let me check case 11:
+
+```javascript
+case 11:R[rt]=R[rs]<(si>>>0)?1:0;break;
+```
+
+The `sltiu` instruction in MIPS compares as unsigned, but the immediate is sign-extended first. So the comparison should be:
+```
+R[rt] = (R[rs] >>> 0) < (si >>> 0) ? 1 : 0
+```
+
+Wait, I have `R[rs]<(si>>>0)` which does an unsigned compare of si but R[rs] is treated as signed by JavaScript because it's a
+[tr-thinking call-0083:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  Uint32Array element (which is already unsigned). Actually R[rs] is accessed as R[rs] which is a Uint32Array, so it's already unsigned. And si>>>0 converts si to unsigned. So `R[rs]<(si>>>0)` should work... Let me think more carefully.
+
+Actually, in JavaScript, when you compare two numbers with `<`, if both are non-negative (which they are since R[rs] is from Uint32Array and si>>>0 is non-negative), the comparison is correct.
+
+Wait, the issue might be something else. Let me look at the lwr instruction
+[tr-thinking call-0083:worker:xiaomi/mimo-v2.5-pro-ultraspeed] :
+
+```javascript
+case 38:{const a=(R[rs]+si)>>>0,al=a&~3,bo=a&3,mv=r32m(al);R[rt]=bo===0?(R[rt]&0x00FFFFFF|mv<<24)>>>0:bo===1?(R[rt]&0x0000FFFF|mv<<16)>>>0:bo===2?(R[rt]&0x000000FF|mv<<8)>>>0:mv;break}
+```
+
+Wait, this is `lwr` which
+[tr-thinking call-0083:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  loads the rightmost bytes. In MIPS LE, the semantics are different from what I have. Let me check...
+
+Actually for MIPS32r2 LE, the lwl/lwr instructions work on big-endian values stored in memory, with byte ordering being different. The implementation I have might be correct for the "old ABI" but wrong for MIPS32r2.
+
+Actually, let me look at this from a different angle. The key issue is the Z_Malloc allocation size 420303204. Let me think about what arithmetic could produce this value.
+
+420303204 in hex is 0x190C0864. 
+
+Wait
+[tr-thinking call-0083:worker:xiaomi/mimo-v2.5-pro-ultraspeed] , let me check if this could be a problem with the mul instruction (SPECIAL2 fn=2):
+```javascript
+case 2:R[rd]=Math.imul(R[rs],R[rt])>>>0;break;
+```
+
+`Math.imul` returns a signed 32-bit integer. When we `>>>0` it, it becomes unsigned. This should be correct.
+
+Actually, let me reconsider. The issue might be with screen dimensions. The DOOMGENERIC_RESX is 640, RESY is 400. So SCREENWIDTH*SCREENHEIGHT = 256000 = 0x3
+[tr-thinking call-0083:worker:xiaomi/mimo-v2.5-pro-ultraspeed] E800. 
+
+But the Z_Malloc call gets 420303204. If I compute 420303204 / 256000 = 1641.4. That doesn't help.
+
+What if the multiply is producing wrong results for some specific inputs? Let me test with a simple case in JavaScript:
+
+For `Math.imul(-1, -1)` = 1. That's correct.
+For `Math.imul(0x10000, 0x10000)` = 0 (wraps). After `>>>0` it's 0.
+[tr-thinking call-0083:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  But the correct result of 0x10000*0x10000 = 0x100000000 which doesn't fit in 32 bits. In MIPS, mul only stores the low 32 bits, so 0 is correct.
+
+OK, let me think about this differently. Maybe the issue is that some specific instruction is wrong, causing a loop or a wrong value.
+
+Let me add some debugging to trace where the 420303204 comes from. But that would be complex. Instead, let me check if the issue is with the `jal` return address.
+[tr-thinking call-0083:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  The `jal` instruction stores PC+8 (past delay slot) as the return address. In my code:
+
+```javascript
+case 3:R[31]=(cpc+8)>>>0;bd=((cpc+4)&0xF0000000)|((I&0x3FFFFFF)<<2);break;
+```
+
+Wait, for `j` instruction:
+```javascript
+case 2:bd=((cpc+4)&0xF0000000)|((I&0x3FFFFFF)<<2);break;
+```
+
+The j instruction at address A encodes a target in the jump field. The target should be:
+`target
+[tr-thinking call-0083:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  = (A+4) upper 4 bits | (target << 2)` - no, that's wrong too.
+
+Actually in MIPS, the `j` instruction target is computed as:
+`target = PC_high_bits | (imm26 << 2)`
+
+Where PC_high_bits is the upper 4 bits of the address of the instruction in the delay slot (which is PC+4 of the branch).
+
+So for a j at address A:
+`target = (A+4) & 0xF0000000 | (imm26 << 2)`
+
+Wait, actually MIPS specs say the target of `j` is:
+
+[tr-thinking call-0083:worker:xiaomi/mimo-v2.5-pro-ultraspeed] `target = {address_of_j_instruction[31:28], imm26, 2'b00}`
+
+So it's based on the j instruction's own PC, not PC+4:
+`target = (PC_of_j) & 0xF0000000 | (imm26 << 2)`
+
+But I have `(cpc+4)&0xF0000000` which is the delay slot's PC. Let me fix this!
+
+Wait, actually... looking at the MIPS spec more carefully:
+
+"The j instruction is commonly used to jump to a target address that is not within the current 256 MB-aligned region
+[tr-thinking call-0083:worker:xiaomi/mimo-v2.5-pro-ultraspeed] ."
+
+"The jump target address is obtained by shifting the target field left 2 bits, then concatenating the high-order bits of the address of the instruction in the delay slot."
+
+"The address of the delay slot is the jump instruction address + 4."
+
+So the target IS based on the delay slot address (PC+4):
+`target = (PC+4) & 0xF0000000 | (imm26 << 2)`
+
+This matches my code `(cpc+4)&0xF0000000|((I&0x3FFFFFF)<<2)`.
+
+Hmm, but wait. I see in the __
+[tr-thinking call-0083:worker:xiaomi/mimo-v2.5-pro-ultraspeed] start function:
+```
+400110: j 400124
+```
+The j instruction encodes `imm26 = 0x100049` (since 0x400124 >> 2 = 0x100049).
+Target should be: (0x400110 + 4) & 0xF0000000 | (0x100049 << 2) = 0x40000000 | 0x40
+[tr-thinking call-0083:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 0124 = 0x400124. ✓
+
+So that's correct. Let me look at the jal instruction:
+```javascript
+case 3:R[31]=(cpc+8)>>>0;bd=((cpc+4)&0xF0000000)|((I&0x3FFFFFF)<<2);break;
+```
+
+For `jal` at 0x40011c (`jal 439560`):
+- cpc = 0x40011c
+- Return address = cpc + 8 = 0x400124
+
+[tr-thinking call-0083:worker:xiaomi/mimo-v2.5-pro-ultraspeed] - Target = (0x40011c + 4) & 0xF0000000 | (target_field << 2)
+
+Let me check: 0x439560 >> 2 = 0x10E558. 
+Target = 0x400120 & 0xF0000000 | (0x10E558 << 2) = 0x40000000 | 0x439560 = 0x439560.
+[tr-thinking call-0083:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  ✓
+
+So the jal target is correct. Return address is PC+8 which is correct for MIPS (past the delay slot).
+
+Now let me look at the branch delay slot handling more carefully. When we set `bd = target`, the next iteration will:
+1. Execute the delay slot instruction at `pc = cpc+4`
+2. After that, `tb` will be the target, and `pc = tb`
+
+Wait, there's a subtle bug. When a branch is taken:
+1. We set `bd = target`
+2. Next iteration: `tb = bd`, `bd = -1`, `pc = cpc+4` (delay slot)
+3. Execute
+[tr-thinking call-0083:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  delay slot
+4. `if(tb>=0) pc = tb` - but wait, `tb` was set at the START of the iteration, and after executing the delay slot, we check `tb>=0` and set `pc = tb`.
+
+Actually wait, let me re-read the code:
+
+```javascript
+if(bd>=0){tb=bd;bd=-1}
+pc=(cpc+4)>>>0;
+```
+
+So at the START of the iteration, if bd is set (from a previous branch), we save it to tb and clear bd. Then we set pc = cpc+4.
+
+At the END: `if(tb>=0)pc=tb>>>0;`
+
+So the
+[tr-thinking call-0083:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  flow is:
+1. Branch instruction: sets bd=target
+2. Delay slot iteration: tb=target, bd=-1, pc=cpc+4, execute delay slot, then pc=tb=target
+
+This looks correct. The delay slot instruction is executed, then pc is set to the branch target.
+
+But wait - there's a problem with how tb is used. If the delay slot instruction itself sets bd (e.g., it's a branch instruction), then that bd would be lost because bd was already cleared to -1. But this shouldn't normally happen in well-formed MIPS code (you shouldn't put a branch in a delay slot).
+
+Actually, the more
+[tr-thinking call-0083:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  concerning issue is: what if the delay slot instruction modifies a register that the branch condition depends on? In MIPS, the branch condition is evaluated BEFORE the delay slot executes. So the delay slot should not affect the branch.
+
+But in my code, the branch condition IS evaluated at the branch instruction (before the delay slot), so that's fine.
+
+Hmm, let me think about what else could be wrong. Let me check the `sltiu` implementation:
+
+```javascript
+case 11:R[rt]=R[rs]<(si>>>0)?1:0;break;
+```
+
+The `sltiu` instruction sign-extends the immediate to
+[tr-thinking call-0083:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  32 bits, then does an unsigned comparison. So:
+- si is already sign-extended (it's `(I<<16)>>16`)
+- `si>>>0` converts to unsigned
+- `R[rs]` is from Uint32Array, so already unsigned
+
+This looks correct.
+
+What about the `ori` with lui for building 32-bit constants?
+
+```javascript
+case 13:R[rt]=R[rs]|ui;break;
+```
+
+And `lui`:
+```javascript
+case 15:R[rt]=(ui<<16)>>>0;break;
+```
+
+This looks correct. `lui` loads the upper 16 bits,
+[tr-thinking call-0083:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  and `ori` ORs in the lower 16 bits.
+
+Wait, I notice that `case 15` has `R[rt]=(ui<<16)>>>0;` but this shifts `ui` (which is an unsigned 16-bit value from the instruction) left by 16. The result could be negative in JS (if bit 15 of ui is set), but `>>>0` makes it unsigned. So this is correct.
+
+Let me think about the `lw` instruction:
+```javascript
+case 35:R[rt]=r32m((R[rs]+si)>>>0);break;
+```
+
+Here,
+[tr-thinking call-0083:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  `R[rs]+si` could overflow. R[rs] is unsigned (from Uint32Array), si is signed. In JavaScript, when you add a Uint32 and a signed int, the result is a Number. Then `>>>0` makes it unsigned. But `R[rs]+si` could produce a value like 4294967296 + (-1) = 4294967295, which is fine. But if R[rs] is 0 and si is -1, then 0 + (-1) = -1, and `-1 >>> 0` = 4
+[tr-thinking call-0083:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 294967295. This is correct for MIPS address wrapping.
+
+Hmm, I'm running out of ideas for what's wrong. Let me look at the error from a different angle.
+
+420303204 = 0x190C0864
+
+What if I trace the Z_Malloc call? Z_Malloc takes (size, tag, user). If the size is 420303204, that's way too big.
+
+Wait, let me look at the custom printf implementation. The error message format is:
+"Z_Malloc: failed on allocation of %i bytes"
+
+But
+[tr-thinking call-0083:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  the output shows "Z_Malloc: failed on allocation of %i bytes" LITERALLY, with %i not substituted. Then on the next line: "Z_Malloc: failed on allocation of 420303204 bytes".
+
+The first one is from inside Z_Malloc, the second from I_Error. Both use the same format string but the first isn't substituting the value.
+
+Actually, looking at the output:
+```
+R_Init: Init DOOM refresh daemon - Z_Malloc: failed on allocation of %i bytes
+Z_Malloc: failed on allocation of 420303204 bytes
+```
+
+The "R_Init:
+[tr-thinking call-0083:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  Init DOOM refresh daemon - " prefix is from I_InitGraphics or wherever R_Init starts. The "Z_Malloc: failed on allocation of %i bytes" is printed with `printf` but the `%i` is literally printed, meaning the printf implementation doesn't support `%i` or there's a va_args issue.
+
+Wait, the custom printf in the binary - does it support %i? Looking at my_stdlib.c, I'd need to check the custom printf implementation. But the fact that I_Error prints "420303204" correctly suggests that the second printf call works.
+
+Actually, let
+[tr-thinking call-0083:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  me look at the Z_Malloc code:
+```c
+void Z_Malloc(int size, memtag_t tag, void **user)
+{
+    // ... 
+    if (!mem)
+        I_Error("Z_Malloc: failed on allocation of %i bytes", size);
+}
+```
+
+So Z_Malloc is calling I_Error with the size parameter. The size is 420303204.
+
+Let me look at what R_Init calls before this failure. R_Init calls R_InitLightTables, which uses `LIGHTLEVELS * LIGHTSEGSCALE` etc.
+
+Actually, let me check the R_Init code:
+
+```c
+void R_Init (void)
+{
+    R_InitData();
+    printf(".");
+    R_InitPointToAngle
+[tr-thinking call-0083:worker:xiaomi/mimo-v2.5-pro-ultraspeed] ();
+    printf(".");
+    R_InitTables();
+    printf(".");
+    //R_InitTranslationTables();
+    printf("R_Init: Init DOOM refresh daemon -");
+    R_InitLightTables();
+    printf(".");
+    R_InitPlanes();
+    printf(".");
+    R_InitSkyMap();
+    printf(".");
+    R_InitBuffer(scaledviewwidth, viewheight);
+}
+```
+
+So after printing "R_Init: Init DOOM refresh daemon -", it calls R_InitLightTables. Let me look at R_InitLightTables:
+
+```c
+void R_InitLightTables (void)
+{
+    int		ldist, level;
+    int		light, scale;
+    int		startmap;
+
+[tr-thinking call-0083:worker:xiaomi/mimo-v2.5-pro-ultraspeed]     
+    // Calculate the light list to use
+    //  for each lightlevel.
+    ldist = 0;
+    for (light=0; light< LIGHTLEVELS; light++)
+    {
+        startmap = ((LIGHTLEVELS-1-light)*2)*NUMCOLORMAPS/LIGHTLEVELS;
+        
+        for (level=0; level<MAXLIGHTZ; level++)
+        {
+            scale = FixedDiv ((SCREENWIDTH/2*FRACUNIT), (j+1)<<LIGHTZSHIFT);
+            scale >>= LIGHTSCALESHIFT;
+            // ...
+        }
+    }
+}
+```
+
+Hmm, this doesn't allocate anything.
+[tr-thinking call-0083:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  Let me look at R_InitPlanes which probably does:
+
+```c
+void R_InitPlanes(void)
+{
+    // Cache looks like it allocates based on screen width
+}
+```
+
+Or maybe it's R_InitBuffer:
+
+```c
+void R_InitBuffer(int width, int height)
+{
+    // This sets up the view window
+}
+```
+
+Actually, looking at the code flow more carefully, I think the issue might be with R_ExecuteSetViewSize, which is called during initialization. It calls Z_Malloc to allocate the screen buffer.
+
+But wait, the actual issue might be simpler. Let me look at what call actually happens. The error says "Z_Malloc: failed on allocation of 
+[tr-thinking call-0083:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 420303204 bytes". This 420303204 value is the size parameter.
+
+Let me think about what computation could produce 420303204. 
+
+Hmm, what if there's a problem with how the Z_Malloc wrapper works? Z_Malloc is:
+
+```c
+#define Z_Malloc(s,t,p) Z_Malloc2(s,t,p,__FILE__,__LINE__)
+```
+
+Wait, maybe it's:
+```c
+void* Z_Malloc(size_t size, int tag, void **user);
+```
+
+If `size_t` is unsigned 32-bit, and something computes a negative value
+[tr-thinking call-0083:worker:xiaomi/mimo-v2.5-pro-ultraspeed] , wrapping to unsigned could give a huge number.
+
+Actually, looking at the numbers more carefully:
+- SCREENWIDTH = 640, SCREENHEIGHT = 400
+- 640 * 400 * 4 = 1024000 (for pixel_t which is uint32_t)
+- 640 * 400 = 256000 (for byte buffers)
+
+420303204 doesn't match any of these.
+
+Wait, let me check if there's an issue with my `doSys` function where I do:
+```javascript
+case 1:{const e=FD.get
+[tr-thinking call-0083:worker:xiaomi/mimo-v2.5-pro-ultraspeed] (a0);if(!e){R[2]=-1>>>0;return}const sz=Math.min(a2,0x100000),t=Buffer.alloc(sz);for(let i=0;i<sz;i++)t[i]=r8((a1+i)>>>0);if(e.t==='s'){try{R[2]=fs.writeSync(a0,t)}catch(er){R[2]=a2}return}const nn=fs.writeSync(e.h,t,0,sz,e.p);e.p+=nn;if(e.p>e.sz)e.sz=e.p;R[2]=nn;return}
+```
+
+For stdout/stderr writes, I'm
+[tr-thinking call-0083:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  passing the entire buffer `t` to `fs.writeSync`. But `t` has size `Math.min(a2, 0x100000)`, not `a2`. This means stdout writes will be truncated if a2 > 1MB. But that shouldn't cause the Z_Malloc issue.
+
+Actually, wait. Let me re-examine the error more carefully. The program CONTINUES running after the Z_Malloc error. I_Error calls exit(), but in our VM, exit is a syscall that sets EX=a0. So the process should stop.
+
+But looking at the output:
+```
+R_Init: Init
+[tr-thinking call-0083:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  DOOM refresh daemon - Z_Malloc: failed on allocation of %i bytes
+Z_Malloc: failed on allocation of 420303204 bytes
+
+982515712 pc=0x40e6d8
+```
+
+The program continues running after the error! And there's no "Exit:" message. This means I_Error is being called but doesn't actually exit. Let me check:
+
+I_Error probably calls exit() which becomes syscall 60, which sets EX=a0. But the main loop checks `EX===null`. So it should stop. Unless I_Error uses some other mechanism.
+
+
+[tr-thinking call-0083:worker:xiaomi/mimo-v2.5-pro-ultraspeed] Wait, looking at the output, after the error the program continues running for another ~980M instructions. This suggests that I_Error doesn't call exit() properly, or the exit syscall is being handled but the program continues.
+
+Actually, I just realized - the 982515712 line is from my progress counter: `if((ic&0xFFFFF)===0)`. So the program ran ~982M instructions. It was then killed by the 120s timeout, not by exit.
+
+So either:
+1. I_Error calls exit, but exit syscall doesn't work right
+2. I_Error doesn
+[tr-thinking call-0083:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 't call exit
+3. The error is caught somehow
+
+Looking at I_Error in the source:
+```c
+void I_Error(char *error, ...)
+{
+    va_list argptr;
+    ...
+    fprintf(stderr, "\nERROR: ");
+    vfprintf(stderr, error, argptr);
+    fprintf(stderr, "\n");
+    ...
+    exit(-1);
+}
+```
+
+So it calls exit(-1). That's syscall 60 with a0=-1 (0xFFFFFFFF). In my handler:
+```javascript
+case 60:EX=a0;return;
+```
+
+This sets EX = 0xFFFFFFFF. Then the while loop checks `EX===null`. 0xFFFFFFFF is not null, so it should stop.
+
+Hmm wait,
+[tr-thinking call-0083:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  but the output shows the error message but the program keeps running. Let me think... Maybe the custom printf has issues and crashes or enters an infinite loop? Or maybe the issue is that I_Error's exit is never reached because the custom printf or fprintf crashes?
+
+Actually, looking at the output again:
+```
+R_Init: Init DOOM refresh daemon - Z_Malloc: failed on allocation of %i bytes
+Z_Malloc: failed on allocation of 420303204 bytes
+```
+
+The first line has "%i" literally (not substituted). This means the custom printf doesn't handle %i correctly. But the second line "420303204" IS substituted.
+[tr-thinking call-0083:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  
+
+Wait, looking at the Z_Malloc source code:
+```c
+void Z_Malloc(int size, memtag_t tag, void **user)
+{
+    ...
+    if (!mem)
+        I_Error("Z_Malloc: failed on allocation of %i bytes", size);
+}
+```
+
+So the first "%i" that appears literally is from within Z_Malloc using printf (which might use %i). And the second "420303204" is from I_Error which uses vfprintf (or the custom implementation).
+
+But the key point is: after I_Error prints the message, it should call exit(-1). If the program continues,
+[tr-thinking call-0083:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  either:
+1. The exit syscall handler has a bug
+2. The I_Error function's exit call doesn't work
+
+Let me trace the exit syscall more carefully. When syscall 60 is invoked:
+```javascript
+case 60:EX=a0;return;
+```
+
+This sets EX to the exit code (which is -1 = 0xFFFFFFFF). Then the doSys function returns. Then back in the main loop:
+```javascript
+if(tb>=0)pc=tb>>>0;R[0]=0;
+```
+
+And then `while(EX===null)` - EX is now 0xFFFFFFFF, which is not null. So the loop should exit.
+
+But wait - the return from doSys returns to
+[tr-thinking call-0083:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  the main loop, but EX was set to -1 (0xFFFFFFFF). `0xFFFFFFFF === null` is false. So the while condition should be false and the loop exits. This seems correct.
+
+Unless... the issue is that I_Error calls exit(-1) which goes through the custom exit function. Let me check - in the MIPS binary, exit is at 0x43da70. Let me look at the disassembly:
+
+```
+0043da70 <exit>:
+  43da70:       move    v1,a0
+  43da74:       li      t2,6
+[tr-thinking call-0083:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 0
+  43da78:       li      t3,0
+  43da7c:       move    v0,t2
+  43da80:       move    a0,v1
+  43da84:       move    a1,t3
+  ...
+  43da98:       syscall
+  43da9c:       ...
+  43dab4:       j       43dab4    // infinite loop
+```
+
+So exit calls syscall 60 and then loops forever. In my VM, syscall 60 sets EX=a0 and returns. The return goes back to the instruction after `
+[tr-thinking call-0083:worker:xiaomi/mimo-v2.5-pro-ultraspeed] syscall`, which is at 0x43da9c. Then it continues to 0x43dab4 which is `j 43dab4` (infinite loop).
+
+But wait - EX was set, so when does the main loop check it? After the syscall instruction in exit, control returns to exit's code, which eventually reaches the `j 43dab4` infinite loop. But before executing that, the main loop should check `EX===null`.
+
+Actually, the issue is: the syscall instruction is in the exit function. After the syscall returns (setting EX), the next instruction in the exit function will execute (it's in the delay slot or
+[tr-thinking call-0083:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  the next instruction). Then control returns to the main loop, which checks `EX===null`.
+
+But the main loop checks at the TOP of the loop, not after each instruction. So:
+1. syscall instruction: EX = a0, doSys returns
+2. Main loop: `R[0]=0;` then loops back to top
+3. `while(EX===null)` - EX is not null, exits
+
+Actually, let me re-read the main loop:
+
+```javascript
+while(EX===null){
+  const cpc=pc,I=r32m(cpc);let tb=-1;
+  ...
+  case 12:doSys(cpc);break;
+  ...
+  if(tb>=0)pc=
+[tr-thinking call-0083:worker:xiaomi/mimo-v2.5-pro-ultraspeed] tb>>>0;R[0]=0;
+}
+```
+
+After doSys sets EX, we're still inside the while body. We continue to the end of the switch, then `if(tb>=0)pc=tb>>>0;R[0]=0;`, and then the while condition is checked. At that point EX is not null, so the loop exits. Good.
+
+But WAIT - I just realized something. The output shows the error but the program continues. What if I_Error is NOT calling exit? What if the error is non-fatal and the program just continues?
+
+Let me look at Z_Malloc more carefully.
+[tr-thinking call-0083:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  Actually, Z_Malloc with the custom allocator... If the allocation fails, it calls I_Error which calls exit. But maybe the allocator has a fallback?
+
+Actually, I think the real issue is simpler. Let me look at the Z_Malloc code path again. The error message "Z_Malloc: failed on allocation of %i bytes" - the %i is not being substituted. This suggests that the printf call is wrong.
+
+Wait, looking at Z_Malloc in the source:
+```c
+void* Z_Malloc2(int size, memtag_t tag, void *user, const char *file, int line)
+{
+    ...
+    if (!mem)
+    {
+        I_Error("Z_Malloc: failed on allocation of %d bytes", size);
+    }
+``
+[tr-thinking call-0083:worker:xiaomi/mimo-v2.5-pro-ultraspeed] `
+
+Actually, it's %d not %i. And I_Error uses vfprintf.
+
+Hmm, but the output shows "%i" literally. That means the custom printf doesn't support %i. Let me look at the custom printf implementation:
+
+In the my_stdlib.c custom printf:
+```c
+case 'i':
+case 'd': {
+    int num = va_arg(ap, int);
+    ...
+}
+```
+
+It should handle %i. But the output clearly shows "%i" literally, which means the printf in the binary doesn't handle %i.
+
+Wait, actually the output was:
+```
+R_Init: Init DOOM refresh daemon - Z_Malloc: failed on allocation of %i bytes
+Z_Malloc: failed on allocation of 
+[tr-thinking call-0083:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 420303204 bytes
+```
+
+The first line is from `printf("R_Init: Init DOOM refresh daemon -");` followed by `printf(".")` - actually no. Let me re-read.
+
+Actually, looking at the R_Init source code:
+```c
+void R_Init (void)
+{
+    ...
+    printf("R_Init: Init DOOM refresh daemon -");
+    R_InitLightTables();
+    ...
+}
+```
+
+So "R_Init: Init DOOM refresh daemon -" is printed by printf. Then R_InitLightTables is called. But the output shows "Z_Malloc: failed on allocation of %i bytes" immediately after. This means
+[tr-thinking call-0083:worker:xiaomi/mimo-v2.5-pro-ultraspeed] :
+
+1. R_Init prints the banner
+2. R_InitLightTables (or another function) calls Z_Malloc with a large size
+3. Z_Malloc fails and calls I_Error
+
+The I_Error message "Z_Malloc: failed on allocation of 420303204 bytes" is the SECOND line. The FIRST line with "%i" is confusing - maybe it's from a different printf call inside Z_Malloc itself (a debug print)?
+
+Actually wait, maybe the output is:
+```
+R_Init: Init DOOM refresh daemon - Z_Malloc: failed on allocation of %i bytes
+```
+
+This could be a single line from I_Error's
+[tr-thinking call-0083:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  vfprintf that doesn't support %i. I_Error would call vfprintf(stderr, "Z_Malloc: failed on allocation of %i bytes", size). If vfprintf doesn't handle %i, it prints "%i" literally.
+
+But then the SECOND line "Z_Malloc: failed on allocation of 420303204 bytes" - where does that come from? Maybe I_Error has a fallback or another handler?
+
+Actually, let me look at I_Error in the source:
+```c
+void I_Error(char *error, ...)
+{
+    va_list argptr;
+    
+    // Message first
+    va_start(argptr, error);
+    fprintf(stderr, "\nERROR: ");
+    vfprintf(stderr, error, argptr);
+    fprintf(stderr, "\
+[tr-thinking call-0083:worker:xiaomi/mimo-v2.5-pro-ultraspeed] n");
+    va_end(argptr);
+    
+    exit(-1);
+}
+```
+
+So I_Error should print:
+```
+ERROR: Z_Malloc: failed on allocation of %i bytes
+```
+
+But the output doesn't show "ERROR:" or the literal "%i" from I_Error. Instead, the output shows:
+```
+R_Init: Init DOOM refresh daemon - Z_Malloc: failed on allocation of %i bytes
+Z_Malloc: failed on allocation of 420303204 bytes
+```
+
+This is confusing. Let me think again...
+
+Maybe there's no I_Error at all, and Z_Malloc uses printf directly:
+```c
+printf
+[tr-thinking call-0083:worker:xiaomi/mimo-v2.5-pro-ultraspeed] ("Z_Malloc: failed on allocation of %i bytes\n", size);
+```
+
+The custom printf doesn't handle %i, so it prints literally. Then on the next line, another printf with %d prints the actual value. Or maybe the error handler tries again.
+
+Actually, I think the issue might be simpler. Looking at the output more carefully, I see that the program continues AFTER the error. So maybe the Z_Malloc failure is handled differently - it doesn't call I_Error but instead returns NULL and the program continues, eventually crashing with wrong behavior.
+
+Let me focus on the real issue: why does Z_Malloc get called with 
+[tr-thinking call-0083:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 420303204 bytes? The value 0x190C0864 doesn't make sense for any DOOM allocation.
+
+Actually, let me look at R_InitBuffer more carefully. Wait, the issue might be with how R_Init sets up the screen. R_ExecuteSetViewSize allocates based on screen width/height.
+
+Actually, let me check if maybe there's an issue with the `printf` in the binary when printing error messages. If the size is actually something reasonable but the printf formatting is wrong due to our VM, then the allocation size might be fine but something else is wrong.
+
+Hmm,
+[tr-thinking call-0083:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  but the Z_Malloc IS failing (it says "failed on allocation"). So the allocation IS being called with a bad size.
+
+Let me try a different approach. Let me add syscall tracing to see what values are being passed to brk.
+
+Actually, let me focus on optimizing the VM speed first. The Z_Malloc error might be a secondary issue that's caused by the program running out of memory or having a race condition. Let me try running with more memory.
+
+Actually wait - the zone memory is only 600000 bytes. The custom malloc in the binary uses a buddy allocator. Z_Malloc allocates from the zone, not from the system heap. So Z
+[tr-thinking call-0083:worker:xiaomi/mimo-v2.5-pro-ultraspeed] _Malloc gets 600000 bytes total.
+
+420303204 bytes is way more than 600000 bytes. So Z_Malloc is definitely being called with a wrong size.
+
+Let me check what's being calculated. In R_InitLightTables:
+```c
+#define MAXLIGHTZ		128
+#define LIGHTLEVELS		16
+#define LIGHTSEGSHIFT		4
+#define LIGHTSCALESHIFT		12
+#define LIGHTZSHIFT		20
+
+void R_InitLightTables (void)
+{
+    int		i, j, level, startmap, scale;
+    
+    for (i=0 ; i< LIGHTLEVELS ; i++)
+    {
+        startmap = ((LIGHTLEVELS-1-i
+[tr-thinking call-0083:worker:xiaomi/mimo-v2.5-pro-ultraspeed] )*2)*NUMCOLORMAPS/LIGHTLEVELS;
+        for (j=0 ; j<MAXLIGHTZ ; j++)
+        {
+            scale = FixedDiv ((SCREENWIDTH/2*FRACUNIT), (j+1)<<LIGHTZSHIFT);
+            scale >>= LIGHTSCALESHIFT;
+            ...
+        }
+    }
+}
+```
+
+FixedDiv is a function that does fixed-point division. Let me check if FixedDiv is correct.
+
+FixedDiv computes (a<<16)/b essentially. For (SCREENWIDTH/2*FRACUNIT) = 320 * 65536 = 20971520. And (j+1)<<LIGHTZSHIFT
+[tr-thinking call-0083:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  = (j+1)<<20.
+
+For j=0: scale = FixedDiv(20971520, 1<<20) = FixedDiv(20971520, 1048576). In fixed point, this should give about 20.0 * 65536 = 1310720.
+
+But if FixedDiv is wrong... Let me check FixedDiv:
+
+```c
+fixed_t FixedDiv(fixed_t a, fixed_t b)
+{
+    if ((abs(a) >> 14) >= abs(b))
+        return (a^b) <
+[tr-thinking call-0083:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  0 ? MININT : MAXINT;
+    else
+    {
+        int64_t result = ((int64_t)a << 16) / b;
+        return (fixed_t)result;
+    }
+}
+```
+
+Wait, this might not be the standard FixedDiv. In the doomgeneric codebase, FixedDiv might be different. Let me check.
+
+Actually, the standard DOOM FixedDiv is:
+```c
+fixed_t FixedDiv(fixed_t a, fixed_t b)
+{
+    if ( (abs(a)>>14) >= abs(b))
+        return (a^b)<0 ? MININT : MAXINT;
+    return FixedDiv2 (a,b);
+}
+```
+
+And FixedDiv2 does the
+[tr-thinking call-0083:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  actual division using a 64-bit intermediate.
+
+Let me check if there's an issue with how FixedDiv computes. If FixedDiv returns wrong results, it could lead to wrong size calculations.
+
+Actually, looking at it more carefully, R_InitLightTables doesn't allocate anything. It just fills lookup tables. The allocation must come from somewhere else.
+
+Let me look at R_InitBuffer:
+```c
+static void R_InitBuffer(int width, int height)
+{
+    // Nothing to allocate
+}
+```
+
+OK, maybe the allocation is from R_ExecuteSetViewSize? Let me check:
+```c
+void R_ExecuteSetViewSize (void)
+{
+    ...
+    Z_Free(screens[0]); 
+[tr-thinking call-0083:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  // or similar
+    ...
+}
+```
+
+Actually, I think I need to look at what exactly is being allocated with Z_Malloc. The 420303204 value is suspicious.
+
+420303204 in hex = 0x190C0864. Let me see... 
+
+Hmm, what if the issue is with the `sltiu` instruction? If `sltiu` is wrong, comparisons could produce wrong results, causing wrong control flow and wrong allocation sizes.
+
+Let me check `sltiu` more carefully:
+```javascript
+case 11:R[rt]=R[rs]<(si>>>0)?1:0;break;
+```
+
+The
+[tr-thinking call-0083:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  `sltiu` instruction:
+1. Sign-extends the 16-bit immediate to 32 bits
+2. Compares as unsigned
+
+In my code, `si` is already sign-extended (it's `(I<<16)>>16`). Then `si>>>0` converts to unsigned. And `R[rs]` is from Uint32Array, so already unsigned.
+
+But wait - in JavaScript, `R[rs]<(si>>>0)` when R[rs] is from Uint32Array (a number between 0 and 4294967295) and si>>>0 is also between 0 and 4294967295. The `<` operator on
+[tr-thinking call-0083:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  two non-negative numbers should work correctly.
+
+Hmm, but there's a subtle issue. If si is negative (e.g., -1), then si>>>0 = 4294967295. And R[rs] = 0. Then `0 < 4294967295` is true, which is correct (any unsigned value < 0xFFFFFFFF is true). This seems right.
+
+Actually, let me reconsider. The `sltiu` instruction sign-extends the immediate, then does unsigned comparison. So if the immediate is -1 (0xFFFF), it becomes 0xFFFFFFFF when sign-extended, and then unsigned comparison is
+[tr-thinking call-0083:worker:xiaomi/mimo-v2.5-pro-ultraspeed] : R[rs] < 0xFFFFFFFF, which is true for all R[rs] except 0xFFFFFFFF. This is correct.
+
+OK, I'm going in circles. Let me just add some tracing to figure out what's happening. Specifically, let me trace the Z_Malloc call.
+
+Actually, I think the best approach is to look at R_Init source code more carefully and find what Z_Malloc is being called with.
+
+Looking at the doomgeneric source:
+
+```c
+void R_Init (void)
+{
+    R_InitData ();
+    printf (".");
+    R_InitPointToAngle ();
+    printf (".");
+    R_InitTables
+[tr-thinking call-0083:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  ();
+    printf (".");
+    // R_InitTranslationTables ();
+    printf ("R_Init: Init DOOM refresh daemon -");
+    R_InitLightTables ();
+    printf (".");
+    R_InitPlanes ();
+    printf (".");
+    R_InitSkyMap ();
+    printf (".");
+    R_InitBuffer (scaledviewwidth, viewheight);        
+}
+```
+
+The "." after "R_Init: Init DOOM refresh daemon -" should come from R_InitLightTables. But in the output, there's no "." - instead, the Z_Malloc error happens immediately. So the error is in R_InitLightTables or R_InitPlanes.
+
+R_InitPlanes doesn't exist in
+[tr-thinking call-0083:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  the file list, so let me look for it. It might be in r_draw.c or similar.
+
+Actually, R_InitPlanes is in r_draw.c. Let me look:
+```c
+void R_InitPlanes(void)
+{
+    // Nothing allocated here in the standard doomgeneric code
+}
+```
+
+Hmm, but the doomgeneric_img.c version might be different. The binary might have custom code.
+
+Let me look at the source around the R_InitPlanes function.
+
+Actually, let me just look at the R_Init flow. After R_Init, what happens? Let me look at the actual execution:
+
+1. I_Init - sets up machine state
+
+[tr-thinking call-0083:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 2. M_Init - init misc info
+3. R_Init - init DOOM refresh daemon
+
+Within R_Init:
+1. R_InitData
+2. R_InitPointToAngle
+3. R_InitTables
+4. R_InitLightTables
+5. R_InitPlanes
+6. R_InitSkyMap
+7. R_InitBuffer
+
+The output shows:
+```
+I_Init: Setting up machine state.
+M_Init: Init miscellaneous info.
+R_Init: Init DOOM refresh daemon - Z_Malloc: failed on allocation of %i bytes
+```
+
+Note that NO dots appear between "R_Init: Init DOOM refresh daemon -" and the error. In the code
+[tr-thinking call-0083:worker:xiaomi/mimo-v2.5-pro-ultraspeed] , R_InitLightTables is called first, and it should print a "." after it completes. The fact that no dots appear means R_InitLightTables itself calls Z_Malloc and fails.
+
+Let me check R_InitLightTables source:
+```c
+void R_InitLightTables (void)
+{
+    int		i;
+    int		j;
+    int		level;
+    int		startmap; 	
+    int		scale;
+    
+    // Calculate the light list to use
+    //  for each lightlevel.
+    //  ...
+    ldist = 0;
+    for (i=0 ; i< LIGHTLEVELS ; i++)
+    {
+	startmap = ((LIGHTLEVELS-1-i)*2)*NUMCOLORMAPS/LIGHTLEVELS;
+	for (j=0 ; j<MAXLIGHTZ ; j++)
+	{
+	   
+[tr-thinking call-0083:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  scale = FixedDiv ((SCREENWIDTH/2*FRACUNIT), (j+1)<<LIGHTZSHIFT);
+	    scale >>= LIGHTSCALESHIFT;
+	    ...
+	}
+    }
+}
+```
+
+This doesn't call Z_Malloc. So the allocation must come from somewhere else in the call chain.
+
+Actually, wait. Let me re-read the doomgeneric source. It says "R_Init: Init DOOM refresh daemon -" is printed at the START of R_Init, not at the end. And then R_InitLightTables is called. But in the output, the error happens right after that string is printed, suggesting R_InitLightTables itself
+[tr-thinking call-0083:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  fails with Z_Malloc.
+
+But R_InitLightTables in the source code doesn't call Z_Malloc! Unless the binary is different from the source code I'm looking at.
+
+Actually, the source might have been modified for this particular build. Let me check if there are any differences. The doomgeneric_img.c file is the platform-specific file. Maybe the doomgeneric_img.c includes custom R_Init modifications.
+
+Hmm, but I checked earlier and doomgeneric_img.c only contains DG_Init, DG_DrawFrame, DG_GetKey, etc. It doesn't modify R_Init.
+
+Let me look for R_InitLightTables in the binary:
+
+The function R_InitLightTables is at... let me check
+[tr-thinking call-0083:worker:xiaomi/mimo-v2.5-pro-ultraspeed] :
+Actually, it might be inlined or called from somewhere else. Let me search for the R_InitLightTables call.
+
+You know what, I think the real problem might be with FixedDiv. If FixedDiv returns wrong values, it could cascade into wrong sizes.
+
+FixedDiv in standard DOOM:
+```c
+fixed_t FixedDiv(fixed_t a, fixed_t b)
+{
+    if ( (abs(a)>>14) >= abs(b))
+        return (a^b)<0 ? MININT : MAXINT;
+    return FixedDiv2(a,b);
+}
+```
+
+FixedDiv2 in assembly:
+```asm
+; 
+[tr-thinking call-0083:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 32-bit x86 assembly
+; eax = a, edx = b
+; returns eax = (a << 16) / b
+```
+
+In C:
+```c
+fixed_t FixedDiv2(fixed_t a, fixed_t b)
+{
+    long long c = ((long long)a<<16) / (long long)b;
+    return (fixed_t)c;
+}
+```
+
+Let me check what FixedDiv does in the MIPS binary. Actually, I should disassemble it.
+
+This is getting very deep. Let me take a different approach. Instead of tracing the exact bug, let me check if the Z_Malloc issue is actually fatal or if the program continues. The output shows it continues for
+[tr-thinking call-0083:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  ~980M more instructions. Let me let it run for much longer and see if it produces a frame.
+
+Actually, looking at the progress:
+- After ~2M insns, it reaches "I_Init: Setting up machine state."
+- After ~2M insns, it reaches "M_Init"
+- After ~2M insns, it reaches "R_Init"
+- Then it hits the Z_Malloc error and prints the error
+- Then it continues running for ~980M insns without printing anything new
+
+The program doesn't exit after the error, which means I_Error either doesn't call exit or exit doesn't work. But in either case, the program is
+[tr-thinking call-0083:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  stuck in some loop.
+
+Let me check if there's an infinite loop after the error. The 980M insns suggest it's doing something.
+
+Actually, wait - maybe I_Error DOES exit, but the exit code is -1 which becomes 0xFFFFFFFF, and that gets stored as EX. But what if the doSys function returns and then the code after the syscall (in the exit function) loops infinitely? In MIPS, exit() after syscall just loops:
+
+```
+43dab4: j 43dab4  // infinite loop
+```
+
+And my VM would execute this forever because the while loop only checks EX at the top. But wait,
+[tr-thinking call-0083:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  after the syscall, we're back in the main loop. The syscall instruction returns, then the next instruction in the main loop continues. The exit function's j 43dab4 would be executed... but it sets bd = 43dab4, and then the delay slot executes, and then pc = 43dab4, and then j 43dab4 again, and so on forever.
+
+But the while loop checks EX at the top! So:
+1. syscall 60: EX = 0xFFFFFFFF
+2. Main loop end: R[0]=0
+3. while(EX===null) - EX is 0xFFFFFFFF, not null -
+[tr-thinking call-0083:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  EXIT
+
+This should work! Unless there's a bug where the syscall handler doesn't properly return.
+
+Wait, I just realized - the syscall handler for exit is `case 60:EX=a0;return;`. This returns from doSys. Then in the main loop, the `case 12:doSys(cpc);break;` breaks out of the switch. Then `if(tb>=0)pc=tb>>>0;R[0]=0;`. Then back to the top of the while loop, which checks EX.
+
+But what if the syscall at 0x43da98 has a delay slot? Actually, syscall doesn
+[tr-thinking call-0083:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 't have a delay slot. It's an immediate instruction. So after the syscall, execution continues at 0x43da9c.
+
+Hmm, but in my VM, the syscall is handled by `case 12:doSys(cpc);break;`. After doSys returns (which sets EX), we break from the switch, execute `if(tb>=0)pc=tb>>>0;R[0]=0;`, and loop back.
+
+But pc was already set to cpc+4 at the top of the iteration. So after the syscall, pc = 0x43da9c (the instruction
+[tr-thinking call-0083:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  after syscall in the exit function). Then the while loop checks EX... which is not null. So it should exit.
+
+OK so the exit should work. But the output shows the program running for ~980M more instructions. So either:
+1. exit is not being called (I_Error doesn't call exit)
+2. The error doesn't come from I_Error
+3. Something else
+
+Let me try adding an exit check more aggressively and see what happens. But actually, let me just try running for much longer. If DOOM can boot past the error, it should eventually render frames.
+
+Actually, I think I should focus on FIXING the Z_Malloc error rather than working around it. The Z_Malloc is
+[tr-thinking call-0083:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  getting a bad size, which means some computation earlier is wrong. 
+
+Let me look at this from the perspective of R_Init. The code says `R_InitLightTables(); printf(".");` but no "." appears before the error. So R_InitLightTables fails.
+
+But R_InitLightTables in the source doesn't call Z_Malloc. Unless... the source code I have doesn't match the binary. The binary might have different R_InitLightTables.
+
+Actually, wait - I'm looking at the doomgeneric source in /app/doomgeneric/doomgeneric/. But the binary was compiled from these sources (presumably). Let me check if R_InitLightTables allocates anything.
+
+Looking at r_main
+[tr-thinking call-0083:worker:xiaomi/mimo-v2.5-pro-ultraspeed] .c around line 611:
+```c
+void R_InitLightTables (void)
+{
+    int		i;
+    int		j;
+    int		level;
+    int		startmap; 	
+    int		scale;
+    
+    for (i=0 ; i< LIGHTLEVELS ; i++)
+    {
+	startmap = ((LIGHTLEVELS-1-i)*2)*NUMCOLORMAPS/LIGHTLEVELS;
+	for (j=0 ; j<MAXLIGHTZ ; j++)
+	{
+	    scale = FixedDiv ((SCREENWIDTH/2*FRACUNIT), (j+1)<<LIGHTZSHIFT);
+	    scale >>= LIGHTSCALESHIFT;
+	    level = startmap
+[tr-thinking call-0083:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  - scale/DISTMAP;
+	    if (level < 0)
+		level = 0;
+	    if (level >= NUMCOLORMAPS)
+		level = NUMCOLORMAPS-1;
+	    zlight[i][j] = colormaps + level*256;
+	}
+    }
+}
+```
+
+No Z_Malloc here. The error must come from somewhere else.
+
+Wait, but the Z_Malloc error says "failed on allocation of %i bytes" with %i literally. If the printf function doesn't handle %i, then the custom printf in Z_Malloc would not format the string correctly. Let me check what printf format Z
+[tr-thinking call-0083:worker:xiaomi/mimo-v2.5-pro-ultraspeed] _Malloc uses.
+
+In z_zone.c:
+```c
+void Z_Malloc(int size, memtag_t tag, void **user)
+{
+    ...
+    if (!mem)
+        I_Error("Z_Malloc: failed on allocation of %i bytes", size);
+}
+```
+
+Hmm wait, looking at the source more carefully, in some versions of DOOM:
+```c
+#define Z_Malloc(s,t,p) ((p)=Z_Malloc2((s),(t)))
+```
+
+And Z_Malloc2:
+```c
+void *Z_Malloc2(int size, memtag_t tag)
+{
+    ...
+    mem = (memblock_t *)zonebase
+[tr-thinking call-0083:worker:xiaomi/mimo-v2.5-pro-ultraspeed] ;
+    ...
+    while (mem)
+    {
+        if (!mem->user && mem->size >= size)
+        {
+            // Found a free block
+            ...
+        }
+        mem = mem->next;
+    }
+    I_Error("Z_Malloc: failed on allocation of %i bytes", size);
+    return NULL;
+}
+```
+
+So Z_Malloc2 calls I_Error when no free block is found. The size passed is the requested size.
+
+But wait - in the output, the first line "Z_Malloc: failed on allocation of %i bytes" has %i literally. This means the custom printf's v
+[tr-thinking call-0083:worker:xiaomi/mimo-v2.5-pro-ultraspeed] fprintf doesn't support %i. But the second line "Z_Malloc: failed on allocation of 420303204 bytes" does have the value substituted.
+
+Actually, I think what's happening is:
+1. Z_Malloc fails and calls I_Error
+2. I_Error calls fprintf(stderr, "\nERROR: "); 
+3. I_Error calls vfprintf(stderr, "Z_Malloc: failed on allocation of %i bytes", size)
+4. vfprintf doesn't handle %i, prints literally
+
+But the output doesn't show "ERROR:" or "\n". So maybe the output is:
+```
+R_Init: Init DOOM refresh daemon - 
+ERROR
+[tr-thinking call-0083:worker:xiaomi/mimo-v2.5-pro-ultraspeed] : Z_Malloc: failed on allocation of %i bytes
+Z_Malloc: failed on allocation of 420303204 bytes
+```
+
+But stdout and stderr might be mixed differently. The "R_Init: Init DOOM refresh daemon -" goes to stdout, and "ERROR: ..." goes to stderr. Since I'm redirecting both to the same file with `2>&1`, they might be interleaved differently.
+
+Actually, in my doSys, writes to fd 1 (stdout) go through the stdio path, but writes to fd 2 (stderr) also go through the stdio path. Both should work.
+[tr-thinking call-0083:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  But maybe there's a buffering issue.
+
+OK, let me take a completely different approach. Let me check if the FixedDiv function in the binary produces correct results. Let me disassemble it.
+
+Actually, I realize the REAL question is: what computation produces 420303204? Let me figure this out.
+
+Let me check if 420303204 relates to any standard DOOM computation.
+
+SCREENWIDTH = 640, SCREENHEIGHT = 400, FRACUNIT = 65536.
+
+Hmm, 640 * 400 = 256000.
+640 * 400 * 4 = 1024000 (pixel
+[tr-thinking call-0083:worker:xiaomi/mimo-v2.5-pro-ultraspeed] _t size for screen buffer)
+640 * 400 * 256 = 65536000 (unlikely)
+
+420303204 / 640 = 656723.75625 - not integer
+420303204 / 65536 = 6413.3 - not integer
+420303204 / 256 = 1641809.39 - not integer
+
+Hmm. Let me look at it in hex: 420303204
+[tr-thinking call-0083:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  = 0x190C0864
+If I break this down: 0x190C and 0x0864
+0x190C = 6412
+0x0864 = 2148
+
+That doesn't help.
+
+Wait, what if the issue is that the program calls Z_Malloc with a size computed from FixedDiv, and FixedDiv is wrong? 
+
+FixedDiv(a, b) = (a << 16) / b approximately.
+
+If a = SCREENWIDTH/2 * FRACUNIT = 320 * 65536 = 20971520
+And b = (j+1) << LIGHTZSHIFT = (j+1) << 2
+[tr-thinking call-0083:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 0
+
+For j=0: b = 1048576
+FixedDiv = (20971520 << 16) / 1048576 = (20971520 * 65536) / 1048576 = 1374389534720 / 1048576 = 1310720
+
+That's a reasonable value. This wouldn't cause a huge allocation.
+
+I think the real issue might be that the program runs fine up to a
+[tr-thinking call-0083:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  point, and then some instruction produces a wrong result that cascades. Let me try a different approach - let me trace the execution around the failing point.
+
+Actually, I realize I've been spending too long debugging this. Let me just add a syscall trace around the failing Z_Malloc call and see what's happening. The key is to find what syscall (likely brk) is being called with what value, and what the malloc implementation is doing.
+
+Actually, let me try something simpler. Let me increase the initial heap end. Maybe the buddy allocator's initial state doesn't match what the program expects.
+
+Looking at basic_malloc, the buddy allocator uses a memory pool at 
+[tr-thinking call-0083:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 0x4b0b40. The pool size is at 0x4b0b14 (2836 = 0x0B14 from 0x4b0000). The initial heap end from my code is 0x404b2000, which is where _end is at 0x404b1790 + some alignment.
+
+Wait, _end = 0x404b1790. So the BSS section ends at 0x404b1790. The buddy allocator pool starts at 0x4b0b40 in virtual address space.
+[tr-thinking call-0083:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  Let me check... 0x4b0b40 is in the BSS section (which is at 0x4750c0 with size 0x4003c6d0). So the buddy pool is at 0x4b0b40.
+
+But the heap end (brk) should be after all of BSS, including the buddy pool area. The buddy pool starts at 0x4b0b40, and its size is stored at 0x4b0b14.
+
+Actually, looking at basic_malloc:
+```
+439b30:       lui     v0,0x4b
+439b34:       addiu   v
+[tr-thinking call-0083:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 1,v0,2708   ; v1 = 0x4b0a94 (free list array)
+```
+
+And:
+```
+439c34:       lui     a1,0x4b
+439c38:       lui     at,0x4000
+439c3c:       lw      a0,2836(a1)  ; a0 = *(0x4b0b14) = pool size
+439c40:       addu    a2,a0,v1     ; a2 = pool_size
+[tr-thinking call-0083:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  + new allocation
+439c44:       sltu    at,at,a2     ; if (result > 0x40000000)
+439c48:       bnez    at,439c68    ;   return NULL (overflow)
+439c50:       lui     at,0x4b
+439c54:       sw      a2,2836(a1)  ; update pool size
+439c58:       addiu   at,at,2880   ; at = 0x4b0b40 (pool start)
+439c5c:       addu    at,at,a0     ; at +=
+[tr-thinking call-0083:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  old pool size
+439c60:       addiu   v0,at,8      ; return at + 8 (with header at at)
+439c64:       sw      v1,0(at)     ; store size in header
+```
+
+So the buddy allocator pool starts at 0x4b0b40 and grows upward. The current size is at 0x4b0b14. The maximum allowed size is 0x40000000 (1GB). The pool is in BSS.
+
+My heapEnd = 0x404b2000. This
+[tr-thinking call-0083:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  means the system's brk is at 0x404b2000. But the buddy pool goes up to 0x4b0b40 + pool_size. If pool_size is large, it could extend beyond 0x404b2000.
+
+Wait, but 0x4b0b40 is BELOW 0x404b2000 in address. So the buddy pool at 0x4b0b40 is within the BSS section, which starts at 0x4750c0. And 0x4b0b40 is
+[tr-thinking call-0083:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  at offset 0x3BA80 from the start of BSS. The BSS is 0x4003c6d0 bytes, so it extends from 0x4750c0 to 0x4750c0 + 0x4003c6d0 = 0x404B1790. Wait, that doesn't add up.
+
+Let me recalculate: 0x4750c0 + 0x4003c6d0 = 0x4478C790. That seems too large. Actually:
+
+
+[tr-thinking call-0083:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 0x4750c0 + 0x4003c6d0:
+0x004750c0
++ 0x4003c6d0
+= 0x404B1790
+
+Yes, that equals _end = 0x404B1790. So the BSS section extends from 0x4750c0 to 0x404B1790.
+
+But the buddy pool at 0x4b0b40 is within BSS (0x4750c0 < 0x4b0b40 < 0x404B1790). The pool grows from 
+[tr-thinking call-0083:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 0x4b0b40 upward, and its max allowed size is 0x40000000, which means it could extend to 0x4b0b40 + 0x40000000 = 0x404b0b40. This is just below _end (0x404B1790), so it fits within BSS.
+
+The brk syscall would be called when malloc needs more memory beyond what's available. My initial heapEnd is 0x404b2000. When brk is called with a0 > heapEnd, I expand it.
+[tr-thinking call-0083:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  Since the buddy allocator doesn't use brk (it uses its own pool), the brk calls would come from the standard malloc/balloc.
+
+Wait, looking at the malloc code more carefully. The malloc function first tries the buddy allocator (size classes). If that fails, it calls basic_malloc which uses the pool at 0x4b0b40. The pool grows by calling the code at 0x439c34 which simply increases the pool size and returns a pointer. No brk call.
+
+But where does the initial pool come from? The BSS is zero-initialized, so the pool starts as all
+[tr-thinking call-0083:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  zeros. The pool size at 0x4b0b14 starts as 0. When basic_malloc is first called, it allocates from the pool starting at 0x4b0b40.
+
+So actually, malloc in this binary doesn't use brk at all! The brk syscall would only be called if the pool overflows, which it shouldn't for normal DOOM operation.
+
+So where does the Z_Malloc allocation size of 420303204 come from? Z_Malloc gets its memory from malloc. If Z_Malloc requests 420303204 bytes from malloc
+[tr-thinking call-0083:worker:xiaomi/mimo-v2.5-pro-ultraspeed] , malloc will try to allocate from the pool, which will fail (pool is only 600000 bytes for zone memory).
+
+But wait - Z_Malloc allocates from the zone, not from malloc. Z_Malloc2 allocates from the zone which was created by I_ZoneBase. The zone is 600000 bytes. Z_Malloc2 searches for a free block in the zone. If no block is found, it calls I_Error.
+
+So the question is: why is Z_Malloc being asked for 420303204 bytes? This value is clearly wrong. It should be something like SCREENWIDTH
+[tr-thinking call-0083:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  * SCREENHEIGHT = 256000 or similar.
+
+Let me check what R_InitLightTables actually does in this binary. Let me disassemble it.
+
+Actually wait - I said R_InitLightTables doesn't allocate memory. But the output shows the error happens during R_Init. Maybe it's not R_InitLightTables but something called just before it. Let me look at the code flow more carefully.
+
+The output says:
+```
+R_Init: Init DOOM refresh daemon - Z_Malloc: failed on allocation of %i bytes
+```
+
+In the source:
+```c
+printf ("R_Init: Init DOOM refresh daemon -");
+R_InitLightTables ();
+printf (".");
+```
+
+So "R_Init: Init DOOM refresh daemon -" is printed, then R_InitLightTables is
+[tr-thinking call-0083:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  called. The Z_Malloc error happens inside R_InitLightTables or inside a function it calls.
+
+Wait, maybe R_InitLightTables in this binary is different from the source. The binary might have been compiled with optimizations that inline things or reorder function calls.
+
+Actually, let me think about this differently. Let me check what's at the address where the error originates. The last progress line was "pc=0x439f30" when the error happened. Let me check what function that's in.
+
+0x439f30 is... let me check. strlen is at 0x439f20.
+[tr-thinking call-0083:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  So 0x439f30 is in strlen? Or after it.
+
+Actually, the progress counter fires every 1M instructions. So pc=0x439f30 just means the last progress update showed the PC at that address. The actual error could have happened at any PC.
+
+Let me try a different approach. Let me add a trace of the printf/Z_Malloc call and see what's happening.
+
+OK, I've spent way too long on this. Let me just add some simple tracing and rerun. Specifically, let me trace syscall numbers to see if exit is being called.
+
+Actually, I think the REAL
+[tr-thinking call-0083:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  issue is much simpler. Let me check: when the binary calls `printf("R_Init: Init DOOM refresh daemon -");`, the output goes to stdout (fd=1). Then R_InitLightTables calls... wait.
+
+Let me look at this from the binary perspective. Let me disassemble R_Init:
+- R_Init is at 0x42a900
+[tr-stream call-0083:worker:xiaomi/mimo-v2.5-pro-ultraspeed] I need to take a completely different approach. The interpreter is too slow at ~8M insns/sec. DOOM needs hundreds of millions of instructions. Let me use Node.js `new Function` to JIT compile MIPS blocks into JavaScript for 100x speed improvement.
+
+{
+  "analysis": "The interpreter runs
+[tr-stream call-0083:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  at ~8M insns/sec but DOOM needs ~500M+ insns. Even at 500s that's not enough. I need a block-based JIT compiler. Let me write a JIT that translates basic blocks of MIPS into JavaScript functions that V8 can optimize. This should give 100-1000x speedup.",
+  "plan": "Rewrite vm.js with a JIT compiler that translates MIPS basic blocks to JavaScript. Each block becomes a Function that V8's JIT can optimize aggressively.",
+  "commands": [
+    {
+      "keystrokes": "head -1 vm
+[tr-stream call-0083:worker:xiaomi/mimo-v2.5-pro-ultraspeed] .js > /dev/null && wc -l vm.js\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "node -e \"const R=new Uint32Array(32);R[1]=100;R[2]=200;R[3]=(R[1]+R[2])>>>0;console.log(R[3])\"\n",
+      "duration": 0.1
+    }
+  ]
+}
+
+[tr-stream call-0083:worker:xiaomi/mimo-v2.5-pro-ultraspeed] worker.done finish=stop cost_microdollars=245616
+[tr-stream call-0083:xiaomi/mimo-v2.5-pro-ultraspeed] I need to take a completely different approach. The interpreter is too slow at ~8M insns/sec. DOOM needs hundreds of millions of instructions. Let me use Node.js `new Function` to JIT compile MIPS blocks into JavaScript for 100x speed improvement.
+
+{
+  "analysis": "The interpreter runs at ~8M insns/sec but DOOM needs ~500M+ insns. Even at 500s that's not enough. I need a block-based JIT compiler. Let me write a JIT that translates basic blocks of MIPS into JavaScript functions that V8 can optimize. This should give 100-1000x speedup.",
+  "plan": "Rewrite vm.js with a JIT compiler that translates MIPS basic blocks to JavaScript. Each block becomes a Function that V8's JIT can optimize aggressively.",
+  "commands": [
+    {
+      "keystrokes": "head -1 vm.js > /dev/null && wc -l vm.js\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "node -e \"const R=new Uint32Array(32);R[1]=100;R[2]=200;R[3]=(R[1]+R[2])>>>0;console.log(R[3])\"\n",
+      "duration": 0.1
+    }
+  ]
+}

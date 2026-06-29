@@ -1,0 +1,129 @@
+
+[tr-stream call-0030:socrates:trustedrouter/socrates-pro-plus-1.0] socrates.started
+
+[tr-stream call-0030:worker:xiaomi/mimo-v2.5-pro-ultraspeed] worker.started
+[tr-thinking call-0030:worker:xiaomi/mimo-v2.5-pro-ultraspeed] Good. The bug is at line 650: `p += Whsize_hd(hd)`. This is the advancement at the end of the loop body in pool_sweep. Let me verify my analysis more carefully.
+
+In the sweep loop:
+- Each block in the pool occupies `wh = wsize_sizeclass[sz]` words.
+- For a **live block**: the header `hd` has `Wosize_hd(hd) = wosize` (the object size). `Whsize_hd(hd) = wosize + 1`. The block occupies `wh` words. So `p += Whsize_hd(hd)` advances by `wosize + 
+[tr-thinking call-0030:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 1` instead of `wh`. This is wrong if `wosize + 1 != wh` (which is almost always the case due to fragmentation within a size class).
+
+Wait, but this is an existing piece of code that was supposedly working before. The user said they added run-length compression. Let me re-read the code more carefully.
+
+Actually, wait. Let me look at the code flow more carefully:
+
+For a **free block** (POOL_BLOCK_FREE_HD(hd)):
+1. `p += wh * Wosize_hd(hd)` - skips over `Wosize_hd(hd)` additional blocks
+2. Then `p += Whsize_hd(hd)` - this advances by `Wosize_hd(hd)
+[tr-thinking call-0030:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  + 1`
+3. Total advance: `wh * Wosize_hd(hd) + Wosize_hd(hd) + 1 = Wosize_hd(hd) * (wh + 1) + 1`
+
+For a **free block with wosize=0** (a single free block):
+1. `p += 0` (no skip)
+2. `p += 1` (advance by 1)
+3. Total: 1
+
+That's definitely wrong. Each block in the pool is `wh` words. So the total should be `(Wosize_hd(hd) + 
+[tr-thinking call-0030:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 1) * wh`.
+
+For a **live block**:
+1. No skip (the `p += wh * Wosize_hd(hd)` line is only in the free block branch)
+2. `p += Whsize_hd(hd)` = `p += Wosize_hd(hd) + 1`
+3. Total: `Wosize_hd(hd) + 1`
+
+That's also wrong if `Wosize_hd(hd) + 1 != wh`, which is the case when there's padding.
+
+Wait, but if the compiler was working before the user made changes, then this line must have been different before. The user said they added
+[tr-thinking call-0030:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  run-length compression to the free list sweeping. The current code has:
+
+```c
+/* add the free blocks following this block, skipping over them */
+p += wh * Wosize_hd(hd);
+```
+
+This is the run-length part - it skips `Wosize_hd(hd)` additional blocks.
+
+And then:
+```c
+p += Whsize_hd(hd);
+```
+
+This is supposed to advance past the current block. For the original (pre-run-length) code, this would have just been `p += wh` - advance by one block size.
+
+So the fix should be to change `p += Whsize_hd(hd)` to `p += wh`.
+
+Wait, actually I should
+[tr-thinking call-0030:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  think about this more carefully. In the original code without run-length encoding, the wosize in a free block header would have been 0 (since a free block is like an object of size 0), and `Whsize_hd(hd)` = 0 + 1 = 1. And each block in the pool is `wh` words. So even in the original code `p += 1` would be wrong... unless the original code was `p += wh` and the user changed it to `p += Whsize_hd(hd)` thinking it would work with the run-length encoding.
+
+Actually, I think the original code must have been `p += wh` for advancing to the next block,
+[tr-thinking call-0030:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  and the user changed it to `p += Whsize_hd(hd)` as part of the run-length compression work. The correct fix is to change it back to `p += wh`.
+
+Let me verify: if we use `p += wh`:
+
+For a **free block with wosize N** (representing N+1 contiguous free blocks):
+1. `p += wh * N` - skip N additional blocks
+2. `p += wh` - advance past the current block
+3. Total: `wh * (N + 1)` = correct, that's N+1 blocks of size wh each
+
+For a **live block**:
+1
+[tr-thinking call-0030:worker:xiaomi/mimo-v2.5-pro-ultraspeed] . No skip
+2. `p += wh` - advance past the current block
+3. Total: `wh` = correct, that's 1 block of size wh
+
+Yes, `p += wh` is correct. Let me make the fix.
+[tr-stream call-0030:worker:xiaomi/mimo-v2.5-pro-ultraspeed] Now I understand the bug. At line 650, `p += Whsize_hd(hd)` is wrong. It should be `p += wh`. In the pool, every slot occupies `wh = wsize_sizeclass[sz]` words. `Whsize_hd(hd)` returns `wosize + 1` which is the header+data size of the *
+[tr-stream call-0030:worker:xiaomi/mimo-v2.5-pro-ultraspeed] object*, not the slot size. This causes the sweep to misalign when walking through blocks.
+
+Let me apply the fix:
+
+```json
+{
+  "analysis": "The bug is at line 650 of runtime/shared_heap.c. The line `p += Whsize_hd(hd)` should be `p += wh`. In the pool, each slot is `wh = wsize_sizeclass[sz]` words, not `wosize+1` words. The wosize in the header reflects the original object size, not the padded slot size. This misalignment causes the sweep to read garbage headers and corrupt memory, leading to the
+[tr-stream call-0030:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  segfault during bootstrap.",
+  "plan": "Fix the bug, clean the build, and rebuild. Then run the basic testsuite.",
+  "commands": [
+    {
+      "keystrokes": "sed -i 's/^      p += Whsize_hd(hd);$/      p += wh;/' runtime/shared_heap.c\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "grep -n 'p += wh;' runtime/shared_heap.c | head -5\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "awk 'NR>=645 && NR<=655' runtime/shared_heap.c\n",
+      "duration": 0.1
+    }
+  ],
+  "task_complete": false
+}
+```
+
+[tr-stream call-0030:worker:xiaomi/mimo-v2.5-pro-ultraspeed] worker.done finish=stop cost_microdollars=36102
+[tr-stream call-0030:xiaomi/mimo-v2.5-pro-ultraspeed] Now I understand the bug. At line 650, `p += Whsize_hd(hd)` is wrong. It should be `p += wh`. In the pool, every slot occupies `wh = wsize_sizeclass[sz]` words. `Whsize_hd(hd)` returns `wosize + 1` which is the header+data size of the *object*, not the slot size. This causes the sweep to misalign when walking through blocks.
+
+Let me apply the fix:
+
+```json
+{
+  "analysis": "The bug is at line 650 of runtime/shared_heap.c. The line `p += Whsize_hd(hd)` should be `p += wh`. In the pool, each slot is `wh = wsize_sizeclass[sz]` words, not `wosize+1` words. The wosize in the header reflects the original object size, not the padded slot size. This misalignment causes the sweep to read garbage headers and corrupt memory, leading to the segfault during bootstrap.",
+  "plan": "Fix the bug, clean the build, and rebuild. Then run the basic testsuite.",
+  "commands": [
+    {
+      "keystrokes": "sed -i 's/^      p += Whsize_hd(hd);$/      p += wh;/' runtime/shared_heap.c\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "grep -n 'p += wh;' runtime/shared_heap.c | head -5\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "awk 'NR>=645 && NR<=655' runtime/shared_heap.c\n",
+      "duration": 0.1
+    }
+  ],
+  "task_complete": false
+}
+```

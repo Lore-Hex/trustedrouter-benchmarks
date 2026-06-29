@@ -1,0 +1,155 @@
+
+[tr-stream call-0050:socrates:trustedrouter/socrates-pro-plus-1.0] socrates.started
+
+[tr-stream call-0050:worker:xiaomi/mimo-v2.5-pro-ultraspeed] worker.started
+[tr-thinking call-0050:worker:xiaomi/mimo-v2.5-pro-ultraspeed] The key insight is at address 0x439c34-0x439c68. This is the fallback when no free block is found - it just bumps a pointer in a static buffer area. It doesn't call brk/sbrk! Instead:
+
+- 0x4b0b14 stores the current allocation offset (a pointer at `lui at,0x4b; addiu at,at,2836` = 0x4b0b14)
+- 0x4b0b40 is the start of the allocation area (lui at,0x4b; addiu at,at,2880 = 0x4b0b40)
+- It adds the
+[tr-thinking call-0050:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  requested size to the current offset, checks it doesn't exceed 0x40000000 (1GB limit at line 439c44: sltu at,at,a2 where at was set to 0x4000 << 16 = 0x40000000)
+- Then bumps the pointer and returns the new block
+
+So the heap is actually a static buffer at 0x4b0b40! Not using brk at all!
+
+Let me check what address 0x4b0b14 and 0x4b0b4
+[tr-thinking call-0050:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 0 map to. Those are in BSS (0x4750c0 to 0x4478d930).
+
+0x4b0b14 is in BSS. And 0x4b0b40 is also in BSS.
+
+So the malloc allocator uses a static area starting at 0x4b0b40 in BSS as its heap. The current size pointer is at 0x4b0b14.
+
+The problem is that the heap starts at 0x4b0b40, and BSS is very large (0x4003
+[tr-thinking call-0050:worker:xiaomi/mimo-v2.5-pro-ultraspeed] c6d0 bytes). The heap region would extend from 0x4b0b40 for a large distance. The limit check is at 0x40000000 (sltu at,at,a2 where at=0x40000000), so the max total allocation is 0x40000000 bytes from the heap start.
+
+Wait, let me re-read the code more carefully:
+
+```
+439c34: 3c05004b  lui     a1,0x4b      # a1 = 0x4b0000
+439c38: 3c014000  lui     at,0x4000   
+[tr-thinking call-0050:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  # at = 0x40000000
+439c3c: 8ca40b14  lw      a0,2836(a1)  # a0 = *(0x4b0b14) = current_heap_size
+439c40: 00833021  addu    a2,a0,v1     # a2 = current_heap_size + requested_size
+439c44: 0026082b  sltu    at,at,a2     # at = (0
+[tr-thinking call-0050:worker:xiaomi/mimo-v2.5-pro-ultraspeed] x40000000 < a2) ? 1 : 0
+439c48: 14200007  bnez    at,439c68    # if overflow, return NULL
+439c4c: 24020000  li      v0,0
+439c50: 3c01004b  lui     at,0x4b
+439c54: aca60b14  sw      a2,2836(a1)  # store new heap_size
+439c58: 24210b
+[tr-thinking call-0050:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 40  addiu   at,at,2880   # at = 0x4b0b40 (heap base)
+439c5c: 00240821  addu    at,at,a0     # at = heap_base + old_size (the new block)
+439c60: 24220008  addiu   v0,at,8      # v0 = block + 8 (skip header)
+439c64: ac230000  sw      v1,0(at)     # store size in
+[tr-thinking call-0050:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  block header
+```
+
+So:
+- Heap base is at 0x4b0b40
+- Current heap size is stored at 0x4b0b14
+- Limit is 0x40000000 bytes (~1GB)
+- New block = heap_base + old_size
+- Return value = block + 8 (skip 8-byte header)
+
+The BSS goes from 0x4750c0 to 0x4750c0 + 0x4003c6d0 = 0x4478d930. And 0x4b0b40 is
+[tr-thinking call-0050:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  within BSS.
+
+The issue might be that memory at 0x4b0b40 onward isn't actually being zero-initialized correctly because the pages are being allocated on demand and reads return 0 for uninitialized pages, which should be fine.
+
+Wait, the actual problem is simpler. The `Z_Malloc: failed on allocation` message means the zone allocator ran out of its 600000 byte pool. This is a DOOM issue, not a VM issue.
+
+Let me look at the Z_Init function. The message said "zone memory: 0x5e6b50, 600000 allocated for zone". That's from
+[tr-thinking call-0050:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  I_Init or similar.
+
+Actually, wait - the earlier output showed: "zone memory: 0x5e6b50, 600000 allocated for zone" and then it failed at R_Init. 600000 might just not be enough for R_Init.
+
+Looking at the i_system.c:
+```
+size_t maxram = MAXIMUM_ZONE;  // likely some large value
+```
+
+Let me check what I_ZoneBase does. The code in i_system.c for the zone base would allocate memory. In the binary, this calls malloc to get the zone memory.
+
+Actually, the output says "600000 allocated for zone" - this is
+[tr-thinking call-0050:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  likely from `I_ZoneBase` in `i_system.c`. Let me look at what I_ZoneBase does.
+
+Let me look at the I_ZoneBase function more carefully in the source code. The default behavior uses mb_used to determine zone size, and the default is something like 6MB. But here it says only 600000 (600KB), which seems way too small.
+
+Actually, looking at the DOOM source, the zone size is determined by I_ZoneBase which typically allocates about 10MB. Let me check what the binary does. The output says "600000 allocated for zone" which is only 
+[tr-thinking call-0050:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 600KB - that's tiny and probably not enough.
+
+Wait - looking more carefully at the DOOM code, `I_ZoneBase` returns a pointer and a size. The size might come from something like `DEFAULT_RAM` or `MAXIMUM_ZONE`. Let me check.
+
+In the code at i_system.c, there would be something like:
+```
+mb_used = 6 * 1024 * 1024; // or similar
+```
+
+But 600000 is about 586KB. This seems wrong. Let me think about why...
+
+Actually, 600000 in the
+[tr-thinking call-0050:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  output could be from some format string. Let me look at the exact string output: "zone memory: 0x5e6b50, 600000 allocated for zone"
+
+The actual size displayed might be calculated differently. Let me check the i_system.c source code.
+
+Let me re-read the DOOM source to understand Z_Init better. The issue might just be that the zone is too small, and we need to look at what I_ZoneBase does.
+
+Actually, I think the real issue might be simpler. The "600000" might just be a default value from the compiled code. Looking at classic DOOM source, I
+[tr-thinking call-0050:worker:xiaomi/mimo-v2.5-pro-ultraspeed] _ZoneBase does:
+
+```c
+byte *zone;
+int zone_size = mb_used * 1024 * 1024; // default 21MB
+zone = malloc(zone_size);
+```
+
+If `mb_used` is not set or is set very low, the zone will be too small. But since the binary was compiled with the img backend, it might have a specific zone size.
+
+Let me just increase the available memory. The issue might also be that my malloc implementation is broken. Let me think about it differently - the malloc in the binary is using a buddy allocator with a static heap area. If the heap is working correctly, then Z_Malloc
+[tr-thinking call-0050:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  is actually working but just running out of zone space.
+
+Wait, but looking at the binary output: "zone memory: 0x5e6b50, 600000 allocated for zone" - this means I_ZoneBase returned 600000 bytes. But actually that might be calculated wrong because of some error in my interpreter.
+
+Let me look at what I_ZoneBase does in i_system.c more carefully. I need to read that source.
+
+Actually, I don't think I read i_system.c properly yet. Let me check it.
+[tr-stream call-0050:worker:xiaomi/mimo-v2.5-pro-ultraspeed] {
+  "analysis": "I found that the binary uses a static buddy allocator at
+[tr-stream call-0050:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  0x4b0b40 in BSS rather than brk. The zone size of 600000 bytes seems too small. Let me look at the I_ZoneBase function in i_system.c to understand why zone memory is so small.",
+  "plan": "Read i_system.c to find I_ZoneBase and understand zone allocation.",
+  "commands": [
+    {
+      "keystrokes": "grep -n 'I_ZoneBase\\|zone_size\\|MAXIMUM_ZONE\\|mb_used\\|DEFAULT_RAM\\|zonebase' /app/doomgeneric/doomgeneric/i_system.c\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "grep -n 'zone_size\\|I
+[tr-stream call-0050:worker:xiaomi/mimo-v2.5-pro-ultraspeed] _ZoneBase\\|zonebase\\|mb_used' /app/doomgeneric/doomgeneric/my_stdlib.c\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "readelf -s /app/doomgeneric_mips | grep -E 'I_ZoneBase|zonebase|mb_used|I_ZoneTag' | head -10\n",
+      "duration": 0.1
+    }
+  ]
+}
+
+[tr-stream call-0050:worker:xiaomi/mimo-v2.5-pro-ultraspeed] worker.done finish=stop cost_microdollars=97274
+[tr-stream call-0050:xiaomi/mimo-v2.5-pro-ultraspeed] {
+  "analysis": "I found that the binary uses a static buddy allocator at 0x4b0b40 in BSS rather than brk. The zone size of 600000 bytes seems too small. Let me look at the I_ZoneBase function in i_system.c to understand why zone memory is so small.",
+  "plan": "Read i_system.c to find I_ZoneBase and understand zone allocation.",
+  "commands": [
+    {
+      "keystrokes": "grep -n 'I_ZoneBase\\|zone_size\\|MAXIMUM_ZONE\\|mb_used\\|DEFAULT_RAM\\|zonebase' /app/doomgeneric/doomgeneric/i_system.c\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "grep -n 'zone_size\\|I_ZoneBase\\|zonebase\\|mb_used' /app/doomgeneric/doomgeneric/my_stdlib.c\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "readelf -s /app/doomgeneric_mips | grep -E 'I_ZoneBase|zonebase|mb_used|I_ZoneTag' | head -10\n",
+      "duration": 0.1
+    }
+  ]
+}

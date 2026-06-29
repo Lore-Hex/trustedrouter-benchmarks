@@ -1,0 +1,178 @@
+
+[tr-stream call-0031:socrates:trustedrouter/socrates-pro-plus-1.0] socrates.started
+
+[tr-stream call-0031:worker:xiaomi/mimo-v2.5-pro-ultraspeed] worker.started
+[tr-thinking call-0031:worker:xiaomi/mimo-v2.5-pro-ultraspeed] Wait, I need to reconsider this. Let me think more carefully about the pool_sweep function.
+
+In OCaml's shared heap, each pool has blocks of a fixed size class `wh = wsize_sizeclass[sz]`. When a block is freed, it gets a POOL_FREE_HEADER. The run-length compression means that a free block's `wosize` field encodes how many *additional* contiguous free blocks follow.
+
+Looking at the loop:
+1. `p` starts at POOL_FIRST_BLOCK
+2. It reads header `hd`
+3. If the block is garbage (GARBAGE color), it makes
+[tr-thinking call-0031:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  it a free block with POOL_FREE_HEADER(0)
+4. If the block is free (either original or newly freed):
+   - It tries to merge with last_free_block
+   - It advances: `p += wh * Wosize_hd(hd)` - this skips the N additional free blocks encoded in the run-length
+5. Then at end of loop: `p += Whsize_hd(hd)` - this is supposed to advance past the current block
+
+Wait, but for a POOL_FREE_HEADER(0), Wosize_hd would be 0. So `p += wh * 0 = 0`
+[tr-thinking call-0031:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  and `p += Whsize_hd(hd) = 0 + 1 = 1`. So p only advances by 1 word. That's clearly wrong - a block occupies `wh` words!
+
+Actually wait, let me reconsider. For a regular (non-compressed) free block, the old code would have been:
+- `p += Whsize_hd(hd)` where hd is the old free header (before run-length compression)
+
+In the old code without run-length compression, each free block had wosize = 0 (or some other encoding), and `Whsize_hd(hd) = wosize + 1 = 1`. But that can't be right either...
+
+Actually
+[tr-thinking call-0031:worker:xiaomi/mimo-v2.5-pro-ultraspeed] , I think I'm confusing myself. Let me look at this more carefully.
+
+In the ORIGINAL code (before the run-length compression change), what did free blocks look like? Let me think about what POOL_FREE_HEADER is.
+
+Looking at the code:
+```c
+*p = POOL_FREE_HEADER(0);
+```
+
+For a newly freed block. The original header `hd` has the object's wosize. When we set it to `POOL_FREE_HEADER(0)`, we're setting wosize to 0.
+
+Then the original loop would advance `p += Whsize_hd(hd)` where hd is the ORIGINAL header (the object's header), giving `wosize + 1` which
+[tr-thinking call-0031:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  is the correct step to get to the next block in the pool... 
+
+Wait no, that's NOT right either. In the pool, every block occupies exactly `wh` words (the size class width). So the correct step should be `p += wh` always, not `p += Whsize_hd(hd)` which is the object's actual width.
+
+Hmm, but then in the original (pre-run-length-compression) code, how did the loop work?
+
+Actually, I think I need to understand the pool layout better. Let me look at the macros:
+
+- `POOL_FIRST_BLOCK(a, sz)` - first block in
+[tr-thinking call-0031:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  pool
+- `POOL_END(a)` - end of pool
+- `wsize_sizeclass[sz]` = wh = width in words of one block slot
+
+So each slot is `wh` words. In the original code, `p += Whsize_hd(hd)` wouldn't work correctly for slots where the object is smaller than the slot. That means the original code must have used `p += wh`!
+
+So my fix is correct - changing `p += Whsize_hd(hd)` to `p += wh`. Let me verify by checking what was there in the original code pattern.
+
+Actually wait, let me re-examine the code.
+[tr-thinking call-0031:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  There are TWO advances in the free block case:
+1. `p += wh * Wosize_hd(hd)` - inside the free block case, to skip run-length compressed blocks
+2. `p += Whsize_hd(hd)` - at the end of the loop body, for all blocks
+
+For a newly freed block (GARBAGE -> free), the header is set to `POOL_FREE_HEADER(0)`, so `hd` is reloaded to `POOL_FREE_HEADER(0)`, meaning Wosize_hd(hd) = 0 and Whsize_hd(hd) = 1.
+
+So the total advancement for a single free block would be:
+-
+[tr-thinking call-0031:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  `p += wh * 0 = 0` (skip no additional blocks)
+- `p += Whsize_hd(POOL_FREE_HEADER(0)) = 0 + 1 = 1`
+- Total: p += 1
+
+That's completely wrong. A free block occupies `wh` words, not 1 word.
+
+But wait, what about the hd used at the bottom? Let me re-read:
+
+```c
+/* reload hd */
+hd = POOL_FREE_HEADER(0);
+```
+
+Yes, hd gets reloaded to POOL_FREE_HEADER(0) for newly freed blocks. And for originally-free blocks, hd was already the
+[tr-thinking call-0031:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  free header.
+
+And for live blocks (not free), we go to the else branch, no first advance, and then `p += Whsize_hd(hd) = wosize + 1`. But the block actually occupies `wh` words, so this is wrong if wosize + 1 != wh.
+
+Hmm wait, actually let me reconsider. In a pool of sizeclass sz, each block is `wh = wsize_sizeclass[sz]` words. The actual object stored in the block has `wosize = wh - 1` (plus some extra maybe, because the header is stored elsewhere). 
+
+Actually, I
+[tr-thinking call-0031:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  need to be more precise. Let me look at the header format. In OCaml:
+- A block has: header (1 word) + wosize data words
+- Total = wosize + 1 = Whsize_wosize(wosize)
+
+In a pool, all blocks have the same size class. The size class determines `wh = wsize_sizeclass[sz]`, which is the total width of one block (header + data + alignment). For smaller objects, `wh` might be larger than `wosize + 1` due to padding.
+
+Wait, but the pool stores blocks sequentially with no
+[tr-thinking call-0031:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  gaps? Let me think...
+
+Actually, in OCaml 5's pool system, each block in the pool has exactly `wh` words. The first word is the header, then wosize data words, then potentially padding. All blocks in a pool have the same total size `wh`.
+
+So `Whsize_hd(hd) = wosize + 1` is the header+data size, which is <= wh. The correct step to the next block is always `wh`, not `Whsize_hd(hd)`.
+
+So yes, my fix is correct. The `p += Whsize_hd(hd)` should be `p += wh`.
+
+Let me also verify: for
+[tr-thinking call-0031:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  a run-length compressed free block with Wosize_hd(hd) = N (meaning N additional free blocks follow), the advance should be:
+- Skip N+1 blocks total (the current one plus N following)
+- So: `p += (N+1) * wh = wh + wh*N`
+
+In the loop:
+1. `p += wh * Wosize_hd(hd)` = `p += wh * N` (skip N additional blocks)
+2. `p += wh` (advance past current block)
+Total: p += wh * N + wh = (N+1) * wh ✓
+
+For a single
+[tr-thinking call-0031:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  free block (N=0):
+1. p += wh * 0 = 0
+2. p += wh
+Total: p += wh ✓
+
+For a live block:
+1. No first advance (enters else branch)
+2. p += wh
+Total: p += wh ✓
+
+This all checks out. The fix is correct.
+
+But wait, I need to double-check something. In the original code (without run-length compression), the header comment says: "The wosize is used to indicate the number of contiguous free blocks that follow." This is a NEW convention for run-length compression. Previously, what was the free
+[tr-thinking call-0031:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  block convention?
+
+Looking at the old sweep code pattern, each free block had wosize=0 in its header. The old code probably just did:
+```
+p += wh;
+```
+for every block (free or not). The new run-length compression was supposed to skip multiple blocks when encountering a run, and the developer accidentally used `Whsize_hd(hd)` instead of `wh` in the bottom line.
+
+Actually, I should also check if there's a verify function to see what the correct invariants are.
+
+OK, I'm fairly confident my fix is correct. Let me proceed with building and testing.
+[tr-stream call-0031:worker:xiaomi/mimo-v2.5-pro-ultraspeed] Good, the fix is applied at line 650. Now let me rebuild the
+[tr-stream call-0031:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  compiler.
+
+```json
+{
+  "analysis": "The fix is applied. `p += Whsize_hd(hd)` has been changed to `p += wh` at line 650. In the pool, every block slot is `wh = wsize_sizeclass[sz]` words. `Whsize_hd(hd)` gives wosize+1 which is the object's actual size, not the slot size. This misalignment caused the sweep to read invalid headers, leading to memory corruption and the segfault. Now I need to rebuild.",
+  "plan": "Clean the build and rebuild the compiler, then run the basic testsuite.",
+  "commands": [
+    {
+      "keystrokes": "make clean 2>&1 | tail -5\n",
+      "duration": 10.0
+    },
+    {
+      "keystrokes": "make -
+[tr-stream call-0031:worker:xiaomi/mimo-v2.5-pro-ultraspeed] j$(nproc) 2>&1 | tail -30\n",
+      "duration": 60.0
+    }
+  ],
+  "task_complete": false
+}
+```
+
+[tr-stream call-0031:worker:xiaomi/mimo-v2.5-pro-ultraspeed] worker.done finish=stop cost_microdollars=39052
+[tr-stream call-0031:xiaomi/mimo-v2.5-pro-ultraspeed] Good, the fix is applied at line 650. Now let me rebuild the compiler.
+
+```json
+{
+  "analysis": "The fix is applied. `p += Whsize_hd(hd)` has been changed to `p += wh` at line 650. In the pool, every block slot is `wh = wsize_sizeclass[sz]` words. `Whsize_hd(hd)` gives wosize+1 which is the object's actual size, not the slot size. This misalignment caused the sweep to read invalid headers, leading to memory corruption and the segfault. Now I need to rebuild.",
+  "plan": "Clean the build and rebuild the compiler, then run the basic testsuite.",
+  "commands": [
+    {
+      "keystrokes": "make clean 2>&1 | tail -5\n",
+      "duration": 10.0
+    },
+    {
+      "keystrokes": "make -j$(nproc) 2>&1 | tail -30\n",
+      "duration": 60.0
+    }
+  ],
+  "task_complete": false
+}
+```

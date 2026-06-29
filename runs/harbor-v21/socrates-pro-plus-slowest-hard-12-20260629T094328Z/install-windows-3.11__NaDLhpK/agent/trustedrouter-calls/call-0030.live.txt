@@ -1,0 +1,78 @@
+
+[tr-stream call-0030:socrates:trustedrouter/socrates-pro-plus-1.0] socrates.started
+
+[tr-stream call-0030:worker:xiaomi/mimo-v2.5-pro-ultraspeed] worker.started
+[tr-thinking call-0030:worker:xiaomi/mimo-v2.5-pro-ultraspeed] The VNC framebuffer request isn't returning any data. This might be because the VNC protocol version 3.8 requires security type negotiation differently, or the framebuffer request format is wrong. Let me check the protocol more carefully.
+
+Actually, looking at the RFB protocol for version 3.8:
+- Client sends RFB version
+- Server sends security types (first byte is number of types, followed by the types)
+- For type 1 (None), the server sends a SecurityResult (4 bytes: 0 = OK)
+- Then client sends ClientInit (1 byte: shared flag)
+- Server sends ServerInit
+
+The issue might be that the security handshake for R
+[tr-thinking call-0030:worker:xiaomi/mimo-v2.5-pro-ultraspeed] FB 3.8 is different. For "None" security type, after the client selects it, the server immediately sends the SecurityResult without additional data. But wait - I already handled this correctly in my previous scripts and got success.
+
+The problem might be that the framebuffer update request is being sent but the server isn't responding. Let me check if there's an issue with the packet format.
+
+FramebufferUpdateRequest message:
+- message-type: 1 byte (must be 3, not 0!)
+- incremental: 1 byte
+- x: 2 bytes
+- y: 2 bytes
+- w: 2 bytes
+- h: 2 bytes
+
+Wait, I used `struct.pack('>
+[tr-thinking call-0030:worker:xiaomi/mimo-v2.5-pro-ultraspeed] BxHHHH', 0, 0, 0, width, height)` - that's wrong! The first byte should be 3 (FramebufferUpdateRequest), not 0 (which is SetPixelFormat). And I have the 'x' padding which shouldn't be there.
+
+The correct format is:
+`struct.pack('>BBHHHH', 3, 0, 0, 0, width, height)`
+
+That's why it's not working - I was sending a SetPixelFormat message instead of a FramebufferUpdateRequest.
+
+Let me fix this.
+[tr-stream call-0030:worker:xiaomi/mimo-v2.5-pro-ultraspeed] The framebuffer request format was wrong - I was sending message type 0 (SetPixelFormat) instead of type 3 (FramebufferUpdateRequest). Let me fix this.
+
+{
+  "analysis": "The
+[tr-stream call-0030:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  VNC framebuffer request was using wrong message type (0 instead of 3). The struct format '>BxHHHH' sent type 0 with padding. Need to fix to send type 3 (FramebufferUpdateRequest) with proper format: '>BBHHHH'.",
+  "plan": "Fix the VNC capture script with the correct message type and request the framebuffer properly.",
+  "commands": [
+    {
+      "keystrokes": "cat > /tmp/vnc_cap3.py << 'PYEOF'\nimport socket, struct, time\n\nsock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\nsock.settimeout(10)\nsock.connect
+[tr-stream call-0030:worker:xiaomi/mimo-v2.5-pro-ultraspeed] (('localhost', 5901))\n\nversion = sock.recv(12)\nsock.send(b'RFB 003.008\\n')\n\nntypes = ord(sock.recv(1))\ntypes = sock.recv(ntypes)\nsock.send(bytes([1]))\n\nresult = struct.unpack('>I', sock.recv(4))[0]\nassert result == 0, f'Security failed: {result}'\n\nsock.send(bytes([1]))\n\ndata = b''\nwhile len(data) < 24:\n    data += sock.recv(24 - len(data))\n\nwidth = struct.unpack('>H', data[0:2])[0]\nheight = struct.unpack('>H', data[2:4])[
+[tr-stream call-0030:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 0]\nbpp = data[4]\nprint(f'Server: {width}x{height} bpp={bpp}')\n\nname_len = struct.unpack('>I', data[20:24])[0]\nsock.recv(name_len)\n\n# FramebufferUpdateRequest: type=3, incremental=0, x=0, y=0, w=width, h=height\nreq = struct.pack('>BBHHHH', 3, 0, 0, 0, width, height)\nsock.send(req)\nprint('Sent framebuffer request')\n\nfb_data = b''\nstart = time.time()\nwhile time.time() - start < 8:\n    try:\n        chunk = sock.recv(65536)\n        if not chunk:\n            break\n        fb_data += chunk\n   
+[tr-stream call-0030:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  except socket.timeout:\n        break\n\nprint(f'Got {len(fb_data)} bytes')\nsock.close()\n\nif len(fb_data) > 4:\n    msg_type = fb_data[0]\n    print(f'Message type: {msg_type}')\n    if msg_type == 0:\n        num_rects = struct.unpack('>H', fb_data[2:4])[0]\n        print(f'Rectangles: {num_rects}')\n        off = 4\n        for i in range(min(num_rects, 3)):\n            if off + 12 > len(fb_data):\n                break\n            rx, ry, rw, rh, enc = struct.unpack('>HHHHI', fb_data[off:off+12])\n           
+[tr-stream call-0030:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  off += 12\n            pixsz = bpp // 8\n            print(f'  Rect {i}: ({rx},{ry}) {rw}x{rh} enc={enc} pixsz={pixsz}')\n            \n            if enc == 0:\n                pixbytes = rw * rh * pixsz\n                print(f'  Need {pixbytes} bytes, have {len(fb_data) - off}')\n                if off + pixbytes <= len(fb_data):\n                    header = f'P6\\n{rw} {rh}\\n255\\n'.encode()\n                    pixels = bytearray(rw * rh * 3)\n                    for p in range(rw * rh):\n                        base =
+[tr-stream call-0030:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  off + p * pixsz\n                        pixels[p*3] = fb_data[base+2]\n                        pixels[p*3+1] = fb_data[base+1]\n                        pixels[p*3+2] = fb_data[base]\n                    with open('/tmp/vnc-fb.ppm', 'wb') as f:\n                        f.write(header + bytes(pixels))\n                    print(f'Saved PPM')\n                off += pixbytes\n            else:\n                print(f'  Non-raw encoding {enc}')\n                break\n    else:\n        print(f'Unexpected message type: {msg_type}')\nelse:\n    print(f'No data received,
+[tr-stream call-0030:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  raw bytes: {fb_data[:20]}')\nPYEOF\npython3 /tmp/vnc_cap3.py\n",
+      "duration": 15.0
+    },
+    {
+      "keystrokes": "ls -la /tmp/vnc-fb.ppm 2>/dev/null && convert /tmp/vnc-fb.ppm /tmp/vnc-fb.png && identify /tmp/vnc-fb.png\n",
+      "duration": 3.0
+    }
+  ],
+  "task_complete": false
+}
+
+[tr-stream call-0030:worker:xiaomi/mimo-v2.5-pro-ultraspeed] worker.done finish=stop cost_microdollars=47857
+[tr-stream call-0030:xiaomi/mimo-v2.5-pro-ultraspeed] The framebuffer request format was wrong - I was sending message type 0 (SetPixelFormat) instead of type 3 (FramebufferUpdateRequest). Let me fix this.
+
+{
+  "analysis": "The VNC framebuffer request was using wrong message type (0 instead of 3). The struct format '>BxHHHH' sent type 0 with padding. Need to fix to send type 3 (FramebufferUpdateRequest) with proper format: '>BBHHHH'.",
+  "plan": "Fix the VNC capture script with the correct message type and request the framebuffer properly.",
+  "commands": [
+    {
+      "keystrokes": "cat > /tmp/vnc_cap3.py << 'PYEOF'\nimport socket, struct, time\n\nsock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\nsock.settimeout(10)\nsock.connect(('localhost', 5901))\n\nversion = sock.recv(12)\nsock.send(b'RFB 003.008\\n')\n\nntypes = ord(sock.recv(1))\ntypes = sock.recv(ntypes)\nsock.send(bytes([1]))\n\nresult = struct.unpack('>I', sock.recv(4))[0]\nassert result == 0, f'Security failed: {result}'\n\nsock.send(bytes([1]))\n\ndata = b''\nwhile len(data) < 24:\n    data += sock.recv(24 - len(data))\n\nwidth = struct.unpack('>H', data[0:2])[0]\nheight = struct.unpack('>H', data[2:4])[0]\nbpp = data[4]\nprint(f'Server: {width}x{height} bpp={bpp}')\n\nname_len = struct.unpack('>I', data[20:24])[0]\nsock.recv(name_len)\n\n# FramebufferUpdateRequest: type=3, incremental=0, x=0, y=0, w=width, h=height\nreq = struct.pack('>BBHHHH', 3, 0, 0, 0, width, height)\nsock.send(req)\nprint('Sent framebuffer request')\n\nfb_data = b''\nstart = time.time()\nwhile time.time() - start < 8:\n    try:\n        chunk = sock.recv(65536)\n        if not chunk:\n            break\n        fb_data += chunk\n    except socket.timeout:\n        break\n\nprint(f'Got {len(fb_data)} bytes')\nsock.close()\n\nif len(fb_data) > 4:\n    msg_type = fb_data[0]\n    print(f'Message type: {msg_type}')\n    if msg_type == 0:\n        num_rects = struct.unpack('>H', fb_data[2:4])[0]\n        print(f'Rectangles: {num_rects}')\n        off = 4\n        for i in range(min(num_rects, 3)):\n            if off + 12 > len(fb_data):\n                break\n            rx, ry, rw, rh, enc = struct.unpack('>HHHHI', fb_data[off:off+12])\n            off += 12\n            pixsz = bpp // 8\n            print(f'  Rect {i}: ({rx},{ry}) {rw}x{rh} enc={enc} pixsz={pixsz}')\n            \n            if enc == 0:\n                pixbytes = rw * rh * pixsz\n                print(f'  Need {pixbytes} bytes, have {len(fb_data) - off}')\n                if off + pixbytes <= len(fb_data):\n                    header = f'P6\\n{rw} {rh}\\n255\\n'.encode()\n                    pixels = bytearray(rw * rh * 3)\n                    for p in range(rw * rh):\n                        base = off + p * pixsz\n                        pixels[p*3] = fb_data[base+2]\n                        pixels[p*3+1] = fb_data[base+1]\n                        pixels[p*3+2] = fb_data[base]\n                    with open('/tmp/vnc-fb.ppm', 'wb') as f:\n                        f.write(header + bytes(pixels))\n                    print(f'Saved PPM')\n                off += pixbytes\n            else:\n                print(f'  Non-raw encoding {enc}')\n                break\n    else:\n        print(f'Unexpected message type: {msg_type}')\nelse:\n    print(f'No data received, raw bytes: {fb_data[:20]}')\nPYEOF\npython3 /tmp/vnc_cap3.py\n",
+      "duration": 15.0
+    },
+    {
+      "keystrokes": "ls -la /tmp/vnc-fb.ppm 2>/dev/null && convert /tmp/vnc-fb.ppm /tmp/vnc-fb.png && identify /tmp/vnc-fb.png\n",
+      "duration": 3.0
+    }
+  ],
+  "task_complete": false
+}

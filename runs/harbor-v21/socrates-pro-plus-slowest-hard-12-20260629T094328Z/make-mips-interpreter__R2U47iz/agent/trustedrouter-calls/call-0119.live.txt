@@ -1,0 +1,851 @@
+
+[tr-stream call-0119:socrates:trustedrouter/socrates-pro-plus-1.0] socrates.started
+
+[tr-stream call-0119:worker:xiaomi/mimo-v2.5-pro-ultraspeed] worker.started
+[tr-thinking call-0119:worker:xiaomi/mimo-v2.5-pro-ultraspeed] Let me analyze the W_CacheLumpNum function more carefully. The key instruction is at 0x438040:
+
+```
+438040:       8c720014        lw      s2,20(v1)     # s2 = lumpinfo[i].size
+```
+
+This loads from v1 (which is lumpinfo_base + i*28) at offset 20 (0x14). So the lumpinfo structure has size at offset 20, not 16.
+
+But wait, my trace showed Z_Malloc being called with size = 
+[tr-thinking call-0119:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 0xf4000000 at ra=0x4380ac. Looking at the code:
+
+```
+438098:       02202825        move    a1,s0         # a1 = tag
+43809c:       8c240010        lw      a0,16(at)     # a0 = lumpinfo[i].size?? 
+4380a4:       0c10e15b        jal     43856c <Z_Malloc>
+4380a8:       02403025        move    a2,s2
+```
+
+Wait,
+[tr-thinking call-0119:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  this is at 0x438098. Let me re-read:
+- At 0x438090: lui at,0x4b
+- At 0x438094: lw v0,1476(at)  - loads numlumps? No, loads lumpinfo pointer
+- At 0x438098: addu at,v0,s3   - at = lumpinfo + offset
+- At 0x43809c: move a1,s0      - a1 = tag
+- At 0x4380a0: lw a0,16(at)    - a0 = lumpinfo[i].field at offset 16
+- At 0x4380a4: jal Z_Malloc
+[tr-thinking call-0119:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 
+- At 0x4380a8: move a2,s2      - a2 = ??? (but this is delay slot of jal)
+
+Wait, Z_Malloc signature is: Z_Malloc(size, tag, user)
+So a0 = size = lumpinfo[i].field16
+a1 = tag = s0
+a2 = user = s2
+
+So the size comes from offset 16 in the lumpinfo structure. Let me check the lumpinfo_t structure.
+
+Looking at the source code for w_wad.c:
+```c
+typedef struct
+{
+    char	name[8];            // 0
+    wad_file
+[tr-thinking call-0119:worker:xiaomi/mimo-v2.5-pro-ultraspeed] _t *wad_file;       // 8
+    int		position;           // 12
+    int		size;               // 16
+    ...
+} lumpinfo_t;
+```
+
+So size is at offset 16, that matches. The size is loaded from offset 16 of the lumpinfo entry.
+
+The structure size is 28 bytes (sll at,s1,0x2 then sll v0,s1,0x5 then subu s3,v0,at gives index*32 - index*4 = index*28).
+
+Now, the bad size 0xf4000000 (at ra=0x4380ac) means the
+[tr-thinking call-0119:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  lumpinfo entry at offset 16 has a bad value. This was populated by W_AddFile when the WAD was loaded.
+
+The problem is likely in reading the WAD directory. Let me think about what could go wrong:
+
+1. The WAD file header is 12 bytes: type(4), numlumps(4), infotableofs(4)
+2. The directory entries are 16 bytes each: filepos(4), size(4), name(8)
+
+When the binary reads the WAD directory, it uses lseek to position and read to load the entries. If my lseek returns wrong positions or read returns wrong data
+[tr-thinking call-0119:worker:xiaomi/mimo-v2.5-pro-ultraspeed] , the directory entries would be corrupted.
+
+Let me check if there's a simpler issue - perhaps the first Z_Malloc (with size 0xf4000000) at ra=0x4380ac is the one that matters. Let me look at the full W_CacheLumpNum function more carefully.
+
+Actually, I think the issue might be simpler than I thought. Let me look at the second bad Z_Malloc call: size=420303180 at ra=0x427c58. That's 0x190d514c. This is
+[tr-thinking call-0119:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  in R_InitTextures.
+
+Let me check: at ra=0x427c58, the code is within R_InitTextures. Let me disassemble there.
+
+Actually, let me just focus on fixing the VM. The key issue is that the WAD directory is being read incorrectly, likely due to a bug in how I handle reads at certain file positions, or the lseek implementation.
+
+Wait - let me re-examine my lseek implementation. The MIPS binary calls lseek with:
+- a0 = fd
+- a1 = offset (signed 32-bit)
+- a2 = whence (0=SET
+[tr-thinking call-0119:worker:xiaomi/mimo-v2.5-pro-ultraspeed] , 1=CUR, 2=END)
+
+In my interpreter:
+```javascript
+case 8: { // lseek
+  const e = FD.get(a0);
+  if (!e || e.t !== 'f') { R[2] = -1 >>> 0; return; }
+  const o = (a1 << 0) >> 0; let np;
+  a2 === 0 ? np = o : a2 === 1 ? np = e.p + o : np = e.sz + o;
+  ...
+}
+```
+
+The issue: `a1` is `R[5]` which is an unsigned 32-bit value. But lseek offset
+[tr-thinking call-0119:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  is signed. The cast `(a1 << 0) >> 0` should handle sign extension correctly for values up to 32 bits.
+
+But wait - R[5] is loaded from `const a1 = R[5]`. In the doSys function, R is a Uint32Array, so a1 is already unsigned. The `(a1 << 0) >> 0` converts it to a signed 32-bit integer. That should be correct.
+
+Hmm, let me think about this differently. The WAD file is ~4MB. The infotableofs (position of the directory in the WAD) is at offset 8 in the WAD header
+[tr-thinking call-0119:worker:xiaomi/mimo-v2.5-pro-ultraspeed] . Let me verify this by reading the WAD header directly.
+
+Actually, maybe I should just run a quick test: read the WAD header from within the interpreter and verify it.
+
+Or better yet, let me just add detailed tracing for the WAD loading phase. I need to trace open, lseek, and read calls on the doom.wad fd.
+
+Actually, let me take a step back. The problem might be that my read syscall truncates large reads. When DOOM reads the WAD directory, it reads it in one shot. The WAD directory could be several hundred KB. My read is capped at 0x100000 (1MB) which should be fine.
+
+But wait - I
+[tr-thinking call-0119:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  see a potential issue with my read. When I do:
+```javascript
+const sz = Math.min(a2, 0x100000), t = Buffer.alloc(sz);
+const nn = fs.readSync(e.h, t, 0, sz, e.p);
+```
+
+If a2 is, say, 10000, and I read 10000 bytes, then I copy them back to memory. That should be fine.
+
+But what if fs.readSync doesn't return all the bytes? For example, if e.p is beyond the end of the file? In that case nn would be 0.
+
+Actually,
+[tr-thinking call-0119:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  I bet the issue is in how `e.sz` (file size) is initialized. When I open a file, I do:
+```javascript
+let sz = 0;
+try { sz = fs.fstatSync(h).size; } catch(er) {}
+```
+
+That should be correct.
+
+Let me add more detailed tracing to figure out what's happening. I need to trace:
+1. The open of doom.wad - confirm fd
+2. All lseek calls on that fd - log offset and whence
+3. All read calls on that fd - log position, requested size, and returned size
+4. When W_C
+[tr-thinking call-0119:worker:xiaomi/mimo-v2.5-pro-ultraspeed] acheLumpNum is called, log which lump is being loaded and the size from lumpinfo
+
+Actually, I realize I need to try a completely different approach. Let me check if there's an issue with how the interpreter handles `sw` instruction alignment. MIPS requires aligned memory access for lw/sw, and my w32 function handles misaligned access. But what if there's a subtle bug there?
+
+Let me think about what happens when DOOM writes the lumpinfo table. When W_AddFile runs, it:
+1. Reads the WAD header (12 bytes)
+2. lseek to infotableofs
+3. Reads the directory (numlumps * 16 bytes)
+4. Pop
+[tr-thinking call-0119:worker:xiaomi/mimo-v2.5-pro-ultraspeed] ulates lumpinfo entries with name, position, size
+
+Each directory entry is 16 bytes: filepos(4), size(4), name(8).
+
+If my read returns the correct data but my memory write has a bug, the lumpinfo table could be corrupted.
+
+Actually, wait. Let me look at this from the second bad Z_Malloc call: size=420303180 (0x190d514c) at ra=0x427c58. Let me check what's at 0x427c58 in R_InitTextures.
+
+I already disassembled R_InitTextures:
+```
+427c58 is within R_InitTextures+
+[tr-thinking call-0119:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 0x64
+```
+
+Looking at the earlier disassembly at 0x427c00-0x427cb0:
+```
+427c84:       aea20000        sw      v0,0(s5)
+427c88:       26730008        addiu   s3,s3,8
+427c8c:       2610ffff        addiu   s0,s0,-1
+427c90:       1600fff6        bnez    s0,427c6c
+427c94:       26b50004        addiu   s5,s5
+[tr-thinking call-0119:worker:xiaomi/mimo-v2.5-pro-ultraspeed] ,4
+```
+
+That's a loop. Let me see more of the function.
+
+Actually, 0x427c58 is R_InitTextures+0x64. Let me see the whole function from the start.
+
+The issue is clearly related to how the WAD directory is parsed. Let me try a different approach: I'll add a simple check - when the VM opens doom.wad, I'll log the first few bytes of the file to verify it's being read correctly.
+
+Actually, let me just focus on getting this working. The most likely bug is in the SW instruction handling - when DOOM writes data to memory,
+[tr-thinking call-0119:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  if the SW instruction writes to an address that's not 4-byte aligned, my w32 function handles it via the cross-page path. But there might be a subtlety I'm missing.
+
+Let me check: what if the issue is with `srlv`? In my code:
+```javascript
+case 6: R[rd] = (R[rt] >>> (R[rs] & 31)); break;
+```
+
+Wait, I had a bug earlier with srlv that had mismatched parens. Let me check the current code.
+
+In the current vm.js (written via Python):
+```javascript
+case 6: R[rd] = (R[rt] >>> (R[rs] & 31)); break;
+```
+
+That looks correct now
+[tr-thinking call-0119:worker:xiaomi/mimo-v2.5-pro-ultraspeed] .
+
+Let me think about what else could be wrong. The WAD loading process:
+1. Open doom.wad
+2. Read 12-byte header (4-byte type, 4-byte numlumps, 4-byte infotableofs)
+3. lseek to infotableofs
+4. Read directory entries
+
+If infotableofs is wrong (e.g., endianness issue), the directory read would be garbage.
+
+But wait - the binary is little-endian MIPS, and my r32 function reads bytes in little-endian order. That should be correct.
+
+Let me add tracing for the WAD file operations and the initial directory read to
+[tr-thinking call-0119:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  narrow down the bug.
+
+Actually, I just realized something. Let me look at the `lwl` and `lwr` instructions more carefully. These are used for unaligned loads. In MIPS o32 LE, `lwl` and `lwr` work together to load a 32-bit value from a misaligned address.
+
+My implementation:
+```javascript
+case 34: { // lwl
+    const a = (R[rs] + si) >>> 0, al = a & ~3, bo = a & 3, mv = r32(al);
+    R[rt] = bo === 0 ? mv : bo === 1 ? (R[rt] & 0
+[tr-thinking call-0119:worker:xiaomi/mimo-v2.5-pro-ultraspeed] xFF000000 | mv >>> 8) >>> 0 : bo === 2 ? (R[rt] & 0xFFFF0000 | mv >>> 16) >>> 0 : (R[rt] & 0xFFFFFF00 | mv >>> 24) >>> 0;
+    break;
+}
+case 38: { // lwr
+    const a = (R[rs] + si) >>> 0, al = a & ~3, bo = a & 3, mv = r32(al);
+    R[rt] = bo === 0 ? (R[rt] & 0x00FFFFFF | mv << 24) >>> 0 : bo === 1 ? (R[rt] & 0x0000FFFF | mv << 16) >>> 0 : bo ===
+[tr-thinking call-0119:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  2 ? (R[rt] & 0x000000FF | mv << 8) >>> 0 : mv;
+    break;
+}
+```
+
+In little-endian MIPS32, `lwl` loads the most-significant bytes and `lwr` loads the least-significant bytes. For little-endian:
+- lwl at address A: loads the byte at A and the bytes at higher addresses up to the aligned word boundary
+- lwr at address A: loads from the aligned word boundary up to and including the byte at A
+
+Wait, I think there might be a bug in my lwl/lwr for little-endian.
+[tr-thinking call-0119:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  Let me think about this more carefully.
+
+For MIPS32 little-endian:
+- `lwl` at address A (byte offset bo within aligned word):
+  - bo=0: loads entire word (same as lw)
+  - bo=1: loads upper 3 bytes from aligned word, keeps lower 1 byte of rt
+  - bo=2: loads upper 2 bytes from aligned word, keeps lower 2 bytes of rt
+  - bo=3: loads upper 1 byte from aligned word, keeps lower 3 bytes of rt
+
+But in little-endian memory layout, byte 0 is the
+[tr-thinking call-0119:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  least significant byte. So "upper 3 bytes" means bytes 1,2,3 of the word.
+
+For lwl with byte offset 1 (address = word_base + 1):
+- It loads bytes 1,2,3 of the word into the MSB of rt
+- The result in rt should be: byte3|byte2|byte1|rt_old[0]
+
+In my code for bo=1:
+```javascript
+(R[rt] & 0xFF000000 | mv >>> 8) >>> 0
+```
+
+mv is the entire word. mv >>> 8 shifts right by 8 bits
+[tr-thinking call-0119:worker:xiaomi/mimo-v2.5-pro-ultraspeed] , giving byte3|byte2|byte1 in bits 23-0. Then R[rt] & 0xFF000000 keeps the old byte 0 of rt (wait, 0xFF000000 masks the most significant byte).
+
+Hmm, for LE lwl with bo=1:
+- The loaded bytes are 1,2,3 of the word
+- These should go into bits 8-31 of the result
+- Byte 0 of rt (bits 0-7) should be preserved
+
+So: result = (mv >>> 8) | (rt & 0xFF)
+
+
+[tr-thinking call-0119:worker:xiaomi/mimo-v2.5-pro-ultraspeed] But my code says: R[rt] & 0xFF000000 | mv >>> 8
+
+R[rt] & 0xFF000000 keeps bits 24-31 of rt. But we want to keep bits 0-7 of rt. That's a bug!
+
+Wait, let me reconsider. In MIPS, `lwl` is defined differently for big-endian and little-endian. The MIPS architecture defines `lwl` as "load word left" where "left" means the most-significant byte first.
+
+For little-endian MIPS:
+- The MIPS3
+[tr-thinking call-0119:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 2 specification says that lwl and lwr are "reversed" compared to big-endian
+- In LE mode, lwl loads from memory into the LOW-order bytes of the register
+- lwr loads into the HIGH-order bytes
+
+Actually wait, let me reconsider the MIPS specification for little-endian.
+
+In MIPS32, the lwl instruction for little-endian:
+- lwl at addr: loads the byte at addr and bytes at addresses up to the next word boundary into the MSB of the register
+
+Actually, this depends on the MIPS revision. In MIPS32r2 with little-endian, `lwl` and `lwr` behavior is:
+- lwl:
+[tr-thinking call-0119:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  loads bytes from memory starting at the byte address up to the aligned word boundary, placing them at the most significant end of the register
+- lwr: loads bytes from the aligned word boundary up to the byte address, placing them at the least significant end
+
+This is the same for both big and little endian! The byte ordering within the word is what changes.
+
+Wait, actually I think the confusion is that MIPS defines lwl/lwr in terms of "left" and "right" relative to big-endian byte ordering. In little-endian mode, the implementation changes.
+
+Let me look at this from the GCC/binutils perspective for MIPS LE.
+
+For little
+[tr-thinking call-0119:worker:xiaomi/mimo-v2.5-pro-ultraspeed] -endian MIPS:
+- `lwl $t, offset($s)` loads 1 to 4 bytes from memory into the HIGH (left) portion of register $t
+- `lwr $t, offset($s)` loads 1 to 4 bytes from memory into the LOW (right) portion of register $t
+
+But in little-endian, "high" bytes of the register correspond to higher memory addresses.
+
+So for lwl at address A with byte offset bo=1 (A = word_base + 1):
+- It loads bytes at addresses word_base+1, word_base+2, word_base+3
+- These go into the HIGH 3 bytes of the register (bits 31:8)
+- The
+[tr-thinking call-0119:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  low byte of the register is preserved
+
+So result = (loaded_word & 0xFFFFFF00) | (old_rt & 0xFF)
+Or equivalently: result = (mv << 8 ... no that's not right either)
+
+Hmm wait. Let me think about this with actual numbers.
+
+Say memory at word_base contains bytes: [A, B, C, D] (byte at word_base is A)
+In LE, the 32-bit value is: D<<24 | C<<16 | B<<8 | A
+
+lwl at word_base+1 (bo=1):
+- Loads bytes at addresses word_base+1, word_base+2, word_base+3 = B, C, D
+- These go into high 
+[tr-thinking call-0119:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 3 bytes of register
+- Low byte preserved from old register value
+
+The register result should be: (D<<24 | C<<16 | B<<8) | (old_rt & 0xFF)
+= (mv & 0xFFFFFF00) | (old_rt & 0xFF)
+
+But my code does: (R[rt] & 0xFF000000 | mv >>> 8) >>> 0
+
+mv = D<<24 | C<<16 | B<<8 | A
+mv >>> 8 = D<<16 | C<<8 | B (as unsigned 32-bit)
+
+[tr-thinking call-0119:worker:xiaomi/mimo-v2.5-pro-ultraspeed] R[rt] & 0xFF000000 = keeps the top byte of old_rt
+
+So my result = (top_byte_of_old_rt) | (D<<16 | C<<8 | B)
+
+But the correct result should be: (D<<24 | C<<16 | B<<8) | (old_rt & 0xFF)
+= (D<<24 | C<<16 | B<<8 | old_byte_0)
+
+My code gives: old_byte_3<<24 | D<<16 | C<<8 | B
+
+That's wrong! The correct answer puts D at
+[tr-thinking call-0119:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  byte 3, C at byte 2, B at byte 1, and old byte 0 at byte 0.
+
+My code puts old byte 3 at byte 3, D at byte 2, C at byte 1, B at byte 0. That's off by one byte position!
+
+So my lwl implementation is WRONG for little-endian! Let me fix it.
+
+For LE lwl:
+- bo=0: result = mv (load entire word, same as lw)
+- bo=1: result = (mv & 0xFFFFFF00) | (old & 0xFF)
+- bo=2: result = (
+[tr-thinking call-0119:worker:xiaomi/mimo-v2.5-pro-ultraspeed] mv & 0xFFFF0000) | (old & 0xFFFF)
+- bo=3: result = (mv & 0xFF000000) | (old & 0x00FFFFFF)
+
+For LE lwr:
+- bo=3: result = mv (load entire word)
+- bo=2: result = (old & 0xFF000000) | (mv & 0x00FFFFFF)
+- bo=1: result = (old & 0xFFFF0000) | (mv & 0x0000FFFF)
+- bo=0: result = (old & 0xFFFFFF00) | (mv & 0x000000FF)
+
+Wait, let
+[tr-thinking call-0119:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  me re-derive this. In MIPS LE:
+
+lwl $t, offset($s): Load Word Left
+- "Left" in the context of big-endian means the most significant byte
+- In LE, the byte ordering is reversed, so "left" means the byte at the LOWEST address
+
+The MIPS spec says (for LE):
+lwl at addr with byte offset bo (within aligned word):
+- bo=0: loads 4 bytes (word), result = word
+- bo=1: loads 3 bytes from [addr, addr+1, addr+2] into high bytes of result, low byte from old $t
+- bo=2: loads 2 bytes from [addr, addr+1] into high bytes
+- bo=3: loads 1
+[tr-thinking call-0119:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  byte from [addr] into high byte
+
+But what does "high bytes" mean in LE?
+
+Actually, I think the correct behavior for LE lwl is:
+The lwl instruction always loads the CONTIGUOUS bytes from the byte address up to the end of the aligned word, placing them at the most-significant end of the register.
+
+In LE mode, "most-significant end" means the bytes with the highest numerical significance, which in LE memory layout means the highest address bytes.
+
+For lwl at word_base+1 (bo=1), loading bytes B, C, D:
+- D is at the highest address, so it's the most significant
+- Result: D <<
+[tr-thinking call-0119:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  24 | C << 16 | B << 8 | old_byte_0
+
+So result = (D << 24 | C << 16 | B << 8) | (old & 0xFF)
+
+Now, mv (the word at word_base) in LE = A | B<<8 | C<<16 | D<<24
+(mv << 8) >>> 0 would give: B<<8 | C<<16 | D<<24 | 0 (but with overflow...)
+Actually (mv << 8) = (A | B<<8 | C<<16 | D<<24) << 8 = B<<8 | C<<16 | D<<24 (with
+[tr-thinking call-0119:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  A shifted out for 32-bit)
+
+Wait no. mv << 8 in JS: mv is a 32-bit number. JS numbers are 64-bit floats, so mv << 8 could overflow.
+
+Let me be more careful:
+mv = A | (B << 8) | (C << 16) | (D << 24) (as unsigned)
+
+(mv << 8) >>> 0:
+- This shifts mv left by 8 bits, giving (B << 8) | (C << 16) | (D << 24) | (A << 32)
+- Then >>> 0 takes only the lower 32 bits: (B << 8) | (C
+[tr-thinking call-0119:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  << 16) | (D << 24)
+- Wait, A << 32 overflows, so we get: (B << 8) | (C << 16) | (D << 24) | 0
+
+Hmm, that's actually correct for the high 3 bytes! But we need to keep byte 0 of old_rt.
+
+So for bo=1: result = ((mv << 8) >>> 0) | (old & 0xFF)
+
+Wait, let me double-check:
+mv = byte0 | byte1<<8 | byte2<<16 | byte3<<24
+(mv << 8) = byte1<<8 | byte2<<16 | byte3<<24
+[tr-thinking call-0119:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  (byte0 shifted out, but actually in JS all bits are preserved as a Number)
+
+In JS, `(0x78563412 << 8) >>> 0`:
+0x78563412 << 8 = 0x7856341200
+But in JS, bitwise operations work on 32-bit integers, so:
+0x78563412 << 8 = 0x56341200 (the top byte is truncated)
+>>> 0 makes it unsigned
+
+So (mv << 8) >>> 0 = (byte1 << 8) | (byte2 <<
+[tr-thinking call-0119:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  16) | (byte3 << 24)
+= mv & 0xFFFFFF00 with the lowest byte zeroed... no that's not right.
+
+Actually:
+mv = A + B*256 + C*65536 + D*16777216
+mv << 8 = A*256 + B*65536 + C*16777216 + D*4294967296
+
+But in 32-bit: (mv << 8) >>> 0 = (A*256 + B*65536 + C*16777216) >>> 0
+= (B*6
+[tr-thinking call-0119:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 5536 + C*16777216 + D*256... wait I'm confusing myself.
+
+Let me just use hex:
+mv = 0xD7C3B2A1 (A=0xA1, B=0xB2, C=0xC3, D=0xD7)
+mv << 8 = 0x7C3B2A100... but in 32-bit: 0xC3B2A100
+
+Hmm, that gives: C3 B2 A1 00
+But I wanted: 00 B2 C3 D7
+
+That's not right at all! Let me reconsider.
+
+Actually,
+[tr-thinking call-0119:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  in LE, byte at word_base is A (least significant), byte at word_base+3 is D (most significant).
+The 32-bit word value is: D<<24 | C<<16 | B<<8 | A
+
+So mv = 0xD7C3B2A1
+
+lwl at word_base+1 should load bytes at word_base+1 (B), word_base+2 (C), word_base+3 (D)
+These should go to the most significant portion of the register.
+
+Result = D<<24 | C<<16 | B<<8 | (old_rt & 0xFF)
+= 0xD7C3B200 | (old_rt & 0xFF)
+
+Now
+[tr-thinking call-0119:worker:xiaomi/mimo-v2.5-pro-ultraspeed] , (mv << 8) >>> 0 with mv = 0xD7C3B2A1:
+In JavaScript: 0xD7C3B2A1 << 8
+Since 0xD7C3B2A1 has bit 31 set, it's treated as a negative number in 32-bit signed.
+0xD7C3B2A1 << 8 = 0xC3B2A100 (truncated to 32 bits)
+>>> 0 = 0xC3B2A100
+
+That gives 0xC3B2A100, but I wanted 0xD7C3B200. They don
+[tr-thinking call-0119:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 't match!
+
+So my approach of (mv << 8) is wrong. Let me think about what the correct formula is.
+
+I want: D<<24 | C<<16 | B<<8 | (old & 0xFF)
+
+mv = D<<24 | C<<16 | B<<8 | A
+
+So what I want is: mv & 0xFFFFFF00 | (old & 0xFF)
+
+That's correct! The formula for bo=1 should be:
+result = (mv & 0xFFFFFF00) | (old & 0xFF)
+
+NOT (R[rt] & 0xFF
+[tr-thinking call-0119:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 000000 | mv >>> 8) which is what I had.
+
+Let me re-derive for all cases:
+
+For LE lwl:
+- bo=0 (addr = word_base): load entire word → result = mv
+- bo=1 (addr = word_base+1): load bytes 1,2,3 → result = (mv & 0xFFFFFF00) | (old & 0xFF)
+- bo=2 (addr = word_base+2): load bytes 2,3 → result = (mv & 0xFFFF0000) | (old & 0xFFFF)
+- bo=3 (addr = word_base+3): load byte 3 → result = (mv & 0xFF000000) | (old & 0x00FFFFFF)
+
+For LE l
+[tr-thinking call-0119:worker:xiaomi/mimo-v2.5-pro-ultraspeed] wr:
+- bo=3 (addr = word_base+3): load entire word → result = mv
+- bo=2 (addr = word_base+2): load bytes 0,1,2 → result = (old & 0xFF000000) | (mv & 0x00FFFFFF)
+- bo=1 (addr = word_base+1): load bytes 0,1 → result = (old & 0xFFFF0000) | (mv & 0x0000FFFF)
+- bo=0 (addr = word_base+0): load byte 0 → result = (old & 0xFFFFFF00) | (mv & 0x000000FF)
+
+Wait,
+[tr-thinking call-0119:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  this doesn't look right for lwl either. Let me re-examine.
+
+Actually, I think the issue is more subtle. In MIPS, lwl/lwr are designed to work in PAIRS. lwl loads the left part and lwr loads the right part. The "left/right" convention is defined for big-endian, and for little-endian it's... actually swapped.
+
+Let me look at the MIPS32 specification more carefully.
+
+For MIPS32r2 little-endian:
+
+lwl: "Load Word Left" (in LE context, this loads from the HIGH end)
+- At byte offset 0 in word
+[tr-thinking call-0119:worker:xiaomi/mimo-v2.5-pro-ultraspeed] : loads all 4 bytes (same as lw)
+- At byte offset 1: loads bytes [1,2,3] of the word, keeping byte [0] of register
+- At byte offset 2: loads bytes [2,3] of the word, keeping bytes [0,1] of register  
+- At byte offset 3: loads byte [3] of word, keeping bytes [0,1,2] of register
+
+Wait, I think the key insight is: in little-endian, "left" means the high-address bytes, and "right" means the low-address bytes.
+
+lwl at addr:
+[tr-thinking call-0119:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  loads bytes from addr UP TO the aligned word boundary (inclusive)
+- The word boundary is at addr & ~3 (rounded DOWN)
+- Actually no, the word boundary is the NEXT aligned boundary at (addr & ~3) + 3 (going up)
+
+Hmm, I think I need to look at actual MIPS LE behavior more carefully.
+
+Actually, let me just look at how other MIPS emulators handle lwl/lwr for little-endian.
+
+For MIPS LE, the lwl instruction with effective address A:
+- byte_offset = A & 3
+- aligned_addr = A & ~3
+- mem_word = read32(aligned_addr)  // LE
+[tr-thinking call-0119:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  interpretation
+
+lwl loads bytes from the byte at A through to the highest byte of the aligned word (byte at aligned_addr+3 in LE).
+
+For byte_offset=1 (A = aligned_addr + 1):
+- Bytes loaded: A[1], A[2], A[3] (from the aligned word)
+- These are loaded into the HIGH bytes of the register
+- In LE register: byte3=word[3], byte2=word[2], byte1=word[1], byte0=preserved
+
+So result.byte3 = word.byte3, result.byte2 = word.byte2, result.byte1 = word.byte1, result.byte0 = old.byte0
+= (word & 0xFFFFFF00) | (old & 0xFF)
+
+Wait
+[tr-thinking call-0119:worker:xiaomi/mimo-v2.5-pro-ultraspeed] , that's what I derived before. But I said my code was wrong. Let me re-read my code:
+
+```javascript
+case 34: { // lwl
+    const a = (R[rs] + si) >>> 0, al = a & ~3, bo = a & 3, mv = r32(al);
+    R[rt] = bo === 0 ? mv : bo === 1 ? (R[rt] & 0xFF000000 | mv >>> 8) >>> 0 : bo === 2 ? (R[rt] & 0xFFFF0000 | mv >>> 16) >>> 0 : (R[rt] & 0xFFFFFF00 | mv >>> 24) >>> 0;
+   
+[tr-thinking call-0119:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  break;
+}
+```
+
+For bo=1: (R[rt] & 0xFF000000 | mv >>> 8) >>> 0
+
+But I said the correct answer is: (mv & 0xFFFFFF00) | (old & 0xFF)
+
+These are different! Let me verify with an example:
+mv = 0xD7C3B2A1
+old = 0x11223344
+
+My code: (0x11223344 & 0xFF000000) | (0xD7C3B2A1 >>> 8)
+= 0x11000000 | 0x00D7C3
+[tr-thinking call-0119:worker:xiaomi/mimo-v2.5-pro-ultraspeed] B2
+= 0x11D7C3B2
+
+Correct answer: (0xD7C3B2A1 & 0xFFFFFF00) | (0x11223344 & 0xFF)
+= 0xD7C3B200 | 0x44
+= 0xD7C3B244
+
+These are clearly different! My lwl is wrong!
+
+For bo=2:
+My code: (R[rt] & 0xFFFF0000 | mv >>> 16) >>> 0
+= (0x11220000 | 0xD7C3)
+[tr-thinking call-0119:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  = 0x1122D7C3
+
+Correct: (mv & 0xFFFF0000) | (old & 0xFFFF)
+= 0xD7C30000 | 0x3344
+= 0xD7C33344
+
+Also wrong!
+
+For bo=3:
+My code: (R[rt] & 0xFFFFFF00 | mv >>> 24) >>> 0
+= (0x11223300 | 0xD7) = 0x112233D7
+
+Correct: (mv & 0xFF000000) | (old & 0x00FFFFFF)
+= 0xD7000000 | 0x223
+[tr-thinking call-0119:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 344
+= 0xD7223344
+
+Also wrong!
+
+So my lwl is completely wrong for little-endian! It seems like my code was written for big-endian lwl behavior.
+
+Similarly, my lwr is probably wrong too.
+
+Let me also check lwr:
+```javascript
+case 38: { // lwr
+    const a = (R[rs] + si) >>> 0, al = a & ~3, bo = a & 3, mv = r32(al);
+    R[rt] = bo === 0 ? (R[rt] & 0x00FFFFFF | mv << 24) >>> 0 : bo === 1 ? (R[rt] & 0x0000FFFF | mv << 16) >>> 0 : bo === 2 ? (R
+[tr-thinking call-0119:worker:xiaomi/mimo-v2.5-pro-ultraspeed] [rt] & 0x000000FF | mv << 8) >>> 0 : mv;
+    break;
+}
+```
+
+For bo=0: (old & 0x00FFFFFF | mv << 24) >>> 0
+= (0x11223344 & 0x00FFFFFF | 0xD7C3B2A1 << 24) >>> 0
+= (0x00223344 | 0xA1000000)
+= 0xA1223344
+
+Correct for
+[tr-thinking call-0119:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  LE lwr bo=0: (old & 0xFFFFFF00) | (mv & 0xFF)
+= (0x11223300 | 0xA1)
+= 0x112233A1
+
+Hmm, also wrong.
+
+Wait, I think I may have the lwl/lwr behavior backwards. Let me reconsider.
+
+For little-endian MIPS, lwl and lwr are defined as:
+
+lwl: loads the byte at the effective address and possibly additional bytes at HIGHER addresses up to the end of the aligned word. These bytes are placed at the LEFT (high
+[tr-thinking call-0119:worker:xiaomi/mimo-v2.5-pro-ultraspeed] ) end of the register.
+
+But "left end of the register" in LE means the HIGH bytes of the register value, which in LE memory layout correspond to the HIGH addresses.
+
+Wait, actually, I think the confusion is about what "left" means. Let me look at actual MIPS LE documentation.
+
+According to MIPS documentation for LE:
+- lwl: loads the most significant part of a word from memory
+- lwr: loads the least significant part of a word from memory
+
+But in LE, the most significant byte of a word is at the highest address.
+
+For LE lwl with effective address A:
+- byte_offset = A & 3
+- word_base
+[tr-thinking call-0119:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  = A & ~3
+- It loads bytes from word_base+byte_offset to word_base+3
+- The loaded bytes are placed at the MOST SIGNIFICANT end of the register
+
+For byte_offset=1:
+- Loads bytes at word_base+1, word_base+2, word_base+3
+- Places them at the MSB end of register: result[31:24] = byte at word_base+3, result[23:16] = word_base+2, result[15:8] = word_base+1
+- Keeps result[7:0] from old register value
+
+So result = (word & 0xFFFFFF00) | (old & 0xFF)
+
+That's what I derived
+[tr-thinking call-0119:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  before. So my lwl code IS wrong.
+
+For LE lwr with effective address A:
+- byte_offset = A & 3  
+- word_base = A & ~3
+- It loads bytes from word_base to word_base+byte_offset
+- The loaded bytes are placed at the LEAST SIGNIFICANT end of the register
+
+For byte_offset=0:
+- Loads byte at word_base
+- Places it at LSB of register: result[7:0] = byte at word_base
+- Keeps result[31:8] from old register value
+
+So result = (old & 0xFFFFFF00) | (word & 
+[tr-thinking call-0119:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 0xFF)
+
+For byte_offset=1:
+- Loads bytes at word_base, word_base+1
+- Places them at LSB end: result[7:0] = byte at word_base, result[15:8] = byte at word_base+1
+- Keeps result[31:16] from old register value
+
+So result = (old & 0xFFFF0000) | (word & 0xFFFF)
+
+For byte_offset=2:
+- Loads bytes at word_base, word_base+1, word_base+2
+- result = (old & 0xFF000000) | (word & 0x00FFFFFF)
+
+For byte_offset=3:
+- Loads all 
+[tr-thinking call-0119:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 4 bytes = same as lw
+- result = word
+
+OK so my lwr is also wrong! Let me now write the correct implementations:
+
+LE lwl:
+- bo=0: result = mv
+- bo=1: result = (mv & 0xFFFFFF00) | (old & 0xFF)
+- bo=2: result = (mv & 0xFFFF0000) | (old & 0xFFFF)
+- bo=3: result = (mv & 0xFF000000) | (old & 0x00FFFFFF)
+
+LE lwr:
+- bo=
+[tr-thinking call-0119:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 0: result = (old & 0xFFFFFF00) | (mv & 0xFF)
+- bo=1: result = (old & 0xFFFF0000) | (mv & 0xFFFF)
+- bo=2: result = (old & 0xFF000000) | (mv & 0x00FFFFFF)
+- bo=3: result = mv
+
+Similarly, swl and swr need to be fixed:
+
+LE swl:
+- bo=0: write entire word
+- bo=1: write bytes 1,2,3 of word from register (keeping byte 0 of
+[tr-thinking call-0119:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  memory)
+- bo=2: write bytes 2,3 of word from register (keeping bytes 0,1 of memory)
+- bo=3: write byte 3 of word from register (keeping bytes 0,1,2 of memory)
+
+swl stores bytes from the LEFT (most significant) end of the register.
+
+For bo=1: 
+- We want to write bytes 1,2,3 of the register into bytes 1,2,3 of the aligned memory word
+- reg_byte1 = (val >>> 8) & 0xFF, reg_byte2 = (val >>> 16) & 0xFF, reg_byte3 = (val >>> 
+[tr-thinking call-0119:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 24) & 0xFF
+- new_word = (val & 0xFFFFFF00) | (old_mem & 0xFF)
+
+Wait, that's the same as lwl but for writing. Let me think again.
+
+swl stores the most significant bytes of the register to the memory locations from word_base+byte_offset to word_base+3.
+
+For bo=1:
+- Memory bytes 1,2,3 get register bytes 3,2,1 (most significant first in LE)
+- Actually in LE: memory byte at word_base+1 gets register byte 1 (bits 15:8)
+  memory byte at word_base+2 gets register byte 2 (bits 23:16)  
+  memory byte at word_base+3 gets register byte 3 (bits 31:24)
+-
+[tr-thinking call-0119:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  Memory byte at word_base+0 is preserved
+
+So new_word = (val & 0xFFFFFF00) | (old_mem & 0xFF)
+
+LE swl:
+- bo=0: new_word = val
+- bo=1: new_word = (val & 0xFFFFFF00) | (old & 0xFF)
+- bo=2: new_word = (val & 0xFFFF0000) | (old & 0xFFFF)
+- bo=3: new_word = (val & 0xFF000000) | (old & 0x00FFFFFF)
+
+LE swr:
+- bo=0: new_word = (val & 0x000000FF) | (old & 0xFFFFFF00)
+- bo=1: new_word = (val
+[tr-thinking call-0119:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  & 0x0000FFFF) | (old & 0xFFFF0000)
+- bo=2: new_word = (val & 0x00FFFFFF) | (old & 0xFF000000)
+- bo=3: new_word = val
+
+So my current swl/swr code is:
+```javascript
+case 42: { // swl
+    const a = ..., old = r32(al), v = R[rt];
+    w32(al, bo === 0 ? v : bo === 1 ? (old & 0xFF000000 | v & 0x00FFFFFF) >>> 0 :
+[tr-thinking call-0119:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  bo === 2 ? (old & 0xFFFF0000 | v & 0x0000FFFF) >>> 0 : (old & 0xFFFFFF00 | v & 0x000000FF) >>> 0);
+    break;
+}
+```
+
+For bo=1: (old & 0xFF000000 | v & 0x00FFFFFF) >>> 0
+Correct: (val & 0xFFFFFF00) | (old & 0xFF)
+
+These are different! My swl is wrong too.
+
+For swr:
+```javascript
+case 46: { // swr
+    const
+[tr-thinking call-0119:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  a = ..., old = r32(al), v = R[rt];
+    w32(al, bo === 0 ? (old & 0x00FFFFFF | v << 24) >>> 0 : bo === 1 ? (old & 0x0000FFFF | v << 16) >>> 0 : bo === 2 ? (old & 0x000000FF | v << 8) >>> 0 : v);
+    break;
+}
+```
+
+For bo=0: (old & 0x00FFFFFF | v << 24) >>> 0
+Correct: (val & 0x000000FF) | (old & 0xFFFFFF00)
+
+Also wrong!
+
+OK so I
+[tr-thinking call-0119:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  have bugs in lwl, lwr, swl, swr. All four are wrong for little-endian. This is a critical bug that would corrupt data when DOOM loads WAD entries, reads textures, etc.
+
+Let me write the correct versions and update vm.js.
+
+The correct implementations:
+
+LE lwl:
+```
+bo=0: result = mv
+bo=1: result = (mv & 0xFFFFFF00) | (old & 0xFF)
+bo=2: result = (mv & 0xFFFF0000) | (old & 0xFFFF)
+bo=3: result = (mv & 0xFF000000) | (old & 0x00FFFFFF)
+``
+[tr-thinking call-0119:worker:xiaomi/mimo-v2.5-pro-ultraspeed] `
+
+LE lwr:
+```
+bo=0: result = (old & 0xFFFFFF00) | (mv & 0xFF)
+bo=1: result = (old & 0xFFFF0000) | (mv & 0xFFFF)
+bo=2: result = (old & 0xFF000000) | (mv & 0x00FFFFFF)
+bo=3: result = mv
+```
+
+LE swl:
+```
+bo=0: new = val
+bo=1: new = (val & 0xFFFFFF00) | (old & 0xFF)
+bo=2: new = (val & 0xFFFF0000) | (old & 0xFFFF)
+bo=3: new = (val & 0xFF000000) | (old
+[tr-thinking call-0119:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  & 0x00FFFFFF)
+```
+
+LE swr:
+```
+bo=0: new = (old & 0xFFFFFF00) | (val & 0xFF)
+bo=1: new = (old & 0xFFFF0000) | (val & 0xFFFF)
+bo=2: new = (old & 0xFF000000) | (val & 0x00FFFFFF)
+bo=3: new = val
+```
+
+Now let me write the corrected vm.js.
+[tr-stream call-0119:worker:xiaomi/mimo-v2.5-pro-ultraspeed] Found the bug - my lwl/lwr/swl/swr implementations are wrong for little-endian MIPS. These
+[tr-stream call-0119:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  unaligned load/store instructions are critical for WAD file reading. Let me fix all four:
+
+{
+  "analysis": "The lwl/lwr/swl/swr instructions are implemented with big-endian byte ordering instead of little-endian. This corrupts WAD directory reads causing bad lump sizes. The fix requires rewriting all four instructions.",
+  "plan": "Fix lwl/lwr/swl/swr with correct LE byte ordering in vm.js and test.",
+  "commands": [
+    {
+      "keystrokes": "python3 << 'PYEOF'\nwith open('/app/vm.js', 'r') as f:\n    c = f.read()\n\n# Fix lwl (case 34)\nold_lwl = \"
+[tr-stream call-0119:worker:xiaomi/mimo-v2.5-pro-ultraspeed] \"\"case 34: { const a = (R[rs] + si) >>> 0, al = a & ~3, bo = a & 3, mv = r32(al); R[rt] = bo === 0 ? mv : bo === 1 ? (R[rt] & 0xFF000000 | mv >>> 8) >>> 0 : bo === 2 ? (R[rt] & 0xFFFF0000 | mv >>> 16) >>> 0 : (R[rt] & 0xFFFFFF00 | mv >>> 24) >>> 0; break; }\"\"\"\nnew_lwl = \"\"\"case 34: { const a = (R[rs] + si) >>> 0, al =
+[tr-stream call-0119:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  a & ~3, bo = a & 3, mv = r32(al); R[rt] = bo === 0 ? mv : bo === 1 ? ((mv & 0xFFFFFF00) | (R[rt] & 0xFF)) >>> 0 : bo === 2 ? ((mv & 0xFFFF0000) | (R[rt] & 0xFFFF)) >>> 0 : ((mv & 0xFF000000) | (R[rt] & 0x00FFFFFF)) >>> 0; break; }\"\"\"\n\n# Fix lwr (case 38)\nold_lwr = \"\"\"case 38: { const a = (R[rs] + si) >>> 0, al = a & ~3, bo = a
+[tr-stream call-0119:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  & 3, mv = r32(al); R[rt] = bo === 0 ? (R[rt] & 0x00FFFFFF | mv << 24) >>> 0 : bo === 1 ? (R[rt] & 0x0000FFFF | mv << 16) >>> 0 : bo === 2 ? (R[rt] & 0x000000FF | mv << 8) >>> 0 : mv; break; }\"\"\"\nnew_lwr = \"\"\"case 38: { const a = (R[rs] + si) >>> 0, al = a & ~3, bo = a & 3, mv = r32(al); R[rt] = bo === 3 ? mv : bo === 2 ? ((R
+[tr-stream call-0119:worker:xiaomi/mimo-v2.5-pro-ultraspeed] [rt] & 0xFF000000) | (mv & 0x00FFFFFF)) >>> 0 : bo === 1 ? ((R[rt] & 0xFFFF0000) | (mv & 0x0000FFFF)) >>> 0 : ((R[rt] & 0xFFFFFF00) | (mv & 0x000000FF)) >>> 0; break; }\"\"\"\n\n# Fix swl (case 42)\nold_swl = \"\"\"case 42: { const a = (R[rs] + si) >>> 0, al = a & ~3, bo = a & 3, old = r32(al), v = R[rt]; w32(al, bo === 0 ? v : bo === 1 ? (old & 
+[tr-stream call-0119:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 0xFF000000 | v & 0x00FFFFFF) >>> 0 : bo === 2 ? (old & 0xFFFF0000 | v & 0x0000FFFF) >>> 0 : (old & 0xFFFFFF00 | v & 0x000000FF) >>> 0); break; }\"\"\"\nnew_swl = \"\"\"case 42: { const a = (R[rs] + si) >>> 0, al = a & ~3, bo = a & 3, old = r32(al), v = R[rt]; w32(al, bo === 0 ? v : bo === 1 ? ((v & 0xFFFFFF00) | (old & 0xFF)) >>> 0 : bo === 2 ? ((v & 0xFFFF0
+[tr-stream call-0119:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 000) | (old & 0xFFFF)) >>> 0 : ((v & 0xFF000000) | (old & 0x00FFFFFF)) >>> 0); break; }\"\"\"\n\n# Fix swr (case 46)\nold_swr = \"\"\"case 46: { const a = (R[rs] + si) >>> 0, al = a & ~3, bo = a & 3, old = r32(al), v = R[rt]; w32(al, bo === 0 ?
+[tr-stream call-0119:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  (old & 0x00FFFFFF | v << 24) >>> 0 : bo === 1 ? (old & 0x0000FFFF | v << 16) >>> 0 : bo === 2 ? (old & 0x000000FF | v << 8) >>> 0 : v); break; }\"\"\"\nnew_swr = \"\"\"case 46: { const a = (R[rs] + si) >>> 0, al = a & ~3, bo = a & 3, old = r32(al), v = R[rt]; w32(al, bo === 3 ? v : bo === 2 ? ((old & 0xFF000000) | (v & 0x00FFFFFF)) >>> 0 :
+[tr-stream call-0119:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  bo === 1 ? ((old & 0xFFFF0000) | (v & 0x0000FFFF)) >>> 0 : ((old & 0xFFFFFF00) | (v & 0x000000FF)) >>> 0); break; }\"\"\"\n\nreplacements = [\n    (old_lwl, new_lwl),\n    (old_lwr, new_lwr),\n    (old_swl, new_swl),\n    (old_swr, new_swr),\n]\n\nfor old, new in replacements:\n    if old in c:\n        c = c.replace(old, new)\n        print(f'Replaced: {old[:3
+[tr-stream call-0119:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 0]}...')\n    else:\n        print(f'NOT FOUND: {old[:30]}...')\n\nwith open('/app/vm.js', 'w') as f:\n    f.write(c)\nprint('Done')\nPYEOF\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "node -c /app/vm.js && echo 'Syntax OK'\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "grep 'case 34:\\|case 38:\\|case 42:\\|case 46:' /app/vm.js | head -4\n",
+      "duration": 0.1
+    }
+  ]
+}
+
+[tr-stream call-0119:worker:xiaomi/mimo-v2.5-pro-ultraspeed] worker.done finish=stop cost_microdollars=312501
+[tr-stream call-0119:xiaomi/mimo-v2.5-pro-ultraspeed] Found the bug - my lwl/lwr/swl/swr implementations are wrong for little-endian MIPS. These unaligned load/store instructions are critical for WAD file reading. Let me fix all four:
+
+{
+  "analysis": "The lwl/lwr/swl/swr instructions are implemented with big-endian byte ordering instead of little-endian. This corrupts WAD directory reads causing bad lump sizes. The fix requires rewriting all four instructions.",
+  "plan": "Fix lwl/lwr/swl/swr with correct LE byte ordering in vm.js and test.",
+  "commands": [
+    {
+      "keystrokes": "python3 << 'PYEOF'\nwith open('/app/vm.js', 'r') as f:\n    c = f.read()\n\n# Fix lwl (case 34)\nold_lwl = \"\"\"case 34: { const a = (R[rs] + si) >>> 0, al = a & ~3, bo = a & 3, mv = r32(al); R[rt] = bo === 0 ? mv : bo === 1 ? (R[rt] & 0xFF000000 | mv >>> 8) >>> 0 : bo === 2 ? (R[rt] & 0xFFFF0000 | mv >>> 16) >>> 0 : (R[rt] & 0xFFFFFF00 | mv >>> 24) >>> 0; break; }\"\"\"\nnew_lwl = \"\"\"case 34: { const a = (R[rs] + si) >>> 0, al = a & ~3, bo = a & 3, mv = r32(al); R[rt] = bo === 0 ? mv : bo === 1 ? ((mv & 0xFFFFFF00) | (R[rt] & 0xFF)) >>> 0 : bo === 2 ? ((mv & 0xFFFF0000) | (R[rt] & 0xFFFF)) >>> 0 : ((mv & 0xFF000000) | (R[rt] & 0x00FFFFFF)) >>> 0; break; }\"\"\"\n\n# Fix lwr (case 38)\nold_lwr = \"\"\"case 38: { const a = (R[rs] + si) >>> 0, al = a & ~3, bo = a & 3, mv = r32(al); R[rt] = bo === 0 ? (R[rt] & 0x00FFFFFF | mv << 24) >>> 0 : bo === 1 ? (R[rt] & 0x0000FFFF | mv << 16) >>> 0 : bo === 2 ? (R[rt] & 0x000000FF | mv << 8) >>> 0 : mv; break; }\"\"\"\nnew_lwr = \"\"\"case 38: { const a = (R[rs] + si) >>> 0, al = a & ~3, bo = a & 3, mv = r32(al); R[rt] = bo === 3 ? mv : bo === 2 ? ((R[rt] & 0xFF000000) | (mv & 0x00FFFFFF)) >>> 0 : bo === 1 ? ((R[rt] & 0xFFFF0000) | (mv & 0x0000FFFF)) >>> 0 : ((R[rt] & 0xFFFFFF00) | (mv & 0x000000FF)) >>> 0; break; }\"\"\"\n\n# Fix swl (case 42)\nold_swl = \"\"\"case 42: { const a = (R[rs] + si) >>> 0, al = a & ~3, bo = a & 3, old = r32(al), v = R[rt]; w32(al, bo === 0 ? v : bo === 1 ? (old & 0xFF000000 | v & 0x00FFFFFF) >>> 0 : bo === 2 ? (old & 0xFFFF0000 | v & 0x0000FFFF) >>> 0 : (old & 0xFFFFFF00 | v & 0x000000FF) >>> 0); break; }\"\"\"\nnew_swl = \"\"\"case 42: { const a = (R[rs] + si) >>> 0, al = a & ~3, bo = a & 3, old = r32(al), v = R[rt]; w32(al, bo === 0 ? v : bo === 1 ? ((v & 0xFFFFFF00) | (old & 0xFF)) >>> 0 : bo === 2 ? ((v & 0xFFFF0000) | (old & 0xFFFF)) >>> 0 : ((v & 0xFF000000) | (old & 0x00FFFFFF)) >>> 0); break; }\"\"\"\n\n# Fix swr (case 46)\nold_swr = \"\"\"case 46: { const a = (R[rs] + si) >>> 0, al = a & ~3, bo = a & 3, old = r32(al), v = R[rt]; w32(al, bo === 0 ? (old & 0x00FFFFFF | v << 24) >>> 0 : bo === 1 ? (old & 0x0000FFFF | v << 16) >>> 0 : bo === 2 ? (old & 0x000000FF | v << 8) >>> 0 : v); break; }\"\"\"\nnew_swr = \"\"\"case 46: { const a = (R[rs] + si) >>> 0, al = a & ~3, bo = a & 3, old = r32(al), v = R[rt]; w32(al, bo === 3 ? v : bo === 2 ? ((old & 0xFF000000) | (v & 0x00FFFFFF)) >>> 0 : bo === 1 ? ((old & 0xFFFF0000) | (v & 0x0000FFFF)) >>> 0 : ((old & 0xFFFFFF00) | (v & 0x000000FF)) >>> 0); break; }\"\"\"\n\nreplacements = [\n    (old_lwl, new_lwl),\n    (old_lwr, new_lwr),\n    (old_swl, new_swl),\n    (old_swr, new_swr),\n]\n\nfor old, new in replacements:\n    if old in c:\n        c = c.replace(old, new)\n        print(f'Replaced: {old[:30]}...')\n    else:\n        print(f'NOT FOUND: {old[:30]}...')\n\nwith open('/app/vm.js', 'w') as f:\n    f.write(c)\nprint('Done')\nPYEOF\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "node -c /app/vm.js && echo 'Syntax OK'\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "grep 'case 34:\\|case 38:\\|case 42:\\|case 46:' /app/vm.js | head -4\n",
+      "duration": 0.1
+    }
+  ]
+}

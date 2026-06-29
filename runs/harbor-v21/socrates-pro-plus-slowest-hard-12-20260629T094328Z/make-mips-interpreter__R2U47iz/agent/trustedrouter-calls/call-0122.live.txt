@@ -1,0 +1,84 @@
+
+[tr-stream call-0122:socrates:trustedrouter/socrates-pro-plus-1.0] socrates.started
+
+[tr-stream call-0122:worker:xiaomi/mimo-v2.5-pro-ultraspeed] worker.started
+[tr-thinking call-0122:worker:xiaomi/mimo-v2.5-pro-ultraspeed] The read/lseek trace didn't output anything, which means either:
+1. The trace code wasn't reached (file reads happen before R_Init)
+2. The `e.pos < 16` and `e.pos < 100` conditions are never met by the time of the bad Z_Malloc
+
+The bad Z_Malloc size 0x2d2d2c1c = ",,.,", which is an ASCII string! This means lumpinfo.size contains ASCII text instead of an integer. The WAD directory reading is corrupted.
+
+Let me trace the actual WAD loading - specifically the initial open and read of the WAD header and directory.
+[tr-thinking call-0122:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  The WAD directory is at a specific offset in the file and contains entries of 16 bytes each: 4 bytes offset, 4 bytes size, 8 bytes name.
+
+Actually, 0x2d2d2c1c = bytes 0x1c, 0x2c, 0x2d, 0x2d in LE. Let me check what this is in the doom.wad or what's happening.
+
+Wait - let me reconsider. The size 0x2d2d2c1c keeps changing each time:
+- First run: 420303204 = 0x190E
+[tr-thinking call-0122:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 5664
+- Second: 0x190D514C
+- Third: 0x2D2D2C1C
+
+The value changes every time, which means it's reading garbage/uninitialized memory, not just a wrong offset. This strongly suggests that the WAD directory entries were never properly loaded into the lumpinfo array.
+
+The issue could be:
+1. The initial WAD header read (12 bytes) returns wrong data
+2. The lseek to the directory offset returns wrong position
+3. The directory read itself is corrupted
+
+Let me trace the file I/O more broadly - especially the first few reads from
+[tr-thinking call-0122:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  the doom.wad fd.
+
+Actually, looking at the read trace condition: `e.pos < 16` - this only traces when pos < 16, but the condition is on the internal file position (e.p), not e.pos. Wait, I used e.pos but the variable is e.p in the actual read handler. Let me check...
+
+Looking at the read syscall handler:
+```
+case 0: { const e = FD.get(a0); if (e && e.t === 'f' && e.pos < 16) ...
+```
+But the actual position tracking uses `e.p` not `e.pos`. So the
+[tr-thinking call-0122:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  trace never fires because `e.pos` is undefined!
+
+Let me fix the trace and try again.
+
+Actually, I should just trace the WAD reads more carefully. The lumpinfo table at 0x4b05c4 contains pointers. Let me trace what's happening during W_InitMultipleFiles or the initial open/read of the WAD.
+
+Let me take a different approach - trace every syscall in the first few hundred calls to understand the boot sequence.
+[tr-stream call-0122:worker:xiaomi/mimo-v2.5-pro-ultraspeed] The value changes each run (0x190E5664, 0x2D2D2C1C), meaning uninitialized memory. The
+[tr-stream call-0122:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  WAD directory isn't being loaded properly. Let me fix my trace to use `e.p` instead of `e.pos`:
+
+{
+  "analysis": "The Z_Malloc size changes every run, meaning it's reading uninitialized memory. The trace didn't fire because I used `e.pos` instead of `e.p`. Let me fix the trace to properly log the first WAD reads.",
+  "plan": "Fix the trace and run again to see actual WAD I/O.",
+  "commands": [
+    {
+      "keystrokes": "python3 << 'PYEOF'\nwith open('/app/vm.js','r') as f: c=f.read()\n# Remove old broken trace and
+[tr-stream call-0122:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  add correct one\nc = c.replace(\n    \"case 0: { const e = FD.get(a0); if (e && e.t === 'f' && e.pos < 16) { console.error('read fd='+a0+' pos='+e.pos+' sz='+a2+' hostpos='+e.p); } if (!e || e.t === 's')\",\n    \"case 0: { const e = FD.get(a0); if (e && e.t === 'f' && a0 >= 3) { if (!e._traced) e._traced=0
+[tr-stream call-0122:worker:xiaomi/mimo-v2.5-pro-ultraspeed] ; if(e._traced<20){console.error('R fd='+a0+' p='+e.p+' n='+a2);e._traced++;} } if (!e || e.t === 's')\"\n)\nc = c.replace(\n    \"case 8: { const e = FD.get(a0); if (e && e.t === 'f' && e.pos < 100) { console.error('lseek fd='+a0+' off='+((a1<<0)>>0)+' wh='+a2); } if (!e || e.t !== 'f')\",\n    \"case 8: { const e = FD.get(a0); if (e && e.t === 'f' && a0 >=
+[tr-stream call-0122:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  3) { console.error('S fd='+a0+' o='+((a1<<0)>>0)+' w='+a2); } if (!e || e.t !== 'f')\"\n)\nwith open('/app/vm.js','w') as f: f.write(c)\nprint('Fixed trace')\nPYEOF\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "timeout 15 node vm.js > /tmp/trace3.txt 2>&1; grep -aE '^[RS] fd=|Z_Malloc' /tmp/trace3.txt | head
+[tr-stream call-0122:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  -30\n",
+      "duration": 20.0
+    }
+  ]
+}
+
+[tr-stream call-0122:worker:xiaomi/mimo-v2.5-pro-ultraspeed] worker.done finish=stop cost_microdollars=287189
+[tr-stream call-0122:xiaomi/mimo-v2.5-pro-ultraspeed] The value changes each run (0x190E5664, 0x2D2D2C1C), meaning uninitialized memory. The WAD directory isn't being loaded properly. Let me fix my trace to use `e.p` instead of `e.pos`:
+
+{
+  "analysis": "The Z_Malloc size changes every run, meaning it's reading uninitialized memory. The trace didn't fire because I used `e.pos` instead of `e.p`. Let me fix the trace to properly log the first WAD reads.",
+  "plan": "Fix the trace and run again to see actual WAD I/O.",
+  "commands": [
+    {
+      "keystrokes": "python3 << 'PYEOF'\nwith open('/app/vm.js','r') as f: c=f.read()\n# Remove old broken trace and add correct one\nc = c.replace(\n    \"case 0: { const e = FD.get(a0); if (e && e.t === 'f' && e.pos < 16) { console.error('read fd='+a0+' pos='+e.pos+' sz='+a2+' hostpos='+e.p); } if (!e || e.t === 's')\",\n    \"case 0: { const e = FD.get(a0); if (e && e.t === 'f' && a0 >= 3) { if (!e._traced) e._traced=0; if(e._traced<20){console.error('R fd='+a0+' p='+e.p+' n='+a2);e._traced++;} } if (!e || e.t === 's')\"\n)\nc = c.replace(\n    \"case 8: { const e = FD.get(a0); if (e && e.t === 'f' && e.pos < 100) { console.error('lseek fd='+a0+' off='+((a1<<0)>>0)+' wh='+a2); } if (!e || e.t !== 'f')\",\n    \"case 8: { const e = FD.get(a0); if (e && e.t === 'f' && a0 >= 3) { console.error('S fd='+a0+' o='+((a1<<0)>>0)+' w='+a2); } if (!e || e.t !== 'f')\"\n)\nwith open('/app/vm.js','w') as f: f.write(c)\nprint('Fixed trace')\nPYEOF\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "timeout 15 node vm.js > /tmp/trace3.txt 2>&1; grep -aE '^[RS] fd=|Z_Malloc' /tmp/trace3.txt | head -30\n",
+      "duration": 20.0
+    }
+  ]
+}

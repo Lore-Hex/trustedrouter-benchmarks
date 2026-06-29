@@ -1,0 +1,323 @@
+
+[tr-stream call-0100:socrates:trustedrouter/socrates-pro-plus-1.0] socrates.started
+
+[tr-stream call-0100:worker:xiaomi/mimo-v2.5-pro-ultraspeed] worker.started
+[tr-thinking call-0100:worker:xiaomi/mimo-v2.5-pro-ultraspeed] The instruction at 0x4029bc is `li a1,47` which is `addiu a1, zero, 47`. This is in a delay slot after a jal. The problem is that when we compile the block starting at 0x4029bc, we get the `li` instruction alone but the JIT doesn't handle it correctly.
+
+Wait, the issue is that the block starts at 0x4029bc which is the delay slot of a `jal` at 0x4029b8. The `jal` sets `npc` and `done=true`, so the delay slot at 0x4029bc is
+[tr-thinking call-0100:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  never compiled into the same block. When the block at 0x4029bc starts, it should just be `addiu a1, zero, 47`.
+
+Let me check - `li a1, 47` is encoded as `2405002f`. The opcode is 0x09 (addiu). rs=0 (zero), rt=5 (a1), imm=47. So the generated code would be:
+```
+R[5]=(R[0]+(47))>>>0;
+```
+Which should be fine...
+
+Actually wait, the issue might be with the `
+[tr-thinking call-0100:worker:xiaomi/mimo-v2.5-pro-ultraspeed] li` pseudo-instruction. `li a1, 47` could be encoded as `addiu a1, zero, 47` which is opcode 9, rs=0, rt=5, imm=47. That should generate `R[5]=(R[0]+(47))>>>0;` which is valid.
+
+Hmm, but maybe the issue is with an instruction that was already compiled in a previous block. The error says the JIT fails AT 0x4029bc, meaning the `cBlk(0x4029bc)` call returned null due to a `new Function` syntax error.
+
+Let
+[tr-thinking call-0100:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  me look more carefully. The block starting at 0x4029bc would be:
+- 0x4029bc: addiu a1, zero, 47 → R[5]=(R[0]+(47))>>>0;
+- 0x4029c0: addiu s2, v0, 1 → R[18]=(R[2]+(1))>>>0;
+- 0x4029c4: lui s3, 0x44 → R[19]=(67108864)>>>0;  ← wait, 
+[tr-thinking call-0100:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 0x44 << 16 = 0x440000 = 4456448
+- 0x4029c8: li s0, 0 → R[16]=(R[0]+(0))>>>0;
+- 0x4029cc: li s7, 224 → R[23]=(R[0]+(224))>>>0;
+
+These all look fine. Let me check what's actually generated.
+
+Actually, maybe the problem is that the `case 6` for srlv is generating bad
+[tr-thinking call-0100:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  code. Let me check:
+
+```
+case 6:L.push(w(rd,u(rt)+'>>>'+u(rs)+'&31)'));break;
+```
+
+This generates something like `R[rd]=(R[rt]>>>R[rs]&31)>>>0;`
+
+Wait, the parentheses are wrong! `R[rt]>>>R[rs]&31` is parsed as `(R[rt]>>>R[rs])&31` due to operator precedence. But the intended behavior is `R[rt]>>>(R[rs]&31)`. The closing `)` at the end is also wrong - there are mismatch
+[tr-thinking call-0100:worker:xiaomi/mimo-v2.5-pro-ultraspeed] ed parentheses.
+
+Let me check: `w(rd,u(rt)+'>>>'+u(rs)+'&31)')` expands to:
+`R[rd]=((R[rt]>>>0)>>>(R[rs]>>>0)&31)>>>0;`
+
+Wait, that's:
+`R[rd]=(R[rt]>>>R[rs]&31)>>>0;` 
+
+Hmm, the `u(rt)` is `(R[rt]>>>0)` and `u(rs)` is `(R[rs]>>>0)`. So the expression becomes:
+`R[rd]=((R[rt]>>>0)>>>(R[rs]>>>0)&31)>>>0;`
+
+The `)` at the end is from
+[tr-thinking call-0100:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  `u(rt)`'s closing paren, but then we have `>>>` followed by `(R[rs]>>>0)&31)` which has an extra `)` at the end. Let me count:
+
+`u(rt)+'>>>'+u(rs)+'&31)'` = `(R[rt]>>>0)>>>$(R[rs]>>>0)&31)`
+
+So it becomes: `(R[rt]>>>0)>>>(R[rs]>>>0)&31)`
+
+The parentheses are: `(R[rt]>>>0)` opens and closes, then `>>>`, then `(R[rs]>>>0
+[tr-thinking call-0100:worker:xiaomi/mimo-v2.5-pro-ultraspeed] )` opens and closes, then `&31)`. That extra `)` at the end is unmatched!
+
+This is the bug. The srlv case generates code with mismatched parentheses. It should be:
+```
+u(rt)+'>>>'+u(rs)+'&31)'  →  (R[rt]>>>0)>>>(R[rs]>>>0)&31)
+```
+
+There's an unmatched `)` at the end. The `wd()` wrapper adds `R[rd]=(...)>>>0;` around it, so we get:
+`R[rd]=((R[rt]>>>0)>>>(R[rs]>>>0)&31)>>>0;`
+
+Wait
+[tr-thinking call-0100:worker:xiaomi/mimo-v2.5-pro-ultraspeed] , `wd(rd, expr)` = `R[rd]=(expr)>>>0;` where expr is `(R[rt]>>>0)>>>(R[rs]>>>0)&31)`.
+
+So the full line is: `R[rd]=((R[rt]>>>0)>>>(R[rs]>>>0)&31))>>>0;`
+
+Hmm, let me count parens:
+1. `R[rd]=(`
+2. `(R[rt]>>>0)`  - balanced
+3. `>>>`
+4. `(R[rs]>>>0)` - balanced
+5. `&31)`
+6. `)>>>0;`
+
+So we have: `R[rd]=((R[rt]>>>0)>>>(
+[tr-thinking call-0100:worker:xiaomi/mimo-v2.5-pro-ultraspeed] R[rs]>>>0)&31))>>>0;`
+
+Opening parens: ( after =, then ( before R[rt], then ( before R[rs], then ) after >>>0 for R[rs], then &31), then )>>>0;
+
+That's 3 opens and 4 closes. Extra close paren!
+
+The fix should be to change the srlv line to properly parenthesize:
+```
+u(rt)+'>>>'+u(rs)+'&31)'
+```
+should be:
+```
+u(rt)+'>>>(('+u(rs+')&31)')
+```
+
+Wait, that's getting confusing. Let me think about this differently. The intent is:
+`R[rd] = (R[rt] >>> (R
+[tr-thinking call-0100:worker:xiaomi/mimo-v2.5-pro-ultraspeed] [rs] & 31)) >>> 0`
+
+Using `wd(rd, expr)`: `R[rd]=(expr)>>>0;` where expr should be `R[rt]>>>(R[rs]&31)`.
+
+Since `u(rt)` = `(R[rt]>>>0)` and `u(rs)` = `(R[rs]>>>0)`:
+
+The expression should be: `u(rt)+'>>>'+u(rs)+'&31)'` gives `(R[rt]>>>0)>>>(R[rs]>>>0)&31)`.
+
+But this has an extra `)` from the `&31)`. The issue is that
+[tr-thinking call-0100:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  `u(rs)` already has its own closing paren, and then `&31)` adds another one.
+
+The correct expression should be: `(R[rt]>>>0)>>>(R[rs]>>>0)&31)`
+
+Hmm, this evaluates as `((R[rt]>>>0)>>>(R[rs]>>>0))&31)` which is wrong.
+
+The correct expression using the u() helpers would be something like:
+`u(rt)+'>>>(('+u(rs)+')&31)'` → `(R[rt]>>>0)>>>((R[rs]>>>0)&31)`
+
+Then with wd: `R[rd]=((R
+[tr-thinking call-0100:worker:xiaomi/mimo-v2.5-pro-ultraspeed] [rt]>>>0)>>>((R[rs]>>>0)&31))>>>0;`
+
+That has: 4 opens ((()) and 4 closes (()()) - let me recount...
+
+`R[rd]=` then `(expr)>>>0;` where expr = `(R[rt]>>>0)>>>((R[rs]>>>0)&31)`
+
+Full: `R[rd]=((R[rt]>>>0)>>>((R[rs]>>>0)&31))>>>0;`
+
+Parens: ( ( ( ( ) ) ) )
+That's 4 opens and 4 closes. 
+
+But the current code generates `u(rt)+'>>>'+u(rs)+'&3
+[tr-thinking call-0100:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 1)'` which gives `(R[rt]>>>0)>>>(R[rs]>>>0)&31)`:
+Parens: ( ( ( ) ) ) - 3 opens, 3 closes for the inner expression.
+
+With wd wrapper: `R[rd]=((R[rt]>>>0)>>>(R[rs]>>>0)&31))>>>0;`
+Parens: ( ( ( ) ) ) ) - 4 opens, 5 closes. Unbalanced!
+
+So the fix is to change the srlv line. Actually, the simplest fix is to just use the full expression directly:
+
+For srlv, the expression should be `
+[tr-thinking call-0100:worker:xiaomi/mimo-v2.5-pro-ultraspeed] u(rt)+'>>>(('+u(rs)+')&31)'`
+
+Which gives: `(R[rt]>>>0)>>>((R[rs]>>>0)&31)`
+With wd: `R[rd]=((R[rt]>>>0)>>>((R[rs]>>>0)&31))>>>0;`
+
+This is correct! The parens balance: `((()))` → 4 open, 4 close. ✓
+
+Actually wait, let me re-read the original code:
+```
+case 6:L.push(w(rd,u(rt)+'>>>'+u(rs)+'&31)'));break;
+```
+
+`u(rt)+'>>>'+u(rs)+'&31)'`
+
+u
+[tr-thinking call-0100:worker:xiaomi/mimo-v2.5-pro-ultraspeed] (rt) = `(R[rt]>>>0)` → 1 open, 1 close
+`>>>` 
+u(rs) = `(R[rs]>>>0)` → 1 open, 1 close
+`&31)` → 1 close
+
+Total: 2 opens, 3 closes in the expression.
+
+With w(rd, expr) = `R[rd]=(expr)>>>0;`:
+`R[rd]=((R[rt]>>>0)>>>(R[rs]>>>0)&31)>>>0;`
+Opens: 2 (one from =, one from u(rt)), but wait, the opening
+[tr-thinking call-0100:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  paren is from w():
+`R[rd]=` + `(` + expr + `)>>>0;` where expr = `(R[rt]>>>0)>>>(R[rs]>>>0)&31)`
+
+So: `R[rd]=((R[rt]>>>0)>>>(R[rs]>>>0)&31))>>>0;`
+
+Open: ( ( ( → 3 opens (from w(), u(rt), u(rs))
+Close: ) ) ) ) → 4 closes (from u(rt), u(rs), &31), and the close from w())
+
+That's unbalanced: 3 opens vs 4 closes. 
+
+The fix:
+[tr-thinking call-0100:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  change `'&31)'` to `'&31)'` but wrap u(rs) differently.
+
+Actually the simplest fix: `u(rt)+'>>>'+u(rs)+'&31)'` should be `u(rt)+'>>>'+u(rs).replace('>>>0','>>>0')+'&31)'`... no that doesn't help.
+
+Let me think again. The expression we want is: `R[rt] >>> (R[rs] & 31)`.
+
+Using the u() function which returns `(R[x]>>>0)`:
+- `u(rt)` = `(R[rt]>>>0)`
+
+[tr-thinking call-0100:worker:xiaomi/mimo-v2.5-pro-ultraspeed] - We want: `(R[rt]>>>0) >>> ((R[rs]>>>0) & 31)`
+- Which is: `u(rt) + '>>>' + '(' + u(rs) + '&31)'`
+- Which gives: `(R[rt]>>>0)>>>((R[rs]>>>0)&31)`
+
+Then w(rd, that) gives: `R[rd]=((R[rt]>>>0)>>>((R[rs]>>>0)&31))>>>0;`
+Parens: `R[rd]=( (R[rt]>>>0)>>>((R[rs]>>>0)&31) )>>>0;`
+[tr-thinking call-0100:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  → 4 opens, 4 closes ✓
+
+So the fix is to change:
+```
+u(rt)+'>>>'+u(rs)+'&31)'
+```
+to:
+```
+u(rt)+'>>>'+'('+u(rs)+'&31)'
+```
+
+In the original JS source:
+```
+case 6:L.push(w(rd,u(rt)+'>>>'+'('+u(rs)+'&31)'));break;
+```
+
+Actually, let me simplify. The current code is:
+```
+case 6:L.push(w(rd,u(rt)+'>>>'+u(rs)+'&31)'));break;
+```
+
+I need to change it to:
+```
+case 6:L.push(w(rd,u(rt)+'
+[tr-thinking call-0100:worker:xiaomi/mimo-v2.5-pro-ultraspeed] >>>'+ '(' + u(rs)+'&31)'));break;
+```
+
+So `u(rt)+'>>>'+ '(' + u(rs)+'&31)'` → `(R[rt]>>>0)>>>((R[rs]>>>0)&31)`
+
+OK but there may be more issues like this. Let me also check the srav case:
+```
+case 7:L.push('R['+rd+']=('+s(rt)+'>>('+u(rs)+'&31))>>>0;');break;
+```
+
+This generates: `R[rd]=((R[rt]|0)>>(R[rs]>>>0&31))>>>0;`
+Parens: ( ( ( ) ) )
+[tr-thinking call-0100:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  → 3 opens, 3 closes ✓
+But precedence: `R[rs]>>>0&31` → `(R[rs]>>>0)&31` which is correct in JS.
+
+Hmm wait, `>>>` has higher precedence than `&`, so `R[rs]>>>0&31` = `(R[rs]>>>0)&31`. That's correct.
+
+But wait, the full expression is: `(R[rt]|0)>>(R[rs]>>>0&31)`. Inside the parens: `R[rs]>>>0&31` = `(R[rs]>>>0)&31` which might not be what we want. We want `
+[tr-thinking call-0100:worker:xiaomi/mimo-v2.5-pro-ultraspeed] R[rs]&31`, not `(R[rs]>>>0)&31`.
+
+Actually, `(R[rs]>>>0)&31` is the same as `R[rs]&31` for the lower 5 bits, so it's fine.
+
+OK, the main issue is the srlv case. Let me also look for other paren issues in the code.
+
+Looking at case 4 (sllv):
+```
+case 4:L.push(w(rd,u(rt)+'<<('+u(rs)+'&31)'));break;
+```
+u(rt)+'<<('+u(rs)+'&31)' → `(R[rt]
+[tr-thinking call-0100:worker:xiaomi/mimo-v2.5-pro-ultraspeed] >>>0)<<((R[rs]>>>0)&31)`
+With w: `R[rd]=((R[rt]>>>0)<<((R[rs]>>>0)&31))>>>0;`
+Parens: `((()()))` → 4 opens, 4 closes ✓
+
+Wait: `u(rt)+'<<('+u(rs)+'&31)'`
+- `u(rt)` = `(R[rt]>>>0)` → 1 open, 1 close
+- `<<(`
+- `u(rs)` = `(R[rs]>>>0)` → 1 open, 1 close  
+- `&31)` → 1 close
+
+Total expression: `(R[rt]>>>0)<<((R[rs]>>>0)&31
+[tr-thinking call-0100:worker:xiaomi/mimo-v2.5-pro-ultraspeed] )` 
+Open: 3, Close: 3. 
+
+With w(): `R[rd]=((R[rt]>>>0)<<((R[rs]>>>0)&31))>>>0;`
+Open: 4, Close: 4 ✓
+
+OK, so sllv is fine. The issue is only with srlv where there's no opening `(` before u(rs).
+
+So the fix for srlv:
+```
+case 6:L.push(w(rd,u(rt)+'>>>'+u(rs)+'&31)'));break;
+```
+should be:
+```
+case 6:L.push(w(rd,u(rt)+'>>>'+'('+u(rs)+'&31)'));break;
+```
+
+Let me also think
+[tr-thinking call-0100:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  about whether there are any other syntax issues that could cause problems at runtime.
+
+Actually, I just realized - the error is `Unexpected token ')'`. This is a *syntax* error in the generated function code, which means the generated code has unbalanced parens. The srlv bug is the most likely cause.
+
+Let me fix this in the file.
+[tr-stream call-0100:worker:xiaomi/mimo-v2.5-pro-ultraspeed] The issue is a mismatched parenthesis in the srlv (case 6) instruction. Let me fix it:
+
+{
+  "analysis": "The srlv (case 6) generates code with mismatched parentheses: `u(rt)+'>>>'+u(rs)+'&31)'` has an extra closing paren. Need to add an
+[tr-stream call-0100:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  opening paren before u(rs).",
+  "plan": "Fix the srlv parenthesis and test.",
+  "commands": [
+    {
+      "keystrokes": "python3 << 'PYEOF'\nwith open('/app/vm.js','r') as f:\n    c = f.read()\nold = \"case 6:L.push(w(rd,u(rt)+'>>>'+u(rs)+'&31)'));break;\"\nnew = \"case 6:L.push(w(rd,u(rt)+'>>>'+'('+u(rs)+'&31)'));break;\"\nc = c.replace(old, new)\nwith open('/app/vm.js','w') as f:\n    f.write(c)\nprint('Fixed s
+[tr-stream call-0100:worker:xiaomi/mimo-v2.5-pro-ultraspeed] rlv')\nPYEOF\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "grep 'case 6:L.push' /app/vm.js\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "timeout 120 node vm.js > /tmp/jit2.txt 2>&1 &\nsleep 10 && tail -5 /tmp/jit2.txt\n",
+      "duration": 15.0
+    }
+  ]
+}
+
+[tr-stream call-0100:worker:xiaomi/mimo-v2.5-pro-ultraspeed] worker.done finish=stop cost_microdollars=248881
+[tr-stream call-0100:xiaomi/mimo-v2.5-pro-ultraspeed] The issue is a mismatched parenthesis in the srlv (case 6) instruction. Let me fix it:
+
+{
+  "analysis": "The srlv (case 6) generates code with mismatched parentheses: `u(rt)+'>>>'+u(rs)+'&31)'` has an extra closing paren. Need to add an opening paren before u(rs).",
+  "plan": "Fix the srlv parenthesis and test.",
+  "commands": [
+    {
+      "keystrokes": "python3 << 'PYEOF'\nwith open('/app/vm.js','r') as f:\n    c = f.read()\nold = \"case 6:L.push(w(rd,u(rt)+'>>>'+u(rs)+'&31)'));break;\"\nnew = \"case 6:L.push(w(rd,u(rt)+'>>>'+'('+u(rs)+'&31)'));break;\"\nc = c.replace(old, new)\nwith open('/app/vm.js','w') as f:\n    f.write(c)\nprint('Fixed srlv')\nPYEOF\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "grep 'case 6:L.push' /app/vm.js\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "timeout 120 node vm.js > /tmp/jit2.txt 2>&1 &\nsleep 10 && tail -5 /tmp/jit2.txt\n",
+      "duration": 15.0
+    }
+  ]
+}

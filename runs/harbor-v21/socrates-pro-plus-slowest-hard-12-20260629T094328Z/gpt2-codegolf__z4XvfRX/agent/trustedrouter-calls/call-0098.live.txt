@@ -1,0 +1,409 @@
+
+[tr-stream call-0098:socrates:trustedrouter/socrates-pro-plus-1.0] socrates.started
+
+[tr-stream call-0098:worker:xiaomi/mimo-v2.5-pro-ultraspeed] worker.started
+[tr-thinking call-0098:worker:xiaomi/mimo-v2.5-pro-ultraspeed] The interleaved QKV layout didn't help either. Let me think more carefully about what could be wrong.
+
+The key observation is that with the standard layout (wte, wpe, layers, lnf), [in,out] weights, and no gamma+1, I get logit=46.11 for token "stereotypical" (46107). This is extremely high and not the right token.
+
+Let me think about what could cause this systematically. The logits are too confident, suggesting the model is amplifying a specific direction too much.
+
+Key diagnostic data:
+- emb rms: 0.150 (reasonably normal)
+- layer 0 ln1 rms: 0.195 (normal for layer norm output)
+- layer 0 post-attn
+[tr-thinking call-0098:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  rms: 1.830 (blowing up)
+- layer 0 post-mlp rms: 3.841 (further blowing up)
+
+The RMS blows up after attention. This suggests the attention output is too large, which could mean:
+1. The attention weights are wrong (wrong indexing)
+2. The output projection weights are wrong
+
+Wait - let me reconsider the diagnostic output from probe.c:
+```
+@39383808 (layer0 start): 0.0126 0.1113 -0.0190 -0.0797
+```
+
+These values (avg ~0.015
+[tr-thinking call-0098:worker:xiaomi/mimo-v2.5-pro-ultraspeed] ) at offset 39383808 (which is wte_size + wpe_size) look like they could be layer norm bias or gamma values, but they're very small.
+
+But I also found:
+```
+gamma? at offset 2364672 (3079*768): avg|v|=0.8678 vals: 0.1310 0.2093 0.2066 1.2542
+```
+
+This is at offset 2364672 which is 3079*768. Let me check: 3079 =
+[tr-thinking call-0098:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  4*768 - 1 = 3072 - 1. Hmm, that's close to 4*768 = 3072. So offset 2364672 = (4*768-1)*768 = (3071)*768. That's a single 768 block at offset 3071*768.
+
+Wait, but we calculated that the first possible gamma-like block was at this location. Let me check what this means in terms of the file layout.
+
+The file is:
+- wte:
+[tr-thinking call-0098:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  50257*768 = 38597376 floats starting at 0
+- wpe: 1024*768 = 786432 floats starting at 38597376
+- layers start at 38597376 + 786432 = 39383808
+
+So offset 2364672 is within wte! Not in the layers at all. The only gamma-like block found in the ENTIRE file was at an
+[tr-thinking call-0098:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  offset of 2364672 floats, which is at position 2364672*4 = 9458688 bytes = 9.0 MB into the file. This is well within the wte embedding matrix.
+
+This means... the layer norm gammas in this checkpoint are all very small (close to 0). They're NOT stored as gamma-1 (which would make values around 0 also incorrect for gammas near 1). The layer norm gammas genuinely have avg |value| ~ 0.01-0.1.
+
+This is bizarre unless... this is a checkpoint where layer norm parameters are
+[tr-thinking call-0098:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  stored with a very different scale, or perhaps the layer norms use a different parameterization entirely.
+
+Wait, I just realized something. What if this isn't actually a GPT-2 checkpoint but rather a checkpoint from a different model or a different format entirely? The user said "I have downloaded the gpt-2 weights stored as a TF .ckpt" but the format could be a specific conversion.
+
+Actually, let me reconsider. The file size is 497759232 bytes = 124439808 floats. This exactly matches GPT-2 124M's parameter count.
+[tr-thinking call-0098:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  So the weights ARE there.
+
+But what if the checkpoint uses a different normalization? What if it's RMS LayerNorm instead of LayerNorm? RMS LayerNorm doesn't have a mean subtraction - it just divides by RMS. In that case, the formula would be:
+```
+output = x / rms(x) * gamma + beta
+```
+
+But GPT-2 uses standard LayerNorm, not RMS LayerNorm.
+
+Hmm, let me think about this differently. The layer norm gamma values with avg |v| ~ 0.01-0.1 - what if these are actually not gamma but something else? What if the file format stores them in
+[tr-thinking call-0098:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  a completely different order than what I've been assuming?
+
+Actually, I realize I should check the llm.c format more carefully. In llm.c's train_gpt2.py, the parameter names and their order in the state dict would be:
+```python
+transformer.wte.weight  # [V, C]
+transformer.wpe.weight  # [1024, C]
+transformer.h.0.ln_1.weight  # [C]
+transformer.h.0.ln_1.bias  # [C]
+transformer.h.0.attn.c_attn.weight  # [3C, C] - note: PyTorch stores as [out, in]
+transformer.h.0.attn.c_attn.bias
+[tr-thinking call-0098:worker:xiaomi/mimo-v2.5-pro-ultraspeed]   # [3C]
+transformer.h.0.attn.c_proj.weight  # [C, C]
+transformer.h.0.attn.c_proj.bias  # [C]
+transformer.h.0.ln_2.weight  # [C]
+transformer.h.0.ln_2.bias  # [C]
+transformer.h.0.mlp.c_fc.weight  # [4C, C]
+transformer.h.0.mlp.c_fc.bias  # [4C]
+transformer.h.0.mlp.c_proj.weight  # [C, 4C]
+transformer.h.0.mlp.c_proj.bias  # [C]
+...
+transformer.ln_f.weight  # [C]
+transformer.ln_f.bias  # [C]
+```
+
+But wait - the MLP
+[tr-thinking call-0098:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  dimension should be 4*C = 3072, which matches F=3072. That's correct.
+
+Now, in the train_gpt2.py code, the weights are stored as PyTorch tensors with [out, in] shape for linear layers. So:
+- c_attn.weight is [3*768, 768] = [2304, 768]
+- c_proj.weight is [768, 768]
+- c_fc.weight is [3072, 768]
+- c_proj.weight is [768, 3072]
+
+When flattened, a [out
+[tr-thinking call-0098:worker:xiaomi/mimo-v2.5-pro-ultraspeed] , in] matrix becomes: row0_col0, row0_col1, ..., row0_col(in-1), row1_col0, ...
+
+So for c_attn.weight [2304, 768], accessing output neuron j, input i would be: weight[j * 768 + i]
+
+This means for the matrix multiply: output[j] = sum_over_i(input[i] * weight[j * C + i]) + bias[j]
+
+This is the [out, in] format, which is what I've been calling wm=1 in my tests! And the layer norm weights ARE just standard gamma (not gamma-1).
+
+But
+[tr-thinking call-0098:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  wait - when I use wm=1, I get logit=11.56 for "Rover" which is still wrong. And the layer norm gamma values have avg |v| ~ 0.1, which for actual gammas near 1.0 would be way too small.
+
+Unless... the gamma values genuinely ARE small? In GPT-2, after training, the layer norm gammas can have values distributed around 1.0, not 0.1. But what if this is a different checkpoint format where the gammas have been transformed?
+
+Actually, let me reconsider. What if the llm.c format stores wte LAST (at the end of the file)? In
+[tr-thinking call-0098:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  train_gpt2.py, the parameter order in the state dict might put wte at the end.
+
+Or more importantly - what if this checkpoint uses a DIFFERENT weight ordering than alphabetical? Many TF-to-PT converters iterate variables in different orders.
+
+Actually, I think I should try another approach. Let me compute the actual parameter offsets using the grouped-by-type format but with the correct PyTorch parameter name order from train_gpt2.py, where all ln1 weights come first, then all ln1 biases, etc. That's the llm.c format.
+
+But I already tried that and got alternating tokens (mayhem,
+[tr-thinking call-0098:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  stereotypical, imped...). Let me think about what was wrong with that attempt.
+
+Actually, looking at the brute force results more carefully:
+- `wo=0 gm=0 wm=0 lm=0`: logit=46.11 "stereotypical" - standard order, [in,out], direct gamma, wte first
+- `wo=0 gm=0 wm=1 lm=0`: logit=11.56 "Rover" - standard order, [out,in], direct gamma, wte first
+
+And the grouped layout with wm=0 gave logit=46.11 and wm=1 gave logit=8.12.
+
+The wm=1 (out,in) results have
+[tr-thinking call-0098:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  lower logits (closer to reasonable), which suggests the weights ARE in [out,in] format. But the output is still wrong.
+
+The problem might be that while the individual layer processing is approximately right (no exploding/vanishing), the specific weight layout within each layer block is wrong. Maybe the parameter ordering within each layer isn't what I think.
+
+Let me think about this from the opposite direction. What if I use a brute-force approach but for the PER-LAYER parameter ordering within the standard layout?
+
+For the standard layout (wte, wpe, layers, lnf), with [out,in] weights, the question is: what order are the 14 parameter blocks within each layer?
+
+Possible orderings of
+[tr-thinking call-0098:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  {ln1_g, ln1_b, attn_w, attn_b, proj_w, proj_b, ln2_g, ln2_b, fc_w, fc_b, fcproj_w, fcproj_b}:
+1. picoGPT: ln1_g, ln1_b, attn_w, attn_b, proj_w, proj_b, ln2_g, ln2_b, fc_w, fc_b, fcproj_w, fcproj_b
+2. TF alpha (bias first): attn_b, attn_w, fc_b, fc_w, fcproj_b, fcproj_w, ln1_b, ln1_g, ln2_b, ln2_g, proj_b, proj_w
+3. TF alpha (weight first): attn_w, attn_b, fc_w, fc
+[tr-thinking call-0098:worker:xiaomi/mimo-v2.5-pro-ultraspeed] _b, fcproj_w, fcproj_b, ln1_w, ln1_b, ln2_w, ln2_b, proj_w, proj_b
+4. llm.c: ln1_w, ln1_b, attn_w, attn_b, proj_w, proj_b, ln2_w, ln2_b, fc_w, fc_b, fcproj_w, fcproj_b
+
+I've tested 1, 2 (bias-first TF alpha), 3, and 4. None work.
+
+But wait - there's another possibility. In the OpenAI TF checkpoint, the variables are stored with specific full paths. Let me think about what alphabetical ordering would
+[tr-thinking call-0098:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  produce:
+
+For layer h, the TF variable names would be:
+- model/h0/attn/c_attn/b:0
+- model/h0/attn/c_attn/w:0
+- model/h0/attn/c_proj/b:0
+- model/h0/attn/c_proj/w:0
+- model/h0/ln_1/b:0
+- model/h0/ln_1/g:0
+- model/h0/ln_2/b:0
+- model/h0/ln_2/g:0
+- model/h0/mlp/c_fc/b:0
+- model/h0/mlp/c_fc/w:0
+
+[tr-thinking call-0098:worker:xiaomi/mimo-v2.5-pro-ultraspeed] - model/h0/mlp/c_proj/b:0
+- model/h0/mlp/c_proj/w:0
+
+So TF alphabetical is: attn_c_attn_b, attn_c_attn_w, attn_c_proj_b, attn_c_proj_w, ln_1_b, ln_1_g, ln_2_b, ln_2_g, mlp_c_fc_b, mlp_c_fc_w, mlp_c_proj_b, mlp_c_proj_w
+
+Wait! I've been testing "TF alpha" but I may have had the wrong ordering. Let me verify:
+
+Attn has c_attn and c_proj. Alphabetically, c_attn < c_proj.
+MLP has c_fc and c_proj. Alphabetically, c_fc < c_proj.
+Between
+[tr-thinking call-0098:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  attn and ln_1: 'a' < 'l', so attn comes first.
+Between ln_1 and ln_2: ln_1 < ln_2.
+Between ln_2 and mlp: 'l' < 'm', so ln comes first.
+
+So the order is:
+1. attn/c_attn/b [3C]
+2. attn/c_attn/w [C, 3C]  (or [3C, C])
+3. attn/c_proj/b [C]
+4. attn/c_proj/w [C, C] (or [C, C])
+5. ln_1/b [C]
+6. ln_1/g [C]
+7. ln_2/b [C]
+8.
+[tr-thinking call-0098:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  ln_2/g [C]
+9. mlp/c_fc/b [F]
+10. mlp/c_fc/w [C, F] (or [F, C])
+11. mlp/c_proj/b [C]
+12. mlp/c_proj/w [F, C] (or [C, F])
+
+This is EXACTLY what I tested as "TF alpha bias-first" (lm=1 in my brute.c). Let me double-check my per-layer layout in the brute.c code:
+
+```c
+else{aw=p;p+=C*3*C;ab=p;p+=3*C;ow=p;p+=C*C
+[tr-thinking call-0098:worker:xiaomi/mimo-v2.5-pro-ultraspeed] ;ob=p;p+=C;g1=p;p+=C;b1=p;p+=C;g2=p;p+=C;b2=p;p+=C;fw=p;p+=C*F;fb=p;p+=F;pw=p;p+=F*C;pb=p;p+=C;}
+```
+
+Wait, this starts with aw (weight) before ab (bias). But TF alphabetical would have bias before weight! So my lm=1 was:
+1. aw = attn_w [C*3C]
+2. ab = attn_b [3C]
+3. ow = proj_w [C*C]
+4. ob = proj_b [C]
+5. b1 = ln1_b [C]
+6. g1 = ln1_g
+[tr-thinking call-0098:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  [C]
+7. b2 = ln2_b [C]
+8. g2 = ln2_g [C]
+9. fb = fc_b [F]
+10. fw = fc_w [C*F]
+11. pb = fcproj_b [C]
+12. pw = fcproj_w [F*C]
+
+But the TF alphabetical should be:
+1. ab = attn_b [3C]
+2. aw = attn_w [3C*C]
+3. ob = proj_b [C]
+4. ow = proj_w [C*C]
+5. b1 = ln1_b [C]
+6. g1 = ln1_g [C]
+7. b2 = ln2_b [C]
+8. g2 = ln2_g [C]
+9. fb = fc_b [F]
+10. fw = fc_w [F*C]
+1
+[tr-thinking call-0098:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 1. pb = fcproj_b [C]
+12. pw = fcproj_w [C*F]
+
+My lm=1 was WRONG! It had weight before bias. Let me fix this and test. The correct TF alphabetical per-layer order has bias BEFORE weight for all parameters.
+
+Wait, let me re-check. Looking at the TF names:
+- attn/c_attn/b - bias for attention
+- attn/c_attn/w - weight for attention
+
+In TF, 'b' < 'w', so bias comes first. That's the key!
+
+Also for the file layout - are layers at offset 0 or at 3938
+[tr-thinking call-0098:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 3808?
+
+I should test: layers at 39383808 (standard), with correct TF-alpha per-layer order (bias-before-weight), with [out,in] weights, direct gamma.
+
+This is a NEW combination I haven't tested correctly!
+
+Let me also verify - the actual order would be:
+For standard layout (wte first, wpe second):
+- wte: offset 0
+- wpe: offset 50257*768 = 38597376
+- layers start at: 38597376 + 1024*768 = 39383808
+
+[tr-thinking call-0098:worker:xiaomi/mimo-v2.5-pro-ultraspeed] - Per layer: ab(3C), aw(C*3C), ob(C), ow(C*C), b1(C), g1(C), b2(C), g2(C), fb(F), fw(C*F), pb(C), pw(F*C)
+- lnf at end
+
+Let me verify the total: 12 * (3C + C*3C + C + C*C + C + C + C + C + F + C*F + C + F*C) + 2C
+= 12 * (3*768 + 768*3*768 + 76
+[tr-thinking call-0098:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 8 + 768*768 + 768 + 768 + 768 + 768 + 3072 + 768*3072 + 768 + 3072*768) + 2*768
+= 12 * (2304 + 1769472 + 768 + 589824 + 768 + 768 + 768 + 768 + 3072 + 2359296 + 768 + 2359296) + 1536
+= 12 * (2
+[tr-thinking call-0098:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 304 + 1769472 + 768 + 589824 + 768*4 + 3072 + 2359296 + 768 + 2359296) + 1536
+
+Let me add these up:
+2304 + 1769472 = 1771776
+1771776 + 768 = 1772544
+1772544 + 589824 = 2362368
+2362368 + 3
+[tr-thinking call-0098:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 072 = 2365440
+2365440 + 768 = 2366208
+2366208 + 768 = 2366976
+2366976 + 768 = 2367744
+2367744 + 3072 = 2370816
+2370816 + 2359296 = 4730112
+4730112 + 768 = 4730880
+4730880 + 2359296 = 7090176
+
+Hmm,
+[tr-thinking call-0098:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  that's 7090176 per layer. But the expected per-layer total is 7087872.
+
+Difference: 7090176 - 7087872 = 2304.
+
+The expected per-layer total was: C + C + C*3C + 3C + C*C + C + C + C + C*F + F + F*C + C = 768 + 768 + 1769472 + 2304 + 589824 + 768 + 768 + 768 + 2359296 + 3072 + 2359296 + 768 =
+[tr-thinking call-0098:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  ?
+
+Let me recalculate more carefully:
+ln1_g(C) + ln1_b(C) = 1536
+attn_w(C*3C) = 1769472
+attn_b(3C) = 2304
+proj_w(C*C) = 589824
+proj_b(C) = 768
+ln2_g(C) + ln2_b(C) = 1536
+fc_w(C*F) = 2359296
+fc_b(F) = 3072
+fcproj_w(F*C) = 2359296
+fcproj
+[tr-thinking call-0098:worker:xiaomi/mimo-v2.5-pro-ultraspeed] _b(C) = 768
+Total = 1536 + 1769472 + 2304 + 589824 + 768 + 1536 + 2359296 + 3072 + 2359296 + 768 = 7087872
+
+Now with TF alphabetical order:
+attn_b(3C) = 2304
+attn_w(C*3C) = 1769472
+proj_b(C) = 768
+proj_w(C*C) = 589824
+
+[tr-thinking call-0098:worker:xiaomi/mimo-v2.5-pro-ultraspeed] ln1_b(C) = 768
+ln1_g(C) = 768
+ln2_b(C) = 768
+ln2_g(C) = 768
+fc_b(F) = 3072
+fc_w(C*F) = 2359296
+fcproj_b(C) = 768
+fcproj_w(F*C) = 2359296
+Total = 2304 + 1769472 + 768 + 589824 + 768 + 768 + 768 + 768 + 3072 + 2359296 + 768 + 2359296 = ?
+
+Let me add: 2304
+[tr-thinking call-0098:worker:xiaomi/mimo-v2.5-pro-ultraspeed] +1769472=1771776, +768=1772544, +589824=2362368, +768=2363136, +768=2363904, +768=2364672, +768=2365440, +3072=2368512, +2359296=4727808, +768=4728576, +2359296=7087872
+
+7087872!
+[tr-thinking call-0098:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  That's correct!
+
+OK so this confirms the total is correct with this ordering. Now the question is whether this is the right layout or not.
+
+But wait - I already tested this exact ordering (as lm=1 in my brute force). Let me check... In my brute.c code, lm=1 was:
+
+```c
+aw=p;p+=C*3*C;ab=p;p+=3*C;ow=p;p+=C*C;ob=p;p+=C;g1=p;p+=C;b1=p;p+=C;g2=p;p+=C;b2=p;p+=C;fw=p;p+=C*F;fb=p
+[tr-thinking call-0098:worker:xiaomi/mimo-v2.5-pro-ultraspeed] ;p+=F;pw=p;p+=F*C;pb=p;p+=C;
+```
+
+This is: attn_w, attn_b, proj_w, proj_b, ln1_g, ln1_b, ln2_g, ln2_b, fc_w, fc_b, fcproj_w, fcproj_b
+
+But the TF alphabetical should be: attn_b, attn_w, proj_b, proj_w, ln1_b, ln1_g, ln2_b, ln2_g, fc_b, fc_w, fcproj_b, fcproj_w
+
+My lm=1 was WRONG! It has weight before bias, and gamma before beta. The correct TF alphabetical has bias before weight, and beta before gamma.
+
+This is a
+[tr-thinking call-0098:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  combination I've never correctly tested! Let me write this specific test.
+
+Actually, now I need to decide: with this ordering and [in,out] or [out,in] weights?
+
+GPT-2's TF model uses conv1d, which stores weights as [in, out]. When converted to a flat dump, this would be [in_features, out_features] in row-major order.
+
+But wait - if the checkpoint was created using train_gpt2.py from llm.c, then it stores PyTorch weights where Linear layers use [out, in] format.
+
+I need to figure out which converter was used. Since the user says "I have downloaded the gpt-2 weights stored as a
+[tr-thinking call-0098:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  TF .ckpt", this is likely a TF checkpoint that was converted. The question is: was it converted to a flat binary dump directly from TF (keeping [in, out] conv1d format), or was it converted through PyTorch first (getting [out, in] format)?
+
+Since I can't determine this definitively, let me test both.
+
+Actually, let me try the correct TF alphabetical order with both weight formats and both gamma modes. Let me be very precise about the ordering:
+
+TF alphabetical (per layer):
+1. attn/c_attn/b [3C] = attn_bias
+2. attn/c_attn/w [C,
+[tr-thinking call-0098:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  3C] or [3C, C] = attn_weight
+3. attn/c_proj/b [C] = proj_bias
+4. attn/c_proj/w [C, C] = proj_weight
+5. ln_1/b [C] = ln1_bias
+6. ln_1/g [C] = ln1_gamma
+7. ln_2/b [C] = ln2_bias
+8. ln_2/g [C] = ln2_gamma
+9. mlp/c_fc/b [F] = fc_bias
+10. mlp/c_fc/w [C, F] or [F, C] = fc_weight
+11. mlp/c_proj/b [C] = fcproj_bias
+[tr-thinking call-0098:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 
+12. mlp/c_proj/w [F, C] or [C, F] = fcproj_weight
+
+I need to test this very carefully. Let me write the definitive test.
+[tr-stream call-0098:worker:xiaomi/mimo-v2.5-pro-ultraspeed] I just realized my "TF alphabetical" lm=1 in the brute force had weight-before-bias, which is WRONG. The correct TF alphabetical order has bias-before-weight and beta-before-gamma. This is a combination I've never correctly tested!
+
+{
+  "analysis": "My previous TF alphabetical tests were wrong - they had weight before bias. The correct TF alphabetical per-layer order is: attn_b, attn_w, proj_b, proj_w, ln1_b, ln1_g, ln2_b, ln2_g, fc_b, fc_w, fcproj_b, fcproj_w. This
+[tr-stream call-0098:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  has NEVER been correctly tested!",
+  "plan": "Write a test with the correct TF alphabetical ordering (bias-before-weight, beta-before-gamma), testing both weight orientations and gamma modes.",
+  "commands": [
+    {
+      "keystrokes": "cat > /app/correct.c << 'CEOF'\n#include<stdio.h>\n#include<stdlib.h>\n#include<string.h>\n#include<math.h>\n#define C 768\n#define H 12\n#define D 64\n#define F 3072\n#define V 50257\n#define NM 50000\n#define Z 
+[tr-stream call-0098:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 131071\nfloat*W;int tk[1024],nt,bt[256];char ts[V][32];int tl[V],th[Z],tn[Z],mh[Z],mn[Z],ml[NM],mr[NM];\nunsigned char rb[V][32];int rl[V];\nunsigned hf(const char*s,int n){unsigned h=5381;for(int i=0;i<n;i++)h=h*33+(unsigned char)s[i];return h%Z;}\nvoid ti(int i){unsigned h=hf(ts[i],tl[i]);tn[i]=th[h];th[h]=i;}\nint tf(const char*s,int n){unsigned h=hf(s,n);for(int i=th[h];i>=0
+[tr-stream call-0098:worker:xiaomi/mimo-v2.5-pro-ultraspeed] ;i=tn[i])if(tl[i]==n&&!memcmp(ts[i],s,n))return i;return-1;}\nunsigned mhash(int l,int r){return((unsigned)l*V+r)%Z;}\nint mf(int l,int r){unsigned h=mhash(l,r);for(int i=mh[h];i>=0;i=mn[i])if(ml[i]==l&&mr[i]==r)return i;return-1;}\nvoid mi(int i){unsigned h=mhash(ml[i],mr[i]);mn[i]=mh[h];mh[h]=i;}\nvoid lb(char*p){memset(th,-1,sizeof(th));memset(mh,-1,sizeof(mh));unsigned s[256];int n=0;\nfor(int i=0;i<256;i++)if((i>=33&&i<=
+[tr-stream call-0098:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 126)||(i>=161&&i<=172)||(i>=174&&i<=255))s[i]=i;else s[i]=256+n++;\nfor(int b=0;b<256;b++){int q=0;for(int j=0;j<256;j++)if(s[j]<s[b])q++;bt[b]=q;}\nfor(int b=0;b<256;b++){int t=bt[b];unsigned c=s[b];rb[t][0]=b;rl[t]=1;\nif(c<128){ts[t][0]=c;tl[t]=1;}else if(c<2048){ts[t][0]=0xC0|(c>>6);ts[t][1]=0x80|(c&63
+[tr-stream call-0098:worker:xiaomi/mimo-v2.5-pro-ultraspeed] );tl[t]=2;}\nelse{ts[t][0]=0xE0|(c>>12);ts[t][1]=0x80|((c>>6)&63);ts[t][2]=0x80|(c&63);tl[t]=3;}ti(t);}\nFILE*f=fopen(p,\"r\");char ln[256];fgets(ln,256,f);int x=0;\nwhile(fgets(ln,256,f)&&x<NM){int l=strlen(ln);if(ln[l-1]=='\\n')ln[--l]=0;int sp=-1;\nfor(int i=0;i<l;i++)if(ln[i]==' '){sp=i;break;}if(sp<0)continue;\nint li=tf(ln,sp),ri=tf(ln+sp+
+[tr-stream call-0098:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 1,l-sp-1);if(li<0||ri<0)continue;\nml[x]=li;mr[x]=ri;int a=tl[li];memcpy(ts[256+x],ts[li],a);\nmemcpy(ts[256+x]+a,ts[ri],tl[ri]);tl[256+x]=a+tl[ri];\nmemcpy(rb[256+x],rb[li],rl[li]);memcpy(rb[256+x]+rl[li],rb[ri],rl[ri]);\nrl[256+x]=rl[li]+rl[ri];ti(256+x);mi(x);x++;}fclose(f);}\nint tokenize(char*t,int*o){int n=strlen(t);for(int i=0;i<n;i++)o[i]=bt
+[tr-stream call-0098:worker:xiaomi/mimo-v2.5-pro-ultraspeed] [(unsigned char)t[i]];\nwhile(1){int bs=NM,bp=-1;for(int i=0;i<n-1;i++){int r=mf(o[i],o[i+1]);if(r>=0&&r<bs){bs=r;bp=i;}}\nif(bp<0)break;o[bp]=256+bs;memmove(o+bp+1,o+bp+2,(n-bp-2)*sizeof(int));n--;}return n;}\nfloat sc[1024];\nfloat G(float x){return.5f*x*(1+tanhf(.7978845608f*(x+.044715f*x*x*x)));}\nfloat lo[2];\nvoid run
+[tr-stream call-0098:worker:xiaomi/mimo-v2.5-pro-ultraspeed] (int gm,int wm){\nfloat*wte=W,*wpe=W+V*C,*p=wpe+1024*C;\nfloat gm1=gm?1.0f:0.0f;\nfloat*x=calloc(1024*C,sizeof(float)),*xn=malloc(1024*C*sizeof(float)),\n*qk=malloc(1024*3*C*sizeof(float)),*ao=malloc(1024*C*sizeof(float)),\n*ff=malloc(1024*F*sizeof(float));\nint T=nt;\nfor(int t=0;t<T;t++)for(int i=0;i<C;i++)x[t*C+i]=wte[tk[t]*C+i]+wpe
+[tr-stream call-0098:worker:xiaomi/mimo-v2.5-pro-ultraspeed] [t*C+i];\nfor(int l=0;l<12;l++){\nfloat*ab_=p;p+=3*C;float*aw=p;p+=C*3*C;\nfloat*ob_=p;p+=C;float*ow=p;p+=C*C;\nfloat*b1=p;p+=C;float*g1=p;p+=C;\nfloat*b2=p;p+=C;float*g2=p;p+=C;\nfloat*fb_=p;p+=F;float*fw_=p;p+=C*F;\nfloat*pb_=p;p+=C;float*pw_=p;p+=F*C;\nfor(int t=0;t<T;t++){float m=0,v=0;\nfor(int i=0;i<C;i++)m+=x
+[tr-stream call-0098:worker:xiaomi/mimo-v2.5-pro-ultraspeed] [t*C+i];m/=C;\nfor(int i=0;i<C;i++)v+=(x[t*C+i]-m)*(x[t*C+i]-m);v=sqrtf(v/C+1e-5f);\nfor(int i=0;i<C;i++)xn[t*C+i]=(x[t*C+i]-m)/v*(g1[i]+gm1)+b1[i];}\nfor(int t=0;t<T;t++)for(int j=0;j<3*C;j++){float s=ab_[j];\nif(wm==0)for(int i=0;i<C;i++)s+=xn[t*C+i]*aw[i*3*C+j];\nelse for(int i=0;i<C;i++)s+=xn[t*C+i]*aw[j*C+i];qk[t*3*C+j]=s;
+[tr-stream call-0098:worker:xiaomi/mimo-v2.5-pro-ultraspeed] }\nfor(int h=0;h<H;h++)for(int t=0;t<T;t++){\nfor(int s=0;s<=t;s++){float d=0;for(int i=0;i<D;i++)d+=qk[t*3*C+h*D+i]*qk[s*3*C+C+h*D+i];sc[s]=d/sqrtf(D);}\nfloat mx=-1e30f;for(int s=0;s<=t;s++)if(sc[s]>mx)mx=sc[s];\nfloat ss=0;for(int s=0;s<=t;s++){sc[s]=expf(sc[s]-mx);ss+=sc[s];}\nfor(int s=0;s<=t;s++)sc[s]/=ss;\nfor(int i=0;i<D;i++){float v=0;for(int s=
+[tr-stream call-0098:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 0;s<=t;s++)v+=sc[s]*qk[s*3*C+2*C+h*D+i];ao[t*C+h*D+i]=v;}}\nfor(int t=0;t<T;t++)for(int j=0;j<C;j++){float s=ob_[j];\nif(wm==0)for(int i=0;i<C;i++)s+=ao[t*C+i]*ow[i*C+j];\nelse for(int i=0;i<C;i++)s+=ao[t*C+i]*ow[j*C+i];x[t*C+j]+=s;}\nfor(int t=0;t<T;t++){float m=0,v=0;\nfor(int i=0;i<C;i++)m+=x[t*C+i];m/=C;\nfor(int i=0;i<C;i++)v+=(x[t*C+i]-m)*(x[t*C
+[tr-stream call-0098:worker:xiaomi/mimo-v2.5-pro-ultraspeed] +i]-m);v=sqrtf(v/C+1e-5f);\nfor(int i=0;i<C;i++)xn[t*C+i]=(x[t*C+i]-m)/v*(g2[i]+gm1)+b2[i];}\nfor(int t=0;t<T;t++)for(int j=0;j<F;j++){float s=fb_[j];\nif(wm==0)for(int i=0;i<C;i++)s+=xn[t*C+i]*fw_[i*F+j];\nelse for(int i=0;i<C;i++)s+=xn[t*C+i
+[tr-stream call-0098:worker:xiaomi/mimo-v2.5-pro-ultraspeed] ]*fw_[j*C+i];ff[t*F+j]=G(s);}\nfor(int t=0;t<T;t++)for(int j=0;j<C;j++){float s=pb_[j];\nif(wm==0)for(int i=0;i<F;i++)s+=ff[t*F+i]*pw_[i*C+j];\nelse for(int i=0;i<F;i++)s+=ff[t*F+i]*pw_[j*F+i];x[t*C+j]+=s;}}\nfloat*g=p;p+=C;float*b=p;\nfor(int t=0;t<T;t++){float m=0,v=0;\nfor(int i=0;i<C;i++)m+=x[t*C+i];m/=C;\nfor(int i=0;i<C;i++)v+=(x[t*C+i]-m)*(x[t*C+i]-m);
+[tr-stream call-0098:worker:xiaomi/mimo-v2.5-pro-ultraspeed] v=sqrtf(v/C+1e-5f);\nfor(int i=0;i<C;i++)xn[t*C+i]=(x[t*C+i]-m)/v*(g[i]+gm1)+b[i];}\nint lt=T-1,best=0;float bv=-1e30f;\nfor(int j=0;j<V;j++){float s=0;for(int i=0;i<C;i++)s+=xn[lt*C+i]*wte[j*C+i];if(s>bv){bv=s;best=j;}}\nlo[0]=bv;lo[1]=best;\nfree(x);free(xn);free(qk);free(ao);free(ff);}\nint main(int argc,char**argv){\nFILE*f=fopen(argv[1],\"
+[tr-stream call-0098:worker:xiaomi/mimo-v2.5-pro-ultraspeed] rb\");fseek(f,0,SEEK_END);long sz=ftell(f);fseek(f,0,SEEK_SET);\nW=malloc(sz);fread(W,1,sz,f);fclose(f);\nlb(argv[2]);nt=tokenize(argv[3],tk);\nfor(int gm=0;gm<2;gm++)for(int wm=0;wm<2;wm++){\nrun(gm,wm);\nint best=(int)lo[1];\nprintf(\"gm=%d wm=%d: tok=%d l=%.2f \\\"\",gm,wm,best,lo[0]);\nfwrite(rb[best],1,rl[best],stdout);printf(\"\\\"\ \");
+[tr-stream call-0098:worker:xiaomi/mimo-v2.5-pro-ultraspeed] \n}\nprintf(\"\\n\");return 0;}\nCEOF\nwc -c /app/correct.c && gcc -O3 -o /app/correct /app/correct.c -lm 2>&1 | grep error; /app/correct gpt2-124M.ckpt vocab.bpe 'The meaning of life is' 2>&1 | grep -v warn\n",
+      "duration": 120.0
+    }
+  ]
+}
+
+[tr-stream call-0098:worker:xiaomi/mimo-v2.5-pro-ultraspeed] worker.done finish=stop cost_microdollars=375260
+[tr-stream call-0098:xiaomi/mimo-v2.5-pro-ultraspeed] I just realized my "TF alphabetical" lm=1 in the brute force had weight-before-bias, which is WRONG. The correct TF alphabetical order has bias-before-weight and beta-before-gamma. This is a combination I've never correctly tested!
+
+{
+  "analysis": "My previous TF alphabetical tests were wrong - they had weight before bias. The correct TF alphabetical per-layer order is: attn_b, attn_w, proj_b, proj_w, ln1_b, ln1_g, ln2_b, ln2_g, fc_b, fc_w, fcproj_b, fcproj_w. This has NEVER been correctly tested!",
+  "plan": "Write a test with the correct TF alphabetical ordering (bias-before-weight, beta-before-gamma), testing both weight orientations and gamma modes.",
+  "commands": [
+    {
+      "keystrokes": "cat > /app/correct.c << 'CEOF'\n#include<stdio.h>\n#include<stdlib.h>\n#include<string.h>\n#include<math.h>\n#define C 768\n#define H 12\n#define D 64\n#define F 3072\n#define V 50257\n#define NM 50000\n#define Z 131071\nfloat*W;int tk[1024],nt,bt[256];char ts[V][32];int tl[V],th[Z],tn[Z],mh[Z],mn[Z],ml[NM],mr[NM];\nunsigned char rb[V][32];int rl[V];\nunsigned hf(const char*s,int n){unsigned h=5381;for(int i=0;i<n;i++)h=h*33+(unsigned char)s[i];return h%Z;}\nvoid ti(int i){unsigned h=hf(ts[i],tl[i]);tn[i]=th[h];th[h]=i;}\nint tf(const char*s,int n){unsigned h=hf(s,n);for(int i=th[h];i>=0;i=tn[i])if(tl[i]==n&&!memcmp(ts[i],s,n))return i;return-1;}\nunsigned mhash(int l,int r){return((unsigned)l*V+r)%Z;}\nint mf(int l,int r){unsigned h=mhash(l,r);for(int i=mh[h];i>=0;i=mn[i])if(ml[i]==l&&mr[i]==r)return i;return-1;}\nvoid mi(int i){unsigned h=mhash(ml[i],mr[i]);mn[i]=mh[h];mh[h]=i;}\nvoid lb(char*p){memset(th,-1,sizeof(th));memset(mh,-1,sizeof(mh));unsigned s[256];int n=0;\nfor(int i=0;i<256;i++)if((i>=33&&i<=126)||(i>=161&&i<=172)||(i>=174&&i<=255))s[i]=i;else s[i]=256+n++;\nfor(int b=0;b<256;b++){int q=0;for(int j=0;j<256;j++)if(s[j]<s[b])q++;bt[b]=q;}\nfor(int b=0;b<256;b++){int t=bt[b];unsigned c=s[b];rb[t][0]=b;rl[t]=1;\nif(c<128){ts[t][0]=c;tl[t]=1;}else if(c<2048){ts[t][0]=0xC0|(c>>6);ts[t][1]=0x80|(c&63);tl[t]=2;}\nelse{ts[t][0]=0xE0|(c>>12);ts[t][1]=0x80|((c>>6)&63);ts[t][2]=0x80|(c&63);tl[t]=3;}ti(t);}\nFILE*f=fopen(p,\"r\");char ln[256];fgets(ln,256,f);int x=0;\nwhile(fgets(ln,256,f)&&x<NM){int l=strlen(ln);if(ln[l-1]=='\\n')ln[--l]=0;int sp=-1;\nfor(int i=0;i<l;i++)if(ln[i]==' '){sp=i;break;}if(sp<0)continue;\nint li=tf(ln,sp),ri=tf(ln+sp+1,l-sp-1);if(li<0||ri<0)continue;\nml[x]=li;mr[x]=ri;int a=tl[li];memcpy(ts[256+x],ts[li],a);\nmemcpy(ts[256+x]+a,ts[ri],tl[ri]);tl[256+x]=a+tl[ri];\nmemcpy(rb[256+x],rb[li],rl[li]);memcpy(rb[256+x]+rl[li],rb[ri],rl[ri]);\nrl[256+x]=rl[li]+rl[ri];ti(256+x);mi(x);x++;}fclose(f);}\nint tokenize(char*t,int*o){int n=strlen(t);for(int i=0;i<n;i++)o[i]=bt[(unsigned char)t[i]];\nwhile(1){int bs=NM,bp=-1;for(int i=0;i<n-1;i++){int r=mf(o[i],o[i+1]);if(r>=0&&r<bs){bs=r;bp=i;}}\nif(bp<0)break;o[bp]=256+bs;memmove(o+bp+1,o+bp+2,(n-bp-2)*sizeof(int));n--;}return n;}\nfloat sc[1024];\nfloat G(float x){return.5f*x*(1+tanhf(.7978845608f*(x+.044715f*x*x*x)));}\nfloat lo[2];\nvoid run(int gm,int wm){\nfloat*wte=W,*wpe=W+V*C,*p=wpe+1024*C;\nfloat gm1=gm?1.0f:0.0f;\nfloat*x=calloc(1024*C,sizeof(float)),*xn=malloc(1024*C*sizeof(float)),\n*qk=malloc(1024*3*C*sizeof(float)),*ao=malloc(1024*C*sizeof(float)),\n*ff=malloc(1024*F*sizeof(float));\nint T=nt;\nfor(int t=0;t<T;t++)for(int i=0;i<C;i++)x[t*C+i]=wte[tk[t]*C+i]+wpe[t*C+i];\nfor(int l=0;l<12;l++){\nfloat*ab_=p;p+=3*C;float*aw=p;p+=C*3*C;\nfloat*ob_=p;p+=C;float*ow=p;p+=C*C;\nfloat*b1=p;p+=C;float*g1=p;p+=C;\nfloat*b2=p;p+=C;float*g2=p;p+=C;\nfloat*fb_=p;p+=F;float*fw_=p;p+=C*F;\nfloat*pb_=p;p+=C;float*pw_=p;p+=F*C;\nfor(int t=0;t<T;t++){float m=0,v=0;\nfor(int i=0;i<C;i++)m+=x[t*C+i];m/=C;\nfor(int i=0;i<C;i++)v+=(x[t*C+i]-m)*(x[t*C+i]-m);v=sqrtf(v/C+1e-5f);\nfor(int i=0;i<C;i++)xn[t*C+i]=(x[t*C+i]-m)/v*(g1[i]+gm1)+b1[i];}\nfor(int t=0;t<T;t++)for(int j=0;j<3*C;j++){float s=ab_[j];\nif(wm==0)for(int i=0;i<C;i++)s+=xn[t*C+i]*aw[i*3*C+j];\nelse for(int i=0;i<C;i++)s+=xn[t*C+i]*aw[j*C+i];qk[t*3*C+j]=s;}\nfor(int h=0;h<H;h++)for(int t=0;t<T;t++){\nfor(int s=0;s<=t;s++){float d=0;for(int i=0;i<D;i++)d+=qk[t*3*C+h*D+i]*qk[s*3*C+C+h*D+i];sc[s]=d/sqrtf(D);}\nfloat mx=-1e30f;for(int s=0;s<=t;s++)if(sc[s]>mx)mx=sc[s];\nfloat ss=0;for(int s=0;s<=t;s++){sc[s]=expf(sc[s]-mx);ss+=sc[s];}\nfor(int s=0;s<=t;s++)sc[s]/=ss;\nfor(int i=0;i<D;i++){float v=0;for(int s=0;s<=t;s++)v+=sc[s]*qk[s*3*C+2*C+h*D+i];ao[t*C+h*D+i]=v;}}\nfor(int t=0;t<T;t++)for(int j=0;j<C;j++){float s=ob_[j];\nif(wm==0)for(int i=0;i<C;i++)s+=ao[t*C+i]*ow[i*C+j];\nelse for(int i=0;i<C;i++)s+=ao[t*C+i]*ow[j*C+i];x[t*C+j]+=s;}\nfor(int t=0;t<T;t++){float m=0,v=0;\nfor(int i=0;i<C;i++)m+=x[t*C+i];m/=C;\nfor(int i=0;i<C;i++)v+=(x[t*C+i]-m)*(x[t*C+i]-m);v=sqrtf(v/C+1e-5f);\nfor(int i=0;i<C;i++)xn[t*C+i]=(x[t*C+i]-m)/v*(g2[i]+gm1)+b2[i];}\nfor(int t=0;t<T;t++)for(int j=0;j<F;j++){float s=fb_[j];\nif(wm==0)for(int i=0;i<C;i++)s+=xn[t*C+i]*fw_[i*F+j];\nelse for(int i=0;i<C;i++)s+=xn[t*C+i]*fw_[j*C+i];ff[t*F+j]=G(s);}\nfor(int t=0;t<T;t++)for(int j=0;j<C;j++){float s=pb_[j];\nif(wm==0)for(int i=0;i<F;i++)s+=ff[t*F+i]*pw_[i*C+j];\nelse for(int i=0;i<F;i++)s+=ff[t*F+i]*pw_[j*F+i];x[t*C+j]+=s;}}\nfloat*g=p;p+=C;float*b=p;\nfor(int t=0;t<T;t++){float m=0,v=0;\nfor(int i=0;i<C;i++)m+=x[t*C+i];m/=C;\nfor(int i=0;i<C;i++)v+=(x[t*C+i]-m)*(x[t*C+i]-m);v=sqrtf(v/C+1e-5f);\nfor(int i=0;i<C;i++)xn[t*C+i]=(x[t*C+i]-m)/v*(g[i]+gm1)+b[i];}\nint lt=T-1,best=0;float bv=-1e30f;\nfor(int j=0;j<V;j++){float s=0;for(int i=0;i<C;i++)s+=xn[lt*C+i]*wte[j*C+i];if(s>bv){bv=s;best=j;}}\nlo[0]=bv;lo[1]=best;\nfree(x);free(xn);free(qk);free(ao);free(ff);}\nint main(int argc,char**argv){\nFILE*f=fopen(argv[1],\"rb\");fseek(f,0,SEEK_END);long sz=ftell(f);fseek(f,0,SEEK_SET);\nW=malloc(sz);fread(W,1,sz,f);fclose(f);\nlb(argv[2]);nt=tokenize(argv[3],tk);\nfor(int gm=0;gm<2;gm++)for(int wm=0;wm<2;wm++){\nrun(gm,wm);\nint best=(int)lo[1];\nprintf(\"gm=%d wm=%d: tok=%d l=%.2f \\\"\",gm,wm,best,lo[0]);\nfwrite(rb[best],1,rl[best],stdout);printf(\"\\\"\ \");\n}\nprintf(\"\\n\");return 0;}\nCEOF\nwc -c /app/correct.c && gcc -O3 -o /app/correct /app/correct.c -lm 2>&1 | grep error; /app/correct gpt2-124M.ckpt vocab.bpe 'The meaning of life is' 2>&1 | grep -v warn\n",
+      "duration": 120.0
+    }
+  ]
+}

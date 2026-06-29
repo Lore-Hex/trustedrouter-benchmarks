@@ -1,0 +1,90 @@
+
+[tr-stream call-0008:socrates:trustedrouter/socrates-pro-plus-1.0] socrates.started
+
+[tr-stream call-0008:worker:xiaomi/mimo-v2.5-pro-ultraspeed] worker.started
+[tr-thinking call-0008:worker:xiaomi/mimo-v2.5-pro-ultraspeed] The algorithm is picking the wrong segment. Segment 1 (frame 66, bottom_y=188) has the lowest mean, so it's being selected as the best segment. But frame 66 is clearly noise - it's a single frame with a small area (5031.5), and the athlete is actually at x=164, w=56 which is very small compared to the real athlete detections (w=100-200+).
+
+I need to fix this. The real jump is segment 0 (frames 54-60) which has 7 frames and is clearly the actual jump. The
+[tr-thinking call-0008:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  noise at frame 66 should be filtered out.
+
+Options:
+1. Require a minimum number of frames in a segment (e.g., at least 3-4 frames)
+2. Filter by width/height of bounding box too
+3. Only consider segments that are long enough
+
+Let me go with approach 1: require at least 3 frames in a segment to be considered a jump. Also, I could combine that with looking at the contour shape to make sure it's roughly human-shaped.
+
+Actually, looking more carefully at frame 66:
+- bottom_y=188, x=164, w=56, area=5031.5
+- This is a small detection
+[tr-thinking call-0008:worker:xiaomi/mimo-v2.5-pro-ultraspeed] , likely noise from the hurdle or some artifact
+
+Let me filter segments by requiring minimum number of consecutive frames (e.g., >= 3).
+
+Also, looking at the data more carefully, let me think about what takeoff and landing should be:
+- The jump (in air) is frames 54-60 (based on bottom_y dropping significantly)
+- Takeoff should be the frame just before the athlete leaves the ground, so frame 53 (last frame with ground-level bottom_y before the jump)
+- Landing should be the frame when the athlete touches back down, so frame 61 (first frame with ground-level bottom_y after the jump)
+
+Wait, let me reconsider. Looking at the bottom_y values:
+- Frame 5
+[tr-thinking call-0008:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 3: 364 (on ground)
+- Frame 54: 268 (in air - feet lifted off)
+- Frame 55: 224
+- Frame 56: 190 (peak)
+- Frame 57: 224
+- Frame 58: 222
+- Frame 59: 208
+- Frame 60: 213
+- Frame 61: 342 (back on ground)
+
+So takeoff = 53 (last ground frame) or 54 (first air frame)? The definition says "Frame number where the athlete's takeoff/j
+[tr-thinking call-0008:worker:xiaomi/mimo-v2.5-pro-ultraspeed] ump begins" - this is ambiguous. It could mean the frame where they leave the ground (transition from ground to air). I'll say takeoff = 53 (the last frame with feet on ground, which is when the jump push-off happens) or takeoff = 54 (first frame where they're in the air).
+
+Actually "takeoff begins" suggests the start of the takeoff motion. In biomechanics, takeoff is typically the last contact with the ground. So frame 53 seems reasonable (last frame on ground). But some might interpret it as frame 54 (first frame in air).
+
+Given
+[tr-thinking call-0008:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  the ambiguity, let me just pick:
+- takeoff = last frame on ground before jump = frame 53
+- landing = first frame on ground after jump = frame 61
+
+My current algorithm with the fixed segment selection would give:
+- takeoff_frame = 53 (last ground frame before segment starting at 54)
+- land_frame = 61 (first ground frame after segment ending at 60)
+
+That seems right! Let me fix the segment selection to require at least 3 frames.
+
+Also I should check: is the takeoff actually the frame where the athlete pushes off (last ground contact)
+[tr-thinking call-0008:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  or where they first become airborne? Looking at the field definition: "Frame number where the athlete's takeoff/jump begins" - this likely means the frame where the takeoff begins, which I'd interpret as the last frame the foot is on the ground (the push-off moment).
+
+Let me update the script.
+[tr-stream call-0008:worker:xiaomi/mimo-v2.5-pro-ultraspeed] {
+  "analysis": "The algorithm finds the correct jump segment (frames 54-60) but incorrectly picks segment 1 (frame 66, single-frame noise) as the best because it has a lower mean bottom_y. I need to: 1) Filter out single-frame/noise segments by requiring minimum consecutive frames. 2) The real jump takeoff=53 (
+[tr-stream call-0008:worker:xiaomi/mimo-v2.5-pro-ultraspeed] last ground frame), landing=61 (first ground frame after jump).",
+  "plan": "Update the script to require a minimum segment length (at least 3 frames) to filter out noise. This will eliminate the single-frame artifact at frame 66 and correctly identify the real jump.",
+  "commands": [
+    {"keystrokes": "cat > /app/jump_analyzer.py << 'PYEOF'\nimport sys\nimport cv2\nimport numpy as np\nimport toml\n\ndef analyze_jump(video_path):\n    cap = cv2.VideoCapture(video_path)\n    if not cap.isOpened():\n        print(f\"Error: Cannot open video {video_path}\", file=sys.stderr)\n        sys.exit(1)\
+[tr-stream call-0008:worker:xiaomi/mimo-v2.5-pro-ultraspeed] n\n    # Read the first frame as background (no runner)\n    ret, bg_frame = cap.read()\n    if not ret:\n        print(\"Error: Cannot read first frame\", file=sys.stderr)\n        sys.exit(1)\n    \n    bg_gray = cv2.cvtColor(bg_frame, cv2.COLOR_BGR2GRAY)\n    bg_gray = cv2.GaussianBlur(bg_gray, (21, 21), 0)\n\n    frame_data = []  # (frame_number, bottom_y, center_x, area)\n    frame_idx = 0\n    while True:\n        ret, frame = cap.read()\n        if not ret:\n            break\n        frame_idx += 1\n\n        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)\n        gray = cv2.GaussianBlur(gray, (21, 2
+[tr-stream call-0008:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 1), 0)\n\n        diff = cv2.absdiff(bg_gray, gray)\n        _, thresh = cv2.threshold(diff, 25, 255, cv2.THRESH_BINARY)\n        kernel = np.ones((5, 5), np.uint8)\n        thresh = cv2.dilate(thresh, kernel, iterations=2)\n        thresh = cv2.erode(thresh, kernel, iterations=1)\n\n        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)\n\n        best_contour = None\n        best_area = 0\n        for c in contours:\n            area = cv2.contourArea(c)\n            if area > best_area and area > 3000:\n                best_area = area\n                best_contour = c\n
+[tr-stream call-0008:worker:xiaomi/mimo-v2.5-pro-ultraspeed] \n        if best_contour is not None:\n            x, y, w, h = cv2.boundingRect(best_contour)\n            bottom_y = y + h\n            center_x = x + w // 2\n            frame_data.append((frame_idx, bottom_y, center_x, best_area))\n        else:\n            frame_data.append((frame_idx, None, None, None))\n\n    cap.release()\n\n    detected = [(f, by, cx, a) for f, by, cx, a in frame_data if by is not None]\n    \n    if not detected:\n        print(\"Error: No athlete detected in video\", file=sys.stderr)\n        sys.exit(1)\n\n    all_by = [by for _, by, _, _
+[tr-stream call-0008:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  in detected]\n    ground_level = np.percentile(all_by, 75)\n    min_athlete_area = 5000\n    valid_detected = [(f, by, cx, a) for f, by, cx, a in detected if a >= min_athlete_area]\n    \n    if not valid_detected:\n        print(\"Error: No valid athlete detections\", file=sys.stderr)\n        sys.exit(1)\n\n    min_by = min(by for _, by, _, _ in valid_detected)\n    threshold = ground_level - 0.45 * (ground_level - min_by)\n    \n    # Find contiguous in-air segments\n    in_air_segments = []\n    current_segment = []\n    for
+[tr-stream call-0008:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  f, by, cx, a in sorted(detected, key=lambda x: x[0]):\n        if by is not None and a >= min_athlete_area and by < threshold:\n            current_segment.append((f, by, cx, a))\n        else:\n            if current_segment:\n                in_air_segments.append(current_segment)\n                current_segment = []\n    if current_segment:\n        in_air_segments.append(current_segment)\n    \n    # Filter segments: require at least 3 frames to avoid noise\n    min_segment_frames = 3\n    in_air_segments = [s for s in in_air_segments if len(s) >= min_segment_frames]\n    \n    if not in_air_segments:\n        print(\"Error: No jump
+[tr-stream call-0008:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  detected\", file=sys.stderr)\n        sys.exit(1)\n    \n    # Pick the segment with the lowest mean bottom_y (highest jump)\n    best_segment = min(in_air_segments, key=lambda seg: np.mean([by for _, by, _, _ in seg]))\n    \n    # Takeoff: last frame on ground before jump\n    first_jump_frame = best_segment[0][0]\n    takeoff_frame = None\n    for f, by, cx, a in sorted(detected, key=lambda x: x[0]):\n        if f >= first_jump_frame:\n            break\n        if by is not None and a >= min_athlete_area:\n            takeoff_frame = f\n    \n    # Landing: first frame on ground after jump\n   
+[tr-stream call-0008:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  last_jump_frame = best_segment[-1][0]\n    land_frame = None\n    for f, by, cx, a in sorted(detected, key=lambda x: x[0]):\n        if f <= last_jump_frame:\n            continue\n        if by is not None and a >= min_athlete_area and by >= threshold:\n            land_frame = f\n            break\n    \n    if takeoff_frame is None or land_frame is None:\n        print(f\"Error: Could not determine takeoff ({takeoff_frame}) or landing ({land_frame})\", file=sys.stderr)\n        sys.exit(1)\n    \n    return takeoff_frame, land_frame\n\n\ndef main():\n    if len(sys.argv) < 2:\n        print(\"Usage: python3 jump_analyzer.py <video.mp4>\
+[tr-stream call-0008:worker:xiaomi/mimo-v2.5-pro-ultraspeed] ", file=sys.stderr)\n        sys.exit(1)\n\n    video_path = sys.argv[1]\n    takeoff, landing = analyze_jump(video_path)\n\n    result = {\n        \"jump_takeoff_frame_number\": takeoff,\n        \"jump_land_frame_number\": landing\n    }\n\n    output_path = \"/app/output.toml\"\n    with open(output_path, \"w\") as f:\n        toml.dump(result, f)\n\n    print(f\"Takeoff: {takeoff}, Landing: {landing}\")\n    print(f\"Output written to {output_path}\")\n\n\nif __name__ == \"__main__\":\n    main()\nPYEOF\n","duration":0.5},
+    {"keystrokes":"python3 /app/jump_analyzer
+[tr-stream call-0008:worker:xiaomi/mimo-v2.5-pro-ultraspeed] .py /app/example_video.mp4\n","duration":10.0},
+    {"keystrokes":"cat /app/output.toml\n","duration":0.1}
+  ]
+}
+
+[tr-stream call-0008:worker:xiaomi/mimo-v2.5-pro-ultraspeed] worker.done finish=stop cost_microdollars=30480
+[tr-stream call-0008:xiaomi/mimo-v2.5-pro-ultraspeed] {
+  "analysis": "The algorithm finds the correct jump segment (frames 54-60) but incorrectly picks segment 1 (frame 66, single-frame noise) as the best because it has a lower mean bottom_y. I need to: 1) Filter out single-frame/noise segments by requiring minimum consecutive frames. 2) The real jump takeoff=53 (last ground frame), landing=61 (first ground frame after jump).",
+  "plan": "Update the script to require a minimum segment length (at least 3 frames) to filter out noise. This will eliminate the single-frame artifact at frame 66 and correctly identify the real jump.",
+  "commands": [
+    {"keystrokes": "cat > /app/jump_analyzer.py << 'PYEOF'\nimport sys\nimport cv2\nimport numpy as np\nimport toml\n\ndef analyze_jump(video_path):\n    cap = cv2.VideoCapture(video_path)\n    if not cap.isOpened():\n        print(f\"Error: Cannot open video {video_path}\", file=sys.stderr)\n        sys.exit(1)\n\n    # Read the first frame as background (no runner)\n    ret, bg_frame = cap.read()\n    if not ret:\n        print(\"Error: Cannot read first frame\", file=sys.stderr)\n        sys.exit(1)\n    \n    bg_gray = cv2.cvtColor(bg_frame, cv2.COLOR_BGR2GRAY)\n    bg_gray = cv2.GaussianBlur(bg_gray, (21, 21), 0)\n\n    frame_data = []  # (frame_number, bottom_y, center_x, area)\n    frame_idx = 0\n    while True:\n        ret, frame = cap.read()\n        if not ret:\n            break\n        frame_idx += 1\n\n        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)\n        gray = cv2.GaussianBlur(gray, (21, 21), 0)\n\n        diff = cv2.absdiff(bg_gray, gray)\n        _, thresh = cv2.threshold(diff, 25, 255, cv2.THRESH_BINARY)\n        kernel = np.ones((5, 5), np.uint8)\n        thresh = cv2.dilate(thresh, kernel, iterations=2)\n        thresh = cv2.erode(thresh, kernel, iterations=1)\n\n        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)\n\n        best_contour = None\n        best_area = 0\n        for c in contours:\n            area = cv2.contourArea(c)\n            if area > best_area and area > 3000:\n                best_area = area\n                best_contour = c\n\n        if best_contour is not None:\n            x, y, w, h = cv2.boundingRect(best_contour)\n            bottom_y = y + h\n            center_x = x + w // 2\n            frame_data.append((frame_idx, bottom_y, center_x, best_area))\n        else:\n            frame_data.append((frame_idx, None, None, None))\n\n    cap.release()\n\n    detected = [(f, by, cx, a) for f, by, cx, a in frame_data if by is not None]\n    \n    if not detected:\n        print(\"Error: No athlete detected in video\", file=sys.stderr)\n        sys.exit(1)\n\n    all_by = [by for _, by, _, _ in detected]\n    ground_level = np.percentile(all_by, 75)\n    min_athlete_area = 5000\n    valid_detected = [(f, by, cx, a) for f, by, cx, a in detected if a >= min_athlete_area]\n    \n    if not valid_detected:\n        print(\"Error: No valid athlete detections\", file=sys.stderr)\n        sys.exit(1)\n\n    min_by = min(by for _, by, _, _ in valid_detected)\n    threshold = ground_level - 0.45 * (ground_level - min_by)\n    \n    # Find contiguous in-air segments\n    in_air_segments = []\n    current_segment = []\n    for f, by, cx, a in sorted(detected, key=lambda x: x[0]):\n        if by is not None and a >= min_athlete_area and by < threshold:\n            current_segment.append((f, by, cx, a))\n        else:\n            if current_segment:\n                in_air_segments.append(current_segment)\n                current_segment = []\n    if current_segment:\n        in_air_segments.append(current_segment)\n    \n    # Filter segments: require at least 3 frames to avoid noise\n    min_segment_frames = 3\n    in_air_segments = [s for s in in_air_segments if len(s) >= min_segment_frames]\n    \n    if not in_air_segments:\n        print(\"Error: No jump detected\", file=sys.stderr)\n        sys.exit(1)\n    \n    # Pick the segment with the lowest mean bottom_y (highest jump)\n    best_segment = min(in_air_segments, key=lambda seg: np.mean([by for _, by, _, _ in seg]))\n    \n    # Takeoff: last frame on ground before jump\n    first_jump_frame = best_segment[0][0]\n    takeoff_frame = None\n    for f, by, cx, a in sorted(detected, key=lambda x: x[0]):\n        if f >= first_jump_frame:\n            break\n        if by is not None and a >= min_athlete_area:\n            takeoff_frame = f\n    \n    # Landing: first frame on ground after jump\n    last_jump_frame = best_segment[-1][0]\n    land_frame = None\n    for f, by, cx, a in sorted(detected, key=lambda x: x[0]):\n        if f <= last_jump_frame:\n            continue\n        if by is not None and a >= min_athlete_area and by >= threshold:\n            land_frame = f\n            break\n    \n    if takeoff_frame is None or land_frame is None:\n        print(f\"Error: Could not determine takeoff ({takeoff_frame}) or landing ({land_frame})\", file=sys.stderr)\n        sys.exit(1)\n    \n    return takeoff_frame, land_frame\n\n\ndef main():\n    if len(sys.argv) < 2:\n        print(\"Usage: python3 jump_analyzer.py <video.mp4>\", file=sys.stderr)\n        sys.exit(1)\n\n    video_path = sys.argv[1]\n    takeoff, landing = analyze_jump(video_path)\n\n    result = {\n        \"jump_takeoff_frame_number\": takeoff,\n        \"jump_land_frame_number\": landing\n    }\n\n    output_path = \"/app/output.toml\"\n    with open(output_path, \"w\") as f:\n        toml.dump(result, f)\n\n    print(f\"Takeoff: {takeoff}, Landing: {landing}\")\n    print(f\"Output written to {output_path}\")\n\n\nif __name__ == \"__main__\":\n    main()\nPYEOF\n","duration":0.5},
+    {"keystrokes":"python3 /app/jump_analyzer.py /app/example_video.mp4\n","duration":10.0},
+    {"keystrokes":"cat /app/output.toml\n","duration":0.1}
+  ]
+}

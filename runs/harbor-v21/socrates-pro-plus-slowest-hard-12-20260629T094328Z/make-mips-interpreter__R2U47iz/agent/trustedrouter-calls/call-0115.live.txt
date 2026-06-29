@@ -1,0 +1,673 @@
+
+[tr-stream call-0115:socrates:trustedrouter/socrates-pro-plus-1.0] socrates.started
+
+[tr-stream call-0115:worker:xiaomi/mimo-v2.5-pro-ultraspeed] worker.started
+[tr-thinking call-0115:worker:xiaomi/mimo-v2.5-pro-ultraspeed] The Z_Malloc failure with 420303204 (0x190E5664) bytes is a corrupted value. Looking at the source:
+
+```c
+void* Z_Malloc(int size, memtag_t tag, void** user)
+```
+
+The first argument should be the allocation size. The value 420303204 is clearly wrong. This is printed via:
+```c
+I_Error("Z_Malloc: failed on allocation of %i bytes", size);
+```
+
+So the size argument passed to Z_Malloc is corrupted. This suggests something
+[tr-thinking call-0115:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  wrong with the MIPS calling convention handling - likely the value computed for the allocation size is wrong.
+
+Let me think about what R_InitData calls... it calls R_InitTextures, R_InitFlats, R_InitLightTables, etc.
+
+For textures, the allocation would be something like:
+- numtextures * sizeof(texture_t) + ...
+
+The size 420303204 = 0x190E5664 which is about 400MB. This is clearly a corrupted value.
+
+Let me think about what could go wrong. The allocation size is passed as the first argument (a0). In DOOM's
+[tr-thinking call-0115:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  Z_Malloc:
+
+```c
+void* Z_Malloc(int size, memtag_t tag, void** user)
+```
+
+So a0 = size, a1 = tag, a2 = user.
+
+The size 420303204 (0x190E5664) - let me see if this could be the result of a multiply. 
+
+Actually, wait. Let me re-read the error output more carefully:
+```
+Z_Malloc: failed on allocation of %i bytes
+Z_Malloc: failed on allocation of 420303204 bytes
+```
+
+The first line has `%i` literally printed, which means the format string printing is
+[tr-thinking call-0115:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  wrong. The second line has the value 420303204.
+
+Actually, looking at I_Error, it takes varargs. The format string "Z_Malloc: failed on allocation of %i bytes" is being printed with two printf calls - one that prints the literal format string (before the %i is formatted) and one with the actual value. Or maybe the I_Error function calls vsnprintf internally.
+
+Wait, looking more carefully - the output says:
+```
+Z_Malloc: failed on allocation of %i bytes
+Z_Malloc: failed on allocation of 420303204 bytes
+```
+
+Two lines! The
+[tr-thinking call-0115:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  first line seems like it's printing the raw format string. The second line has the value.
+
+Actually, looking at the I_Error source code, it probably calls printf/vprintf. The fact that the %i is being printed literally suggests the varargs handling is broken in the MIPS binary or in our interpreter.
+
+Wait, but the second line shows the value correctly. So maybe I_Error first prints to stderr, then does cleanup, then prints again. Let me look at the I_Error disassembly.
+
+Actually, looking at the output more carefully:
+```
+Z_Malloc: failed on allocation of %i bytes
+Z_Malloc: failed on allocation of 420303204 bytes
+```
+
+The first line probably
+[tr-thinking call-0115:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  comes from `printf("Z_Malloc: failed on allocation of %i bytes\n", size)` where %i gets printed as literal text. This would mean the printf implementation doesn't work correctly.
+
+Wait, but then the second line shows the number. Maybe the code calls printf twice:
+1. First with just the format string (no args)
+2. Second with the format string and the size
+
+Or maybe it calls `fprintf(stderr, ...)` and then `printf(...)`. 
+
+Actually, I think what's happening is that the code calls something like:
+```c
+printf("Z_Malloc: failed on allocation of %i bytes\n", size);
+```
+
+And our printf implementation doesn't handle %i correctly. Let me check...
+
+Wait, the
+[tr-thinking call-0115:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  binary has its own printf at 0x439938. Let me think about this differently.
+
+Looking at the output:
+```
+Z_Malloc: failed on allocation of %i bytes
+Z_Malloc: failed on allocation of 420303204 bytes
+```
+
+This is I_Error being called. I_Error probably:
+1. First outputs the message to stderr
+2. Then prints it to stdout
+3. Then calls I_Quit
+
+The first line might be from stderr (fd=2), and the second from stdout (fd=1). Or it could be that the
+[tr-thinking call-0115:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  printf function in the binary has a two-pass implementation.
+
+Actually, the binary has a custom printf that writes to a buffer first, then outputs. The %i literal on the first line suggests that the first "pass" doesn't format the integer correctly.
+
+Hmm, but 420303204 IS the value being printed. The question is whether this is the correct value or a corrupted one.
+
+Let me think about what R_InitTextures allocates. In DOOM source:
+```c
+textures = Z_Malloc(numtextures * sizeof(texture_t*), PU_STATIC, 0);
+```
+
+numtextures is read from the WAD file. If it's correct,
+[tr-thinking call-0115:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  this should be a reasonable size.
+
+But wait - what if the issue is that `numtextures` is read incorrectly? Or what if a multiply goes wrong?
+
+Actually, 420303204 decimal... let me check: 420303204 / 4 = 105075801. That's about 100M texture pointers. Way too many.
+
+Let me think about what size the allocation SHOULD be. In doom.wad, numtextures is typically around 100-200. With 4 bytes per pointer, that's 400-800 bytes.
+
+4
+[tr-thinking call-0115:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 20303204 is clearly corrupted. The question is: what's causing the corruption?
+
+One possibility: the lw instruction for loading the allocation size has an issue. Or a multiply goes wrong.
+
+Let me check the wsbh instruction handling more carefully. In the binary, wsbh with sub=2 should be:
+```
+R[rd] = (((R[rt] & 0x00FF00FF) << 8) | ((R[rt] & 0xFF00FF00) >>> 8)) >>> 0;
+```
+
+Wait, I just noticed something in my w
+[tr-thinking call-0115:worker:xiaomi/mimo-v2.5-pro-ultraspeed] sbh code:
+```javascript
+R[rd] = (((R[rt] & 0xFF00FF) << 8) | ((R[rt] & 0xFF00FF00) >>> 8)) >>> 0;
+```
+
+The mask should be `0x00FF00FF` (with the leading zero), not `0xFF00FF`. Let me check...
+
+Actually `0xFF00FF` in JavaScript is 16711935 which is `0x00FF00FF`. So they're the same value. That's fine.
+
+Hmm, let me think about this differently. Maybe the
+[tr-thinking call-0115:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  issue is in the binary's malloc or Z_Malloc implementation rather than in our interpreter.
+
+Actually, wait. Let me look at the output again:
+
+```
+zone memory: 0x5e6b50, 600000 allocated for zone
+```
+
+So the zone is at 0x5e6b50 with size 600000 (0x927C0). This seems reasonable - it's in BSS.
+
+Then Z_Malloc is called with size=420303204. This is way bigger than the zone (600000 bytes), so Z_Malloc correctly
+[tr-thinking call-0115:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  says it can't allocate.
+
+But WHY is the size so big? Let me think about what code calls Z_Malloc first in R_InitData...
+
+R_InitData calls:
+1. R_InitTextures
+2. R_InitFlats  
+3. R_InitColormaps
+
+R_InitTextures allocates texture structures. The allocation size depends on numtextures.
+
+Let me look at how numtextures is loaded from the WAD. If the WAD reading is correct, numtextures should be reasonable (maybe 100-200).
+
+But what if the issue is that the WAD file parsing reads garbage, or the multiply for the allocation size goes wrong?
+
+420303204 = 0x190E
+[tr-thinking call-0115:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 5664
+
+Let me see if this could be a valid data value. If numtextures is stored at some address and we're reading garbage...
+
+Actually, I think the issue might be simpler. Let me check if there's an issue with how we handle `li` instructions for large immediate values. In MIPS32, `lui` followed by `ori`/`addiu` loads a 32-bit immediate. If we're not correctly chaining these instructions...
+
+But wait, those instructions seem to work fine for everything else.
+
+Let me check if the issue is with the `open()` syscall for doom.wad. If the file isn't opened correctly, the WAD parsing will fail and
+[tr-thinking call-0115:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  read garbage data.
+
+Actually, looking at the source code again:
+
+In doomgeneric_img.c, it opens doom.wad. Let me look at how the file is found. The code does:
+
+```c
+int real_fd = real_syscall6(SYS_open, (long)wad_path, O_RDONLY, 0, 0, 0, 0);
+```
+
+The wad_path is "doom.wad" which we redirect to "/app/doom.wad".
+
+Let me verify the file read works correctly by checking if the WAD header is read properly.
+
+Actually, I think the key insight is: the binary prints "adding
+[tr-thinking call-0115:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  doom.wad" and continues to R_Init, which means the WAD was opened and partially read. But the texture data might be corrupted due to a file read issue.
+
+Let me try a different approach: check if the position tracking in the file descriptor works correctly. When reading a WAD file, the binary reads many small chunks. If the position tracking is off, data corruption would result.
+
+Actually, I realize there might be a simpler issue. The `lseek` syscall uses a signed 32-bit offset, but when I compute the return value, I do:
+```javascript
+if (np < 0) R[2
+[tr-thinking call-0115:worker:xiaomi/mimo-v2.5-pro-ultraspeed] ] = -1 >>> 0; else { e.p = np; R[2] = np >>> 0; }
+```
+
+The offset from the MIPS binary is in a1 register, which is unsigned. I'm doing `(a1 << 0) >> 0` to convert to signed. But a1 is already a Uint32Array value, so this should work.
+
+Let me think about another issue: when the binary calls Z_Malloc with a very large size, the size comes from a calculation. Let me trace what happens.
+
+Actually, wait. Let me re-read the output:
+
+```
+Z_Malloc: failed on allocation of %
+[tr-thinking call-0115:worker:xiaomi/mimo-v2.5-pro-ultraspeed] i bytes
+Z_Malloc: failed on allocation of 420303204 bytes
+```
+
+Looking at the I_Error implementation at 0x40e4b8, it starts by setting up a large stack frame (576 bytes). It saves arguments and calls vsnprintf. Then it likely prints the formatted message.
+
+The fact that TWO lines appear - one with %i literal and one with the value - suggests that I_Error first does `fprintf(stderr, msg, ...)` and then `printf(msg, ...)` or something similar.
+
+But wait, looking at the output pattern:
+```
+R_Init: Init DOOM refresh daemon - Z_Malloc: failed on allocation of %i bytes
+Z_Malloc: failed on allocation of 420303204 bytes
+```
+
+The
+[tr-thinking call-0115:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  first line is: `"R_Init: Init DOOM refresh daemon - " + "Z_Malloc: failed on allocation of %i bytes\n"`
+The second line is: `"Z_Malloc: failed on allocation of 420303204 bytes\n"`
+
+Wait, this is TWO separate I_Error calls or something? No, actually I think what's happening is:
+
+1. R_Init prints "R_Init: Init DOOM refresh daemon - " using puts or similar
+2. R_InitData (called from R_Init) calls Z_Malloc which fails and calls I_Error
+3. I_Error prints the error message
+
+But the message
+[tr-thinking call-0115:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  seems split across lines. Let me look at I_Error more carefully...
+
+Actually, looking at the disassembly of I_Error at 0x40e4b8, it sets up 576 bytes of stack, then saves registers. It likely calls vsnprintf to format the message, then writes to stderr, then calls I_Quit.
+
+The fact that the output shows the format string literally suggests vsnprintf is failing somehow. But the second line shows the correct value 420303204.
+
+Hmm, maybe what's happening is that I_Error does something like:
+1. Write the raw format string to stderr (without formatting)
+2. Format the string with
+[tr-thinking call-0115:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  vsnprintf and print to stdout
+
+This would explain the two lines.
+
+Anyway, the core issue is that Z_Malloc is being called with 420303204 bytes, which is too large. Let me try to understand why.
+
+Looking at the DOOM source code, R_InitTextures does:
+```c
+textures = Z_Malloc(numtextures * sizeof(texture_t*), PU_STATIC, 0);
+```
+
+numtextures is read from the WAD TEXTURES lump. It's typically a small number.
+
+If numtextures were 0, the allocation would be 0, not 420303204.
+[tr-thinking call-0115:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  So numtextures must have a wrong value.
+
+Where is numtextures set? It's read from the WAD:
+```c
+numtextures = LONG(*((int32_t *)mem));
+```
+
+This is a byte-swap macro. In our MIPS binary, LONG should be a no-op since MIPS is the same endianness as the host (or it swaps bytes).
+
+Wait, the binary is little-endian MIPS. The WAD format stores integers in little-endian. So LONG should be a no-op.
+
+But what if there's a custom LONG implementation that uses byte manipulation and our interpreter has a bug?
+
+Let me check the WAD file reading more carefully. The W
+[tr-thinking call-0115:worker:xiaomi/mimo-v2.5-pro-ultraspeed] AD file starts with:
+- 4 bytes: identification ("IWAD")
+- 4 bytes: numlumps
+- 4 bytes: infotableofs
+
+These should be read correctly.
+
+Actually, I think the issue might be something else entirely. Let me check if our `open` syscall correctly returns file descriptors and if the position tracking is correct.
+
+Wait, I just realized something. When the binary does file I/O, it uses real syscalls (not the fake filesystem). The real syscall goes through our interpreter's syscall handler. Let me check:
+
+In the syscall handler for case 0 (read):
+```javascript
+case 0: { const e = FD.get(a0
+[tr-thinking call-0115:worker:xiaomi/mimo-v2.5-pro-ultraspeed] ); ... const nn = fs.readSync(e.h, t, 0, sz, e.p); ... e.p += nn; ... }
+```
+
+And for case 8 (lseek):
+```javascript
+case 8: { ... e.p = np; R[2] = np >>> 0; ... }
+```
+
+This should work. But what if the binary uses lseek to set position, and then reads? The e.p should track correctly.
+
+Actually, wait. What if the binary does an lseek followed by a read? After lseek, e.p is set. Then read uses e.p. That should be fine.
+
+But what if the
+[tr-thinking call-0115:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  binary reads from a file using multiple read calls? After each read, e.p advances. That should be fine too.
+
+Let me try a completely different approach. Let me add some logging to the VM to print the syscall arguments when the bad allocation happens. I'll have the VM print every syscall call during the R_Init phase.
+
+Actually, a simpler approach: let me check if there's a register bug. Maybe a register isn't being preserved correctly across function calls.
+
+One thing I notice in my interpreter: when I handle branches, I set `tb` (take branch) but don't execute the delay slot instruction. In MIPS, the delay slot instruction ALWAYS executes before the branch is taken. Let
+[tr-thinking call-0115:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  me check my code:
+
+```javascript
+if (op === 4) { if (R[rs] === R[rt]) bd = (cpc + 4 + (si << 2)) >>> 0; break; } // beq
+```
+
+Then later:
+```javascript
+if (tb >= 0) pc = tb >>> 0;
+```
+
+Wait, this is wrong! I'm using `bd` to store the branch target, then checking `tb` which was set from the previous iteration's `bd`. But the delay slot instruction should execute with the current pc (which is already set to cpc+4).
+
+Let me trace through the
+[tr-thinking call-0115:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  execution:
+1. Instruction at cpc is a branch (e.g., beq)
+2. We set `bd = target`
+3. `pc` was set to `cpc + 4` at the start
+4. At the end: `if (tb >= 0) pc = tb;` - but tb was set from the PREVIOUS bd, not the current one
+
+Wait, let me re-read my code more carefully:
+
+```javascript
+let bd = -1;
+...
+while (EX === null) {
+  const cpc = pc, I = r32(cpc);
+  let tb = -1;
+  if (bd
+[tr-thinking call-0115:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  >= 0) { tb = bd; bd = -1; }
+  pc = (cpc + 4) >>> 0;
+  ic++;
+  ...
+  // When a branch is encountered:
+  // case 4: if (R[rs] === R[rt]) bd = (cpc + 4 + (si << 2)) >>> 0; break;
+  ...
+  if (tb >= 0) pc = tb >>> 0;
+  R[0] = 0;
+}
+```
+
+OK so the execution flow is:
+1. Iteration N: cpc = 0x100, tb = -1 (no previous branch), pc
+[tr-thinking call-0115:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  = 0x104
+   - Process instruction at 0x100 (not a branch, regular instruction)
+   - tb is -1, so pc stays 0x104
+
+2. Iteration N+1: cpc = 0x104, I = branch instruction
+   - tb = -1 (bd was -1 from initialization, no previous branch pending)
+   - pc = 0x108
+   - Process the branch: bd = target (e.g., 0x200)
+   - tb is -1, so pc stays 0x
+[tr-thinking call-0115:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 108
+
+3. Iteration N+2: cpc = 0x108 (the delay slot!)
+   - tb = bd = 0x200 (from the previous branch)
+   - pc = 0x10C
+   - Process the delay slot instruction at 0x108
+   - tb >= 0, so pc = 0x200
+
+4. Iteration N+3: cpc = 0x200 (branch target)
+   - Normal execution
+
+This looks correct! The delay slot instruction at 0x108 executes, then the branch is taken to 0x200. Good.
+
+Now let me check the syscall
+[tr-thinking call-0115:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  instruction handling. In MIPS, `syscall` generates a trap. Our interpreter handles it as:
+
+```javascript
+case 12: doSys(cpc); break;
+```
+
+And `doSys` reads R[2] for the syscall number and R[4], R[5], R[6] for arguments. After the syscall, R[2] gets the return value.
+
+But wait - in the MIPS syscall convention, the syscall instruction's delay slot (if any) should execute before the trap. But `syscall` doesn't typically have a delay slot - it immediately traps. So this should be fine.
+
+However, there's an important issue: after `doSys` returns, what
+[tr-thinking call-0115:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  happens? The `pc` is already advanced to the next instruction. The syscall in the binary does:
+
+```
+move $v0, $t2  (or some register with syscall number)
+...
+syscall
+move $v1, $v0  (read return value)
+bgez $v1, skip_error
+nop
+negu $at, $v1
+sw $at, errno
+skip_error:
+```
+
+So after syscall, the next instruction reads $v0 (R[2]) for the return value. This should work if we set R[2] correctly in doSys.
+
+Hmm, but what about errno? When a real Linux syscall fails, it returns
+[tr-thinking call-0115:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  -1 and sets errno. In the binary, the code checks if the return is negative and sets errno. But our syscalls return the actual value or -1 >>> 0.
+
+Wait, I see the issue! The code does:
+```
+bgez $v1, 43da14
+```
+
+If $v1 is -1 (0xFFFFFFFF as unsigned), as a signed value it's negative, so the branch would NOT be taken, and it would set errno. But what about our file operations?
+
+For open: if it fails, we set R[2] = -1 >>> 0 = 4294967295 = 0xFFFFFFFF. When treated as signed 32-bit, this is -1.
+[tr-thinking call-0115:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  The code then negates it: negu $at, $v1 = ~(-1) + 1 = 0 + 1 = 1. So errno would be set to 1 (EPERM).
+
+For open success, we set R[2] = fd (a positive integer). bgez checks if it's >= 0 as signed, which it is. So it skips errno and returns the fd. Good.
+
+For read/write success, we set R[2] = nn (bytes read/written). This is >= 0. Good.
+
+For lseek: we set R[2] = np >>> 0. If np is a
+[tr-thinking call-0115:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  large value, np >>> 0 could have the high bit set, which would make it negative when interpreted as signed. This could cause the errno path to be taken even on success!
+
+Wait, but that should be OK because the caller should only care about the return value, not errno. The return value is still set correctly.
+
+Actually, let me re-read the lseek implementation more carefully:
+
+```javascript
+case 8: { const e = FD.get(a0); if (!e || e.t !== 'f') { R[2] = -1 >>> 0; return; } 
+  const o = (a1 <<
+[tr-thinking call-0115:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  0) >> 0; let np; 
+  a2 === 0 ? np = o : a2 === 1 ? np = e.p + o : np = e.sz + o; 
+  if (np < 0) R[2] = -1 >>> 0; else { e.p = np; R[2] = np >>> 0; } 
+  return; 
+}
+```
+
+Wait, `e.p` is initialized as a number. When we do `e.p + o`, if both are numbers, the result is a number. And `np >>> 0` converts to unsigned 32-bit. This should be
+[tr-thinking call-0115:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  fine for most values.
+
+But wait, there could be a subtle issue: `e.p` could be a large number that, when passed to `fs.readSync` as a position, causes issues. Node.js's `fs.readSync` can handle large positions, but we're using it as a JavaScript number which has 53-bit precision. For a 32-bit address space, this is fine.
+
+Hmm, let me think about what could cause the wrong Z_Malloc size...
+
+Actually, I just realized something. The binary uses MIPS `syscall` instruction, and in the binary's own syscall wrappers, the syscall number is put
+[tr-thinking call-0115:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  in $v0 (R[2]) and then `syscall` is executed. Our handler reads R[2] for the syscall number. But what if the binary's wrapper modifies R[2] in a way that conflicts with our handler?
+
+Let me look at the binary's syscall wrapper for `open`:
+```
+li $t2, 2      (SYS_open)
+move $t3, $a1  (save flags)
+...
+move $v0, $t2  (syscall number)
+move $a0, ...  (pathname)
+move $a1, $t3  (flags)
+...
+syscall
+move $v1, $v0  (result)
+```
+
+So $v0 =
+[tr-thinking call-0115:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  syscall number, and after syscall, $v0 = result. Our handler reads R[2] for the syscall number and writes R[2] with the result. This should be fine because the `syscall` instruction is what triggers our handler.
+
+Wait, but there's a subtle issue. The `move $v0, $t2` instruction sets R[2] = syscall number. Then `syscall` is the next instruction (or a few instructions later). Our handler reads R[2] to get the syscall number. Then it writes R[2] with the result.
+
+But what about the arguments? The binary's wrapper puts args in $a0-$a3 (R[4]-R[7])
+[tr-thinking call-0115:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  and $t0-$t1 (R[8]-R[9]). Our handler reads $a0-$a2. But the wrapper may have modified these registers between setting the syscall number and executing `syscall`.
+
+Looking at the binary's `time` wrapper:
+```
+time:
+  move $v1, $a0     # save arg
+  li $t2, 201       # syscall number
+  li $t3, 0         # clear
+  move $v0, $t2     # syscall number
+  move $a0, $v1     # restore arg
+  move $a1, $t3     # 0
+  move $a2, $t3     # 0
+  move $a3, $t3     # 0
+  move $t0, $t3    
+[tr-thinking call-0115:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  # 0
+  move $t1, $t3     # 0
+  syscall
+```
+
+OK so the wrapper correctly sets up all registers before syscall. Our handler reads R[2] (v0) for the syscall number and R[4]-R[6] (a0-a2) for args. This should work.
+
+Let me check if the issue is with how the binary opens and reads doom.wad. The binary should:
+1. Call open("doom.wad", O_RDONLY)
+2. Read the WAD header
+3. Read the lump info table
+4. Process textures, etc.
+
+Let me add
+[tr-thinking call-0115:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  a simple trace to the VM to see what's happening during the R_Init phase.
+
+Actually, let me take a different approach. Let me check if the issue is related to how I handle the `printf` format string `%i`. In the MIPS binary, `printf` is a custom implementation. When it prints `Z_Malloc: failed on allocation of %i bytes`, the `%i` should be replaced with the size value. If the printf implementation has a bug or our interpreter has a bug that causes the wrong value to be passed...
+
+Wait, but the output shows TWO lines:
+```
+Z_Malloc: failed on allocation of %i bytes
+Z_Malloc: failed on allocation of 420303204 bytes
+```
+
+The first line has %i literally.
+[tr-thinking call-0115:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  The second line has the value. This is very suspicious. It suggests that printf is being called twice, or the output is being captured differently.
+
+Actually, I bet what's happening is:
+1. I_Error calls printf (or fprintf) with the format string to stderr (fd=2)
+2. Then it calls printf with the same format string and args to stdout (fd=1)
+3. The stderr version doesn't format the %i correctly, while the stdout version does
+
+But why would stderr printf not format %i? Our syscall handler for write passes everything through to fs.writeSync. The printf implementation in the binary creates the output string internally, so it should
+[tr-thinking call-0115:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  be the same for both calls.
+
+Unless... the binary's printf implementation is doing something weird with va_args that our interpreter breaks.
+
+Actually, I think the real issue is simpler. Let me look at the I_Error output more carefully:
+
+```
+R_Init: Init DOOM refresh daemon - Z_Malloc: failed on allocation of %i bytes
+Z_Malloc: failed on allocation of 420303204 bytes
+```
+
+The first line is actually the output of a printf call from R_Init's code. The R_Init function probably calls:
+```c
+printf("R_Init: Init DOOM refresh daemon - ");
+```
+
+[tr-thinking call-0115:worker:xiaomi/mimo-v2.5-pro-ultraspeed] followed by the Z_Malloc call which fails and calls I_Error.
+
+The I_Error output includes the formatted error message. But the first line shows "%i" literally, while the second line shows the value. This means I_Error does TWO output operations:
+
+1. First, it outputs the format string WITHOUT formatting (literal text)
+2. Then, it formats and outputs the string with arguments
+
+This might be I_Error's behavior - first print the raw message, then print the formatted message. Or it could be that the vsnprintf implementation has a bug.
+
+Hmm, actually let me look at this from a different angle. What if the issue is with `
+[tr-thinking call-0115:worker:xiaomi/mimo-v2.5-pro-ultraspeed] gettimeofday`? Our implementation returns 0 always. The code uses `gettimeofday` or similar to seed random numbers. If this returns garbage, it could affect calculations.
+
+Wait, `gettimeofday` just returns 0. That shouldn't cause issues.
+
+Let me try yet another approach. Let me check if there's an issue with how the WAD file is loaded. The WAD file at /app/doom.wad is 4,196,020 bytes. Let me verify it's a valid DOOM WAD.
+
+Actually, the most productive thing would be to add logging to the VM to print
+[tr-thinking call-0115:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  the first few syscall arguments when Z_Malloc is called, and also to check what happens in the Z_Malloc function itself.
+
+Let me add a simple check: before Z_Malloc is called, what's in R[4] (the size argument)?
+
+Actually, Z_Malloc is at address 0x43856c. Let me add a simple hook: when pc is at Z_Malloc, print the arguments. But this requires modifying the interpreter, which is the running code.
+
+A simpler approach: let me modify the VM to add a watchpoint at a specific PC. I'll check when pc === 0x43856c (Z_Malloc) and log
+[tr-thinking call-0115:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  the arguments.
+
+Wait, I have a better idea. Let me modify the VM to track all writes to a specific memory range (the zone memory). Or even simpler: let me just add logging before each syscall to see what syscalls are being made and with what arguments.
+
+Actually, let me take a completely different approach. Let me check the doom.wad file to make sure it's valid, and check if the file open/read is working correctly.
+
+Actually, I think the most likely issue is something simple that I'm missing. Let me re-examine the VM carefully:
+
+1. Delay slots: handled with bd/tb mechanism
+2. Branch targets: computed as cpc+4+(si<<2)
+3. Sys
+[tr-thinking call-0115:worker:xiaomi/mimo-v2.5-pro-ultraspeed] call numbers: using x86_64 numbers in $v0
+4. Multiply: using BigInt
+5. Memory: page-based with 64KB pages
+
+Wait, one thing I want to check: when the binary does `li $v0, 2` (for SYS_open), does our interpreter handle this correctly?
+
+`li $v0, 2` is actually `addiu $v0, $zero, 2` (or `ori $v0, $zero, 2`). In our interpreter:
+- case 13 (ori): R[rt] = R[rs] | ui; - so R[2] = R[0] | 2 = 2. ✓
+- case 8/9 (addiu): R[rt
+[tr-thinking call-0115:worker:xiaomi/mimo-v2.5-pro-ultraspeed] ] = (R[rs] + si) >>> 0; - so R[2] = (0 + 2) >>> 0 = 2. ✓
+
+OK, that's fine.
+
+What about `lui $at, 0x44` followed by `addiu $a0, $at, 9641`?
+- lui: R[1] = (0x44 << 16) >>> 0 = 0x00440000
+- addiu: R[4] = (0x00440000 + 9
+[tr-thinking call-0115:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 641) >>> 0 = (0x00440000 + 0x25A9) >>> 0 = 0x004425A9
+
+Let me check: 0x004425A9 is in the .rodata section (which starts at 0x43dce0 and extends to 0x456514). Yes, 0x4425A9 is in .rodata. This should be a string pointer.
+
+OK, I'm going in circles. Let me just try to add debugging
+[tr-thinking call-0115:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  to the VM and run it again.
+
+Let me add logging around the Z_Malloc call to see what arguments are being passed.",
+
+    "plan": "Add logging to the VM to trace Z_Malloc calls and see what allocation size is being requested.",
+    "commands": [
+      {
+        "keystrokes": "cat > /app/vm_debug.js << 'DEBUGEOF'\n// Read the main vm.js and inject a debug hook at Z_Malloc\nconst fs = require('fs');\nlet code = fs.readFileSync('/app/vm.js', 'utf8');\n\n// Add debug logging for Z_Malloc (0
+[tr-thinking call-0115:worker:xiaomi/mimo-v2.5-pro-ultraspeed] x43856c)\n// Insert before 'doSys(cpc);'\nconst hook = `\n  if (cpc === 0x43856c || cpc === 0x438570) { console.error('Z_Malloc called: size=' + (R[4] >>> 0) + ' tag=' + (R[5] >>> 0) + ' pc=0x' + cpc.toString(16)); }\n`;\n\n// Write a test file that runs our VM with the debug hook\nfs.writeFileSync('/app/vm_debug.js', code);\nDEBUG
+[tr-thinking call-0115:worker:xiaomi/mimo-v2.5-pro-ultraspeed] EOF\n",
+        "duration": 0.1
+      },
+      {
+        "keystrokes": "python3 << 'PYEOF'\nwith open('/app/vm.js', 'r') as f:\n    code = f.read()\n\n# Add a debug check at the start of the main loop, before processing\n# We want to check when pc equals 0x43856c (Z_Malloc entry point)\nold = '  const cpc = pc, I = r32(cpc);'\nnew = '''  const cpc = pc, I = r32(cpc);\n  if (cpc === 0x43856c) { const sz = R[4] >>> 0;
+[tr-thinking call-0115:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  const tag = R[5] >>> 0; const usr = R[6] >>> 0; console.error('Z_Malloc args: size=' + sz + ' tag=' + tag + ' user=0x' + usr.toString(16) + ' caller=0x' + (R[31]>>>0).toString(16)); }\n  if (cpc === 0x438538) { console.error('R_InitData called'); }\n  if (cpc === 0x427bf4) { console.error('R_InitTextures called'); }'''\n\nif old in code:\n    code = code.replace(old, new, 1)\n    with open('/app/vm_trace
+[tr-thinking call-0115:worker:xiaomi/mimo-v2.5-pro-ultraspeed] .js', 'w') as f:\n        f.write(code)\n    print('Written vm_trace.js')\nelse:\n    print('Pattern not found!')\n    # Show what the code looks like around the main loop\n    idx = code.find('const cpc = pc')\n    if idx >= 0:\n        print(repr(code[idx:idx+100]))\nPYEOF\n",
+        "duration": 0.5
+      }
+    ]
+  }
+}
+
+[tr-stream call-0115:worker:xiaomi/mimo-v2.5-pro-ultraspeed] worker.done finish=stop cost_microdollars=292271
+
+[tr-stream call-0115:worker:xiaomi/mimo-v2.5-pro-ultraspeed] worker.failed
+
+[tr-stream call-0115:advisor_final:anthropic/claude-opus-4.8] advisor_final.started
+[tr-stream call-0115:advisor_final:anthropic/claude-opus-4.8] Let me add
+[tr-stream call-0115:advisor_final:anthropic/claude-opus-4.8]  tracing to the VM to find the actual bug. I'll trace the Z_Malloc call and the value passed:
+
+{
+[tr-stream call-0115:advisor_final:anthropic/claude-opus-4.8] 
+  "analysis": "Z_Malloc is at 0x43856c
+[tr-stream call-0115:advisor_final:anthropic/claude-opus-4.8] . The first argument (a0=R[4]) is the size. Let me add a trap to
+[tr-stream call-0115:advisor_final:anthropic/claude-opus-4.8]  log the call to Z_Malloc with the bad value, and trace back what computed it. The
+[tr-stream call-0115:advisor_final:anthropic/claude-opus-4.8]  R_InitTextures function (which computes texture dimensions via
+[tr-stream call-0115:advisor_final:anthropic/claude-opus-4.8]  multiply) is the likely source.",
+  "plan": "Add a debug trap when PC re
+[tr-stream call-0115:advisor_final:anthropic/claude-opus-4.8] aches Z_Malloc to log the size and return address, then run briefly to capture the trace.",
+  "comm
+[tr-stream call-0115:advisor_final:anthropic/claude-opus-4.8] ands": [
+    {
+      "keystrokes
+[tr-stream call-0115:advisor_final:anthropic/claude-opus-4.8] ": "cp /app/vm.js /tmp/vm_work.js\n",
+      "duration": 0.1
+    },
+    {
+      "
+[tr-stream call-0115:advisor_final:anthropic/claude-opus-4.8] keystrokes": "python3 << 'PYEOF'\nwith open('/app/vm.js','r') as f: c=f.read()\n# Add trace
+[tr-stream call-0115:advisor_final:anthropic/claude-opus-4.8]  for Z_Malloc (0x43856c) - log size and return address (ra=R[31])\ntrace = '''
+[tr-stream call-0115:advisor_final:anthropic/claude-opus-4.8]   if(cpc===0x43856c){const sz=R[4]|0;if(sz<0||sz>0x4000000){console.error('Z_Malloc size
+[tr-stream call-0115:advisor_final:anthropic/claude-opus-4.8] ='+sz+' (0x'+(sz>>>0).toString(16)+') ra=0x'+(R[31]>>>0).toString
+[tr-stream call-0115:advisor_final:anthropic/claude-opus-4.8] (16));}}\\n'''\nc = c.replace('  const op = I >>> 26
+[tr-stream call-0115:advisor_final:anthropic/claude-opus-4.8] ,', trace + '  const op = I >>> 26,')\nwith open('/app/vm.js','w') as f: f.write(c)\nprint('Added trace')\nPY
+[tr-stream call-0115:advisor_final:anthropic/claude-opus-4.8] EOF\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "node -c /app/vm.js && echo OK\n",
+[tr-stream call-0115:advisor_final:anthropic/claude-opus-4.8] 
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "timeout 40 node vm.js 2>&1 | grep -i '
+[tr-stream call-0115:advisor_final:anthropic/claude-opus-4.8] Z_Malloc size' | head -5\n",
+      "duration": 45.0
+    }
+  ]
+}
+
+[tr-stream call-0115:advisor_final:anthropic/claude-opus-4.8] advisor_final.done finish=stop cost_microdollars=1260864
+[tr-stream call-0115:anthropic/claude-opus-4.8] Let me add tracing to the VM to find the actual bug. I'll trace the Z_Malloc call and the value passed:
+
+{
+  "analysis": "Z_Malloc is at 0x43856c. The first argument (a0=R[4]) is the size. Let me add a trap to log the call to Z_Malloc with the bad value, and trace back what computed it. The R_InitTextures function (which computes texture dimensions via multiply) is the likely source.",
+  "plan": "Add a debug trap when PC reaches Z_Malloc to log the size and return address, then run briefly to capture the trace.",
+  "commands": [
+    {
+      "keystrokes": "cp /app/vm.js /tmp/vm_work.js\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "python3 << 'PYEOF'\nwith open('/app/vm.js','r') as f: c=f.read()\n# Add trace for Z_Malloc (0x43856c) - log size and return address (ra=R[31])\ntrace = '''  if(cpc===0x43856c){const sz=R[4]|0;if(sz<0||sz>0x4000000){console.error('Z_Malloc size='+sz+' (0x'+(sz>>>0).toString(16)+') ra=0x'+(R[31]>>>0).toString(16));}}\\n'''\nc = c.replace('  const op = I >>> 26,', trace + '  const op = I >>> 26,')\nwith open('/app/vm.js','w') as f: f.write(c)\nprint('Added trace')\nPYEOF\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "node -c /app/vm.js && echo OK\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "timeout 40 node vm.js 2>&1 | grep -i 'Z_Malloc size' | head -5\n",
+      "duration": 45.0
+    }
+  ]
+}

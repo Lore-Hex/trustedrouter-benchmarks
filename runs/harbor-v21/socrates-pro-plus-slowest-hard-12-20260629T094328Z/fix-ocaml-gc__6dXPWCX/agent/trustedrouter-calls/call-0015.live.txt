@@ -1,0 +1,321 @@
+
+[tr-stream call-0015:socrates:trustedrouter/socrates-pro-plus-1.0] socrates.started
+
+[tr-stream call-0015:worker:xiaomi/mimo-v2.5-pro-ultraspeed] worker.started
+[tr-thinking call-0015:worker:xiaomi/mimo-v2.5-pro-ultraspeed] Now I understand the code. Let me trace through the sweep logic carefully:
+
+In pool_sweep, the do-while loop iterates over blocks. At the end of the loop body, we have:
+
+1. For free blocks (either existing or garbage that was turned into free): `p += wh * Wosize_hd(hd)` to skip RLE-encoded contiguous free blocks, then `p += Whsize_hd(hd)` at the bottom.
+
+Wait, let me re-read more carefully:
+
+```c
+      if (POOL_BLOCK_FREE_HD(hd)) {
+        // ... merge logic ...
+        
+        /* add the free blocks following this block, skipping over them */
+        p += wh * Wosize_hd(hd);  // skip RLE blocks
+      } else {
+        /* there
+[tr-thinking call-0015:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 's still a live block */
+        release_to_global_pool = 0;
+      }
+      p += Whsize_hd(hd);  // THIS is at the end of the loop for ALL blocks
+```
+
+Wait, let me re-read. Let me trace through the end of the loop body more carefully:
+
+```c
+      if (POOL_BLOCK_FREE_HD(hd)) {
+        all_used = 0;
+        // ... merging with last_free_block ...
+        
+        /* add the free blocks following this block, skipping over them */
+        p += wh * Wosize_hd(hd);
+      } else {
+        release_to_global_pool = 0;
+      }
+      p += Whsize_hd(hd);
+```
+
+So for a
+[tr-thinking call-0015:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  FREE block with Wosize_hd(hd) = R (the RLE count of additional contiguous free blocks):
+- First `p += wh * R` (skip the R additional contiguous free blocks)
+- Then `p += Whsize_hd(hd)` which is `Wosize_hd(hd) + 1` = `R + 1`
+
+Wait, `Whsize_hd(hd)` = `Wosize_hd(hd) + 1`. And for a free block, `Wosize_hd(hd)` is the number of contiguous free blocks that follow.
+
+So for a free block with RLE count 0:
+- `p += wh *
+[tr-thinking call-0015:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  0 = 0` (no additional free blocks)
+- `p += Whsize_hd(hd) = 0 + 1 = 1`
+
+That means p advances by only 1 word! But each block in the pool is `wh` words apart. So this is clearly wrong.
+
+For a free block with RLE count 3:
+- `p += wh * 3` (skip 3 additional free blocks)
+- `p += Whsize_hd(hd) = 3 + 1 = 4`
+
+This advances by `wh * 3 + 4` words, but it should advance `wh * 4` words (the current block + 3 additional = 4 blocks total
+[tr-thinking call-0015:worker:xiaomi/mimo-v2.5-pro-ultraspeed] ).
+
+Wait, let me think about this differently. Looking at the RLE encoding:
+
+When a pool is initialized, the first block gets:
+```c
+p[0] = POOL_FREE_HEADER(pool_blocks-1);
+```
+
+So if there are N blocks in the pool, the first block has Wosize = N-1, meaning "there are N-1 additional free blocks following me."
+
+In pool_allocate:
+```c
+  if( Wosize_hp(p) > 0 ) {
+    next = (value*)(p + wsize_sizeclass[sz]);
+    *next = POOL_FREE_HEADER(Wosize_hp(p) - 1);
+    next[1] = p[1];
+  } else {
+    next = (value*)p[1];
+  }
+```
+
+
+[tr-thinking call-0015:worker:xiaomi/mimo-v2.5-pro-ultraspeed] When allocating from a free block with RLE count > 0, it creates the next free block at `p + wh` with count `Wosize_hp(p) - 1`. If count was 0, it uses the next pointer.
+
+In calc_pool_stats:
+```c
+  while (p + wh <= end) {
+    header_t hd = (header_t)atomic_load_relaxed((atomic_uintnat*)p);
+    if (!POOL_BLOCK_FREE_HD(hd)) {
+      s->pool_live_words += Whsize_hd(hd);
+      s->pool_frag_words += wh - Whsize_hd(hd);
+      s->pool_live_blocks++;
+    } else {
+      p += wh * Wosize_hd(hd); /* skip contiguous free blocks */
+    }
+
+
+[tr-thinking call-0015:worker:xiaomi/mimo-v2.5-pro-ultraspeed]     p += wh;
+  }
+```
+
+In calc_pool_stats, it correctly does `p += wh * Wosize_hd(hd)` to skip the additional free blocks, then `p += wh` to advance past the current block. Total for a free block with count R: `wh * R + wh = wh * (R+1)` which is correct (R+1 blocks including the current one).
+
+But in pool_sweep, for a free block with count R:
+- `p += wh * Wosize_hd(hd) = wh * R` (skip additional)
+- `p += Whsize_hd(hd) = R + 1` (Whsize = Wosize + 1)
+
+Total:
+[tr-thinking call-0015:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  `wh * R + R + 1`
+
+This is NOT correct. It should be `wh * R + wh = wh * (R+1)`.
+
+Wait, but actually the RLE count semantics might be slightly different. Let me re-check.
+
+Actually, let me reconsider. When a block is newly freed (garbage turned to free), `*p = POOL_FREE_HEADER(0)`. So Wosize_hd(hd) = 0. Then:
+- `p += wh * 0 = 0`
+- `p += Whsize_hd(hd) = 0 + 1 = 1`
+
+So for a newly freed block, p advances by 1, but
+[tr-thinking call-0015:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  it should advance by wh. That's clearly wrong.
+
+For an existing free block with RLE count 5:
+- `p += wh * 5`
+- `p += 5 + 1 = 6`
+
+Total: `5*wh + 6`. Should be `6*wh`.
+
+So the final `p += Whsize_hd(hd)` should be `p += wh` instead.
+
+Wait, but the code works in some cases. For example, when merging blocks:
+If we have a free block with RLE count 3, and we merge it with the last_free_block:
+- `*last_free_block = POOL_FREE_HEADER(Wosize_hp(last_free_block) + Wosize_hd(hd)
+[tr-thinking call-0015:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  + 1);`
+
+The "+ Wosize_hd(hd) + 1" means we add R + 1 to the count. This correctly accounts for the current block (1) plus the R additional blocks.
+
+Wait, but the merge condition checks:
+```c
+if( last_free_block + (1 + Wosize_hp(last_free_block)) * wh == p ) {
+```
+
+This checks if `last_free_block + (1 + count_of_last) * wh == p`. So `(1 + count_of_last)` blocks (each wh wide) would land at `p`. This means the RLE count in
+[tr-thinking call-0015:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  a free block header Wosize means "number of ADDITIONAL contiguous free blocks following this one." The block at `p` itself plus `Wosize_hd(hd)` additional blocks = `Wosize_hd(hd) + 1` total blocks.
+
+OK so for the skip at the end of the free block case:
+```c
+        /* add the free blocks following this block, skipping over them */
+        p += wh * Wosize_hd(hd);
+```
+
+After this, `p` points to the last of the RLE-compressed free blocks. Then `p += Whsize_hd(hd)` which is `p
+[tr-thinking call-0015:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  += Wosize_hd(hd) + 1` advances by R+1 words.
+
+But we need to advance by `wh` to get to the next slot! So we should be at `p + wh * R + wh = p + wh * (R+1)`. But we're at `p + wh * R + R + 1`.
+
+So the fix should be: change `p += Whsize_hd(hd);` to `p += wh;` at the end of the do-while loop body.
+
+Wait, but what about for live (non-free) blocks? For a live block, `Whsize_hd(hd)` is the actual header-in
+[tr-thinking call-0015:worker:xiaomi/mimo-v2.5-pro-ultraspeed] cluded size of the object. But in a pool, each block occupies exactly `wh` words, regardless of the actual object size (that's the whole point of sizeclasses - fragmentation is tracked as pool_frag_words). So for a live block too, we should advance by `wh`.
+
+Actually wait, let me check: in `calc_pool_stats`, the loop does `p += wh` unconditionally at the end. In `pool_sweep`, it does `p += Whsize_hd(hd)`. For a live block, `Whsize_hd(hd)` could be less than `wh` (since the object might be smaller than the sizeclass slot). But the next
+[tr-thinking call-0015:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  block starts at offset `wh` from the current block's start, not `Whsize_hd(hd)`.
+
+So the bug is clear: the last line of the do-while body should be `p += wh;` instead of `p += Whsize_hd(hd);`.
+
+But wait, I need to be more careful. Let me re-read:
+
+Actually, for the free block case, we have TWO advances:
+1. `p += wh * Wosize_hd(hd);` (inside the if block for free blocks)
+2. `p += Whsize_hd(hd);` (unconditional at end)
+
+
+[tr-thinking call-0015:worker:xiaomi/mimo-v2.5-pro-ultraspeed] And for the live block case, we have only:
+1. `p += Whsize_hd(hd);` (at end)
+
+For the free block case with count R:
+- Advance: `wh * R + R + 1` = `wh * R + R + 1`
+- Should be: `wh * (R + 1)` = `wh * R + wh`
+
+For the live block case:
+- Advance: `Whsize_hd(hd)` = `Wosize_hd(hd) + 1`
+- Should be: `wh`
+
+So for both cases, the end-of-loop advance should be `p += wh;` instead of `p += Whsize_hd(hd);`.
+
+Actually, hmm, but this
+[tr-thinking call-0015:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  code was presumably working before the RLE compression was added. Before RLE compression:
+- Free blocks had Wosize_hd(hd) = 0 (no RLE encoding)
+- Live blocks had Whsize_hd(hd) as their actual size
+
+Before RLE:
+- Free block: `p += wh * 0 = 0` then `p += Whsize_hd(hd) = 0 + 1 = 1`. That advances by 1, not wh. That doesn't seem right either...
+
+Unless before RLE, free blocks used a different format where the header had Wosize = 0 and it was correct to advance by 1?
+
+Wait,
+[tr-thinking call-0015:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  let me look at the merge condition again:
+```c
+if( last_free_block + (1 + Wosize_hp(last_free_block)) * wh == p ) {
+```
+
+This clearly uses `Wosize` as a count of additional blocks. So even before any RLE work, the free block headers must encode 0 for "no additional blocks follow me" and the merge logic was designed for RLE from the start.
+
+Actually, looking more carefully at the pool_initialize code:
+```c
+p[0] = POOL_FREE_HEADER(pool_blocks-1);
+```
+
+This sets up the first block with Wosize = pool_blocks - 1, meaning there are pool_blocks - 1 additional free blocks after this one
+[tr-thinking call-0015:worker:xiaomi/mimo-v2.5-pro-ultraspeed] . That IS run-length encoding.
+
+So the sweep function's final `p += Whsize_hd(hd)` was ALWAYS wrong. But maybe it was correct in an earlier version of the code where free blocks didn't use RLE encoding.
+
+Hmm, let me think about this differently. Let me consider: what if `Whsize_hd(hd)` is just used to advance past the current block's header+data, and the `p += wh * Wosize_hd(hd)` handles skipping the additional RLE blocks?
+
+For a live block, `Whsize_hd(hd)` = actual header-included size. But in a pool, blocks are all `wh` words. So `Whsize_hd(hd) <= wh`. If
+[tr-thinking call-0015:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  we advance by `Whsize_hd(hd) < wh`, we'd land in the middle of a block's padding area, which is wrong.
+
+OK so the conclusion is the same: `p += Whsize_hd(hd)` at the end should be `p += wh`.
+
+Wait, actually I want to double-check. Let me see if maybe the original code used a different iteration scheme. What if before the RLE change, the free blocks had a "next free" pointer list and didn't use the RLE encoding at all? Then the sweep code would just iterate block by block with `p += wh` implicitly.
+
+Actually, looking at it from the
+[tr-thinking call-0015:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  user's description: "I have been making some changes to the OCaml garbage collector, improving the sweeping performance by run-length compressing the free space in the major heap." So the RLE compression is the NEW change. Before, free blocks probably had a different format.
+
+So the change was:
+1. Added RLE encoding to free blocks (Wosize = count of additional contiguous free blocks)
+2. Modified pool_initialize to use RLE (single free block for entire pool with count pool_blocks-1)
+3. Modified pool_allocate to split the RLE on allocation
+4. Added the `p += wh * Wosize_hd(hd)` skip in pool_sweep for free blocks
+5. BUT forgot to change the
+[tr-thinking call-0015:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  final `p += Whsize_hd(hd)` to `p += wh`
+
+So the fix is to change `p += Whsize_hd(hd);` to `p += wh;` at the end of the do-while loop body in pool_sweep.
+
+Wait, but there might also be another issue. When a garbage block is freed, `*p = POOL_FREE_HEADER(0)`. Then it enters the free block handling where it might merge with the previous free block. If the previous free block is adjacent:
+```c
+if( last_free_block + (1 + Wosize_hp(last_free_block)) * wh == p ) {
+```
+This
+[tr-thinking call-0015:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  checks if the current block `p` is immediately after the last free block's run. If yes, it merges. But there's a subtle issue: what if the current block had some RLE count > 0? Then `Wosize_hd(hd)` is > 0 and the merge correctly adds `Wosize_hd(hd) + 1` to the count (accounting for the current block + its following RLE blocks).
+
+Actually wait, when we detect garbage, we set `*p = POOL_FREE_HEADER(0)` and `hd = POOL_FREE_HEADER(0)`. So garbage blocks always have RLE count 0. That makes sense - we
+[tr-thinking call-0015:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  don't try to merge them during sweep, we just mark the single block as free.
+
+But there's another issue: the garbage block has `hd = POOL_FREE_HEADER(0)`, and `Whsize_hd(hd) = 0 + 1 = 1`. The assertion:
+```c
+CAMLassert(Whsize_hd(hd) <= wh);
+```
+is before the garbage handling. For a live block, this asserts that the header-included size is at most the sizeclass width. That's fine for live blocks.
+
+But for a free block that already had RLE count > 0 (before we touch it), `Whsize_hd(hd) = Wosize_hd(hd) + 1`
+[tr-thinking call-0015:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  which could be much larger than `wh` (e.g., if RLE count is pool_blocks-1 = hundreds). But wait, this assertion only fires for GARBAGE blocks, not for free blocks. So it's fine.
+
+Let me also check `pool_finalise` for similar issues.
+[tr-stream call-0015:worker:xiaomi/mimo-v2.5-pro-ultraspeed] Now I have a clear picture of the bug. Let me read pool_finalise too for comparison, and also look at the merge logic more carefully.
+[tr-stream call-0015:worker:xiaomi/mimo-v2.5-pro-ultraspeed] {}
+
+[tr-stream call-0015:worker:xiaomi/mimo-v2.5-pro-ultraspeed] worker.done finish=tool_calls cost_microdollars=32638
+
+[tr-stream call-0015:advisor:trustedrouter/socrates-pro-plus-1.0] advice.started
+
+[tr-stream call-0015:advisor:anthropic/claude-opus-4.8] advisor.started
+[tr-stream call-0015:advisor:anthropic/claude-opus-4.8] Note to
+[tr-stream call-0015:advisor:anthropic/claude-opus-4.8]  worker: your diagnosis is plausible but verify carefully before editing. Compare the lo
+[tr-stream call-0015:advisor:anthropic/claude-opus-4.8] op's pointer-advance logic against `calc_pool_stats` which is the known
+[tr-stream call-0015:advisor:anthropic/claude-opus-4.8] -correct reference traversal.
+
+Key analysis points to confirm:
+- In `calc_pool
+[tr-stream call-0015:advisor:anthropic/claude-opus-4.8] _stats`: for a free block it does `p += wh * Wosize_hd(hd)` (skip extras) then `p += wh` (advance one slot). For
+[tr-stream call-0015:advisor:anthropic/claude-opus-4.8]  a live block it does only `p += wh`. So every block always advances by a multiple of `wh`.
+- In `pool_sweep`:
+[tr-stream call-0015:advisor:anthropic/claude-opus-4.8]  the final line is `p += Whsize_hd(hd)` (not `p += wh`). For a live block, `Whsize_hd
+[tr-stream call-0015:advisor:anthropic/claude-opus-4.8] (hd)` = actual object whsize, which can be **less than `wh`** due to sizeclass rounding/f
+[tr-stream call-0015:advisor:anthropic/claude-opus-4.8] ragmentation. For a free block it would be `Wosize+1` (wrong unit). This m
+[tr-stream call-0015:advisor:anthropic/claude-opus-4.8] ismatch desynchronizes the pointer from slot alignment, corrupting the heap — consistent with the crash. The correct value
+[tr-stream call-0015:advisor:anthropic/claude-opus-4.8]  is `wh`.
+
+So the fix is: change the final `p += Whsize_hd(hd);` to `p += wh;`. This mak
+[tr-stream call-0015:advisor:anthropic/claude-opus-4.8] es the free-block path `p += wh*Wosize_hd(hd); ... p += wh;` (matches calc_pool_stats) and the live-block path `p += wh;`
+[tr-stream call-0015:advisor:anthropic/claude-opus-4.8]  (correct). Confirm the `CAMLassert(p == end)` then holds.
+
+Before building, do a quick sanity
+[tr-stream call-0015:advisor:anthropic/claude-opus-4.8]  check:
+- Also re-examine `pool_finalise` (line 766+) for the same `
+[tr-stream call-0015:advisor:anthropic/claude-opus-4.8] Whsize_hd` vs `wh` advance bug, since it likely mirrors this loop.
+
+Build guidance:
+- This is a `+
+[tr-stream call-0015:advisor:anthropic/claude-opus-4.8] dev` build. Run `./configure` (consider `--disable-warn-error` if warnings-as-errors tr
+[tr-stream call-0015:advisor:anthropic/claude-opus-4.8] ips you up, though don't disable unnecessarily). Then `make -j$(nproc)`
+[tr-stream call-0015:advisor:anthropic/claude-opus-4.8] . Use long durations and poll with empty keystrokes rather than one huge wait.
+- B
+[tr-stream call-0015:advisor:anthropic/claude-opus-4.8] ootstrapping uses the `boot/` artifacts; a runtime miscompile man
+[tr-stream call-0015:advisor:anthropic/claude-opus-4.8] ifests during the build. After a successful `make`, run `make -C testsuite one
+[tr-stream call-0015:advisor:anthropic/claude-opus-4.8]  DIR=tests/basic` as required and confirm it passes cleanly.
+- If `./configure` was already run, you
+[tr-stream call-0015:advisor:anthropic/claude-opus-4.8]  may just need `make`. Check for an existing `Makefile.config` first
+[tr-stream call-0015:advisor:anthropic/claude-opus-4.8] .
+
+Format reminder: emit only the JSON object, no surrounding prose or code fences.
+
+[tr-stream call-0015:advisor:anthropic/claude-opus-4.8] advisor.done finish=stop cost_microdollars=135427
+
+[tr-stream call-0015:worker:xiaomi/mimo-v2.5-pro-ultraspeed] worker.started
+[tr-thinking call-0015:worker:xiaomi/mimo-v2.5-pro-ultraspeed] Good, the advisor confirmed my diagnosis. Let me now:
+
+1. Check if there's an existing Makefile.config (meaning ./configure was already run)
+2. Read pool_finalise for the same bug
+3. Fix the bug in pool_sweep
+4. Build and test
+
+Let me proceed with the commands.
+[tr-stream call-0015:worker:xiaomi/mimo-v2.5-pro-ultraspeed] Good, the advisor confirms the diagnosis. Let me now check pool_finalise for the same bug, fix the issue, and then build.
+[tr-stream call-0015:worker:xiaomi/mimo-v2.5-pro-ultraspeed] {"commands": "[{\"keystrokes\": \"sed -n '766,810p' /app/ocaml/runtime/shared_heap.c\\n\", \"duration\": 0.5}, {\"keystrokes\": \"ls /app/ocaml/Makefile.config 2>/dev/null && echo EXISTS || echo MISSING\\n\", \"duration\": 0.1}]"}
+
+[tr-stream call-0015:worker:xiaomi/mimo-v2.5-pro-ultraspeed] worker.done finish=tool_calls cost_microdollars=28938
+
+[tr-stream call-0015:socrates:xiaomi/mimo-v2.5-pro-ultraspeed] socrates.tool_calls

@@ -1,0 +1,176 @@
+
+[tr-stream call-0094:socrates:trustedrouter/socrates-pro-plus-1.0] socrates.started
+
+[tr-stream call-0094:worker:xiaomi/mimo-v2.5-pro-ultraspeed] worker.started
+[tr-thinking call-0094:worker:xiaomi/mimo-v2.5-pro-ultraspeed] The emb RMS for wo=0 (wte first) is 0.150, and for wo=1 (wpe first) is 0.350. Neither is wrong per se - the values depend on the specific embeddings being summed.
+
+The key insight from the advisor is that the emb RMS of 0.150 is suspicious. But actually, GPT-2 embedding vectors have RMS around 0.1-0.3, so this might be normal.
+
+Let me think about what I know:
+1. The first 1024*768 = 786432 floats in the file,
+[tr-thinking call-0094:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  treated as wte[0][:4] = 0.4803 -0.5254 -0.4293 -0.2060
+2. These look like reasonable embedding values
+3. The ln1 gammas at offset 39383808 have values like 0.0126 0.1113 -0.0190 -0.0797
+
+Wait - the key issue might be that this IS a gamma-1 format. The values are small but non-zero. In the original GPT-2, gammas are initialized to 1.0 and trained.
+[tr-thinking call-0094:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  In a gamma-1 format, the values would be stored as gamma-1, meaning the actual gamma is 1.0 + stored_value.
+
+If stored values are ~0.01, then actual gamma would be ~1.01, which makes sense for trained LN gammas.
+
+But earlier when I tried gamma-1 with the standard per-layer layout and [in,out] weights, the output was empty. And with [out,in] weights it was also bad.
+
+Let me look at the earlier results more carefully:
+
+- test3 (standard order, direct gamma, [out,in] weights): logit 11.56, "Rover"  
+- test3
+[tr-thinking call-0094:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  (standard order, direct gamma, [in,out] weights): logit 46.11, "stereotypical"
+- The [out,in] format with direct gamma gave the most reasonable logit (11.56)
+
+And with gamma+1:
+- Standard + [in,out] + gamma+1: empty output
+- Standard + [out,in] + gamma+1: empty output
+
+Wait, the empty output came from the gamma+1 test. Let me re-read: I tested `g[i]+1` with standard layout + [out,in] weights, and it gave `The meaning of life is ` (nothing). The ln
+[tr-thinking call-0094:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 1 rms was 0.195 without gamma fix. With gamma+1 it would be much larger, potentially blowing up.
+
+Actually, wait. The gammas at the expected position have avg|value| of 0.0147 (not 0.1). These are very close to zero, which would mean gamma ≈ 1.0 if stored as gamma-1, or gamma ≈ 0.01 if stored directly (which would make no sense for layer norm).
+
+Actually, looking at the earlier diagnostic again:
+- Layer 0 at offset 39383808: avg|v| = 0.1022 (for the first 768 values
+[tr-thinking call-0094:worker:xiaomi/mimo-v2.5-pro-ultraspeed] )
+- These are NOT small values like 0.01 - they're ~0.1 average absolute value
+
+And the individual values are like: 0.0126, 0.1113, -0.0190, -0.0797
+
+These could be LN gammas stored as gamma-1 (actual gamma ≈ 1.0), OR they could be the start of a weight matrix.
+
+But wait, I checked: the entire per-layer size (7087872) doesn't contain any block of 768 with avg|v| between 0.9 and 1.1. This means
+[tr-thinking call-0094:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  there are NO direct gamma values in the layer data. So gammas MUST be stored as gamma-1.
+
+But when I tested gamma+1 with the standard per-layer layout, the output was empty. Let me think about why...
+
+Actually, I realize the issue might be more subtle. In the `test3` result, the most reasonable logit was with [out,in] weights and direct gamma (no +1): logit 11.56 "Rover". This is the lowest reasonable logit among all results. With gamma+1, the gammas become ~1.01 which would scale up the normalized values, potentially causing
+[tr-thinking call-0094:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  logits to blow up.
+
+Wait, but 11.56 for "Rover" after "The meaning of life is" is not correct GPT-2 output. GPT-2 should produce something like "to" or "a" after that prompt.
+
+I'm stuck in a loop. Let me try one completely different approach: what if the problem isn't the weight layout at all, but rather the embedding lookups? What if wte is stored as [768, 50257] instead of [50257, 768]? This would mean wte[token_id] should be accessed as wte[i*V + token_id] for dimension i,
+[tr-thinking call-0094:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  not wte[token_id*C + i].
+
+But I already tested this in the `trans.c` brute force with wte_t=1 (transposed embeddings), and it didn't help either.
+
+I think the issue might be that I'm not correctly identifying the checkpoint format at all. It's possible this is a completely custom format that requires additional header information or metadata that I'm not reading.
+
+Let me look at the file size more carefully: 497759232 bytes. 
+- 497759232 / 4 = 124439808 floats
+- Expected G
+[tr-thinking call-0094:worker:xiaomi/mimo-v2.5-pro-ultraspeed] PT-2 124M params: 50257*768 + 1024*768 + 12*(768+768 + 768*2304+2304 + 768*768+768 + 768+768 + 768*3072+3072 + 3072*768+768) + 768+768
+  = 38597376 + 786432 + 12*7087872 + 15
+[tr-thinking call-0094:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 36
+  = 38597376 + 786432 + 85054464 + 1536
+  = 124439808
+
+This matches exactly! So the file IS raw float32 with no header. The issue must be in the forward pass logic.
+
+At this point, I should accept that my implementation has a bug that I cannot find through systematic testing. Let me try the absolute simplest approach: check if maybe the problem is that I should be using the original [in, out] format for QKV weights but the output
+[tr-thinking call-0094:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  projection and MLP projections use [out, in] format. This mixed format is unlikely but possible.
+
+Actually, let me reconsider the test results. The best result was:
+- test3: standard layout, direct gamma, [out,in]: logit 11.56 "Rover"
+
+With [in,out] we got:
+- Standard layout, direct gamma, [in,out]: logit 46.11 "stereotypical"
+
+The logit of 46.11 is abnormally high. This strongly suggests that the [in,out] format is WRONG for the QKV matrix (which contributes most of the parameters
+[tr-thinking call-0094:worker:xiaomi/mimo-v2.5-pro-ultraspeed] ) since the logits are way too confident.
+
+With [out,in] and logit 11.56 "Rover", the logit is more reasonable but the output is still wrong.
+
+Actually, wait. What if the issue is with the c_attn weight specifically? The c_attn weight in GPT-2 combines Q, K, V into one matrix. The standard format stores it as [768, 2304] where 2304 = 3*768. With [in,out], this means input dim 768, output dim 2304.
+
+But what if this specific checkpoint
+[tr-thinking call-0094:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  stores Q, K, V as SEPARATE weight matrices instead of concatenated? In the TF checkpoint, they would be stored separately as:
+- model/h0/attn/c_attn/w/q: [768, 768]
+- model/h0/attn/c_attn/w/k: [768, 768]  
+- model/h0/attn/c_attn/w/v: [768, 768]
+
+If they're stored as separate matrices with [out, in] format, the sizes would be:
+- q: [768, 768] = 589824
+- k: [768, 768] = 589824
+- v: [768, 7
+[tr-thinking call-0094:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 68] = 589824
+- Total: 1769472 = same as one concatenated matrix
+
+So the data would be at the same offset, but the indexing within the QKV block would be different. With separate Q,K,V:
+- q[i*768+j]: row i, col j of Q weight
+- k[i*768+j]: row i, col j of K weight  
+- v[i*768+j]: row i, col j of V weight
+
+But with concatenated [768, 2304]:
+- w[i*2304+j]: row i, col j, where j < 768 →
+[tr-thinking call-0094:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  Q, 768 ≤ j < 1536 → K, 1536 ≤ j < 2304 → V
+
+These should be equivalent in memory layout since Q comes first, then K, then V in both cases.
+
+Wait, actually in TF the variable names are q, k, v which sort alphabetically as k, q, v. So if the dump iterates variables alphabetically, the order would be K, Q, V instead of Q, K, V!
+
+That's it! If the QKV weights are stored in alphabetical order (k, q, v) instead of (q, k, v), then the
+[tr-thinking call-0094:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  bias offsets and weight column assignments would be wrong in my code.
+
+Let me test: instead of the standard QKV layout where:
+- Columns 0..767 → Q
+- Columns 768..1535 → K  
+- Columns 1536..2303 → V
+
+It should be:
+- Columns 0..767 → K
+- Columns 768..1535 → Q
+- Columns 1536..2303 → V
+
+Let me write a test for this.
+[tr-stream call-0094:worker:xiaomi/mimo-v2.5-pro-ultraspeed] {
+  "analysis": "I just realized something critical. In TF's alphabetical variable ordering, the QKV sub
+[tr-stream call-0094:worker:xiaomi/mimo-v2.5-pro-ultraspeed] -weights would be stored as K, Q, V (alphabetical) instead of Q, K, V. This means columns 0..767 = K, 768..1535 = Q, 1536..2303 = V. This could explain the wrong output. Let me test this.",
+  "plan": "Write a test with K-Q-V column ordering instead of Q-K-V ordering in the attention computation.",
+  "commands": [
+    {
+      "keystrokes": "cat > /app/test_kqv.c << 'CEOF'\n#include<stdio.h>\n#include<stdlib.h>\n#include<string.h>\n#include<math.h>\n#define C 768\n#define H 12\n#define D 64\n#define F 3072\n#define V 50257\n#define NM
+[tr-stream call-0094:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  50000\n#define Z 131071\nfloat*W;int tk[1024],nt,bt[256];char ts[V][32];int tl[V],th[Z],tn[Z],mh[Z],mn[Z],ml[NM],mr[NM];\nunsigned char rb[V][32];int rl[V];\nunsigned hf(const char*s,int n){unsigned h=5381;for(int i=0;i<n;i++)h=h*33+(unsigned char)s[i];return h%Z;}\nvoid ti(int i){unsigned h=hf(ts[i],tl[i]);tn[i]=th[h];th[h]=i;}\nint tf(const char*s,int n){unsigned h=
+[tr-stream call-0094:worker:xiaomi/mimo-v2.5-pro-ultraspeed] hf(s,n);for(int i=th[h];i>=0;i=tn[i])if(tl[i]==n&&!memcmp(ts[i],s,n))return i;return-1;}\nunsigned mhash(int l,int r){return((unsigned)l*V+r)%Z;}\nint mf(int l,int r){unsigned h=mhash(l,r);for(int i=mh[h];i>=0;i=mn[i])if(ml[i]==l&&mr[i]==r)return i;return-1;}\nvoid mi(int i){unsigned h=mhash(ml[i],mr[i]);mn[i]=mh[h];mh[h]=i;}\nvoid lb(char*p){memset(th,-1,sizeof(th));memset(mh,-1,sizeof(mh));unsigned s[256];int n=0;\nfor(int i=
+[tr-stream call-0094:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 0;i<256;i++)if((i>=33&&i<=126)||(i>=161&&i<=172)||(i>=174&&i<=255))s[i]=i;else s[i]=256+n++;\nfor(int b=0;b<256;b++){int q=0;for(int j=0;j<256;j++)if(s[j]<s[b])q++;bt[b]=q;}\nfor(int b=0;b<256;b++){int t=bt[b];unsigned c=s[b];rb[t][0]=b;rl[t]=1;\nif(c<128){ts[t][0]=c;tl[t]=1;}else if(c<2048){ts[t][0]=0xC0|(
+[tr-stream call-0094:worker:xiaomi/mimo-v2.5-pro-ultraspeed] c>>6);ts[t][1]=0x80|(c&63);tl[t]=2;}\nelse{ts[t][0]=0xE0|(c>>12);ts[t][1]=0x80|((c>>6)&63);ts[t][2]=0x80|(c&63);tl[t]=3;}ti(t);}\nFILE*f=fopen(p,\"r\");char ln[256];fgets(ln,256,f);int x=0;\nwhile(fgets(ln,256,f)&&x<NM){int l=strlen(ln);if(ln[l-1]=='\\n')ln[--l]=0;int sp=-1;\nfor(int i=0;i<l;i++)if(ln[i]==' '){sp=i;break
+[tr-stream call-0094:worker:xiaomi/mimo-v2.5-pro-ultraspeed] ;}if(sp<0)continue;\nint li=tf(ln,sp),ri=tf(ln+sp+1,l-sp-1);if(li<0||ri<0)continue;\nml[x]=li;mr[x]=ri;int a=tl[li];memcpy(ts[256+x],ts[li],a);\nmemcpy(ts[256+x]+a,ts[ri],tl[ri]);tl[256+x]=a+tl[ri];\nmemcpy(rb[256+x],rb[li],rl[li]);memcpy(rb[256+x]+rl[li],rb[ri],rl[ri]);\nrl[256+x]=rl[li]+rl[ri];ti(256+x);mi(x);x
+[tr-stream call-0094:worker:xiaomi/mimo-v2.5-pro-ultraspeed] ++;}fclose(f);}\nint tokenize(char*t,int*o){int n=strlen(t);for(int i=0;i<n;i++)o[i]=bt[(unsigned char)t[i]];\nwhile(1){int bs=NM,bp=-1;for(int i=0;i<n-1;i++){int r=mf(o[i],o[i+1]);if(r>=0&&r<bs){bs=r;bp=i;}}\nif(bp<0)break;o[bp]=256+bs;memmove(o+bp+1,o+bp+2,(n-bp-2)*sizeof(int));n--;}return n;}\nfloat sc[1024];\nfloat G(float x){return.5f*x*(1+tanhf
+[tr-stream call-0094:worker:xiaomi/mimo-v2.5-pro-ultraspeed] (.7978845608f*(x+.044715f*x*x*x)));}\nvoid Ln(float*x,float*o,float*g,float*b,int T){for(int t=0;t<T;t++){float m=0,v=0;\nfor(int i=0;i<C;i++)m+=x[t*C+i];m/=C;\nfor(int i=0;i<C;i++)v+=(x[t*C+i]-m)*(x[t*C+i]-m);v=sqrtf(v/C+1e-5f);\nfor(int i=0;i<C;i++)o[t*C+i]=(x[t*C+i]-m)/v*g[i]+b[i];}}\nfloat lo[2];\n/*
+[tr-stream call-0094:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  qkv_order: 0=QKV, 1=KQV */\nvoid run(int wm,int qkv){\nfloat*wte=W,*wpe=W+V*C,*p=wpe+1024*C;\nfloat*x=calloc(1024*C,sizeof(float)),*xn=malloc(1024*C*sizeof(float)),\n*qk=malloc(1024*3*C*sizeof(float)),*ao=malloc(1024*C*sizeof(float)),\n*ff=malloc(1024*F*sizeof(float));\nint T=nt;\nfor(int t=0;t
+[tr-stream call-0094:worker:xiaomi/mimo-v2.5-pro-ultraspeed] <T;t++)for(int i=0;i<C;i++)x[t*C+i]=wte[tk[t]*C+i]+wpe[t*C+i];\nfor(int l=0;l<12;l++){\nLn(x,xn,p,p+C,T);p+=2*C;\nfor(int t=0;t<T;t++)for(int j=0;j<3*C;j++){float s=p[C*3*C+j];\nif(wm==0)for(int i=0;i<C;i++)s+=xn[t*C+i]*p[i*3*C+j];\nelse for(int i=0;i<C;i++)s+=xn[t*C+i]*p[j*C+i];\nqk[t*3*C+j]=s;}p+=C*3*C+
+[tr-stream call-0094:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 3*C;\nfor(int h=0;h<H;h++)for(int t=0;t<T;t++){\nfor(int s=0;s<=t;s++){float d=0;for(int i=0;i<D;i++){\nint qi=0,ki=C;\nif(qkv==1){qi=C;ki=0;}\nd+=qk[t*3*C+qi+h*D+i]*qk[s*3*C+ki+h*D+i];}sc[s]=d/sqrtf(D);}\nfloat mx=-1e30f;for(int s=0;s<=t;s++)if(sc[s]>mx)mx=sc[s];\nfloat ss=0
+[tr-stream call-0094:worker:xiaomi/mimo-v2.5-pro-ultraspeed] ;for(int s=0;s<=t;s++){sc[s]=expf(sc[s]-mx);ss+=sc[s];}\nfor(int s=0;s<=t;s++)sc[s]/=ss;\nfor(int i=0;i<D;i++){float v=0;for(int s=0;s<=t;s++)v+=sc[s]*qk[s*3*C+2*C+h*D+i];ao[t*C+h*D+i]=v;}}\nfor(int t=0;t<T;t++)for(int j=0;j<C;j++){float s=p[C*C+j];\nif(wm==0)for(int i=0;i<C;i++)s+=ao[t*C+i]*p[i*C+j];\nelse for(int i=0;i<C;i++)s+=ao[t*C+i]*p[j*C+i];x[t*C+j]+=s;}
+[tr-stream call-0094:worker:xiaomi/mimo-v2.5-pro-ultraspeed] p+=C*C+C;\nLn(x,xn,p,p+C,T);p+=2*C;\nfor(int t=0;t<T;t++)for(int j=0;j<F;j++){float s=p[C*F+j];\nif(wm==0)for(int i=0;i<C;i++)s+=xn[t*C+i]*p[i*F+j];\nelse for(int i=0;i<C;i++)s+=xn[t*C+i]*p[j*C+i];ff[t*F+j]=G(s);}p+=C*F+F;\nfor(int t=0;t<T;t++)for(int j=0;j<C;j++){float s=p[F*C+j];\nif(wm==0)for(int i=0;i<F;i++)s+=ff[t*F+i]*p[i*C+j];\nelse for(int i
+[tr-stream call-0094:worker:xiaomi/mimo-v2.5-pro-ultraspeed] =0;i<F;i++)s+=ff[t*F+i]*p[j*F+i];x[t*C+j]+=s;}p+=F*C+C;}\nLn(x,xn,p,p+C,T);\nint lt=T-1,best=0;float bv=-1e30f;\nfor(int j=0;j<V;j++){float s=0;for(int i=0;i<C;i++)s+=xn[lt*C+i]*wte[j*C+i];if(s>bv){bv=s;best=j;}}\nlo[0]=bv;lo[1]=best;\nfree(x);free(xn);free(qk);free(ao);free(ff);}\nint main(int argc,char**argv){\nFILE*f=fopen(argv[1],\"
+[tr-stream call-0094:worker:xiaomi/mimo-v2.5-pro-ultraspeed] rb\");fseek(f,0,SEEK_END);long sz=ftell(f);fseek(f,0,SEEK_SET);\nW=malloc(sz);fread(W,1,sz,f);fclose(f);\nlb(argv[2]);nt=tokenize(argv[3],tk);\nfor(int wm=0;wm<2;wm++)for(int qkv=0;qkv<2;qkv++){\nrun(wm,qkv);\nint best=(int)lo[1];\nprintf(\"wm=%d qkv=%d: tok=%d logit=%.2f str=\\\"\",wm,qkv,best,lo[0]);\nfwrite(rb[best],1,rl[best],stdout);printf(\"\\\"
+[tr-stream call-0094:worker:xiaomi/mimo-v2.5-pro-ultraspeed] \\n\");}\nreturn 0;}\nCEOF\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "wc -c /app/test_kqv.c && gcc -O3 -o /app/test_kqv /app/test_kqv.c -lm 2>&1 | grep error; /app/test_kqv gpt2-124M.ckpt vocab.bpe \"The meaning of life is\" 2>&1 | grep -v warn\n",
+      "duration": 120.0
+    }
+  ]
+}
+
+[tr-stream call-0094:worker:xiaomi/mimo-v2.5-pro-ultraspeed] worker.done finish=stop cost_microdollars=337981
+[tr-stream call-0094:xiaomi/mimo-v2.5-pro-ultraspeed] {
+  "analysis": "I just realized something critical. In TF's alphabetical variable ordering, the QKV sub-weights would be stored as K, Q, V (alphabetical) instead of Q, K, V. This means columns 0..767 = K, 768..1535 = Q, 1536..2303 = V. This could explain the wrong output. Let me test this.",
+  "plan": "Write a test with K-Q-V column ordering instead of Q-K-V ordering in the attention computation.",
+  "commands": [
+    {
+      "keystrokes": "cat > /app/test_kqv.c << 'CEOF'\n#include<stdio.h>\n#include<stdlib.h>\n#include<string.h>\n#include<math.h>\n#define C 768\n#define H 12\n#define D 64\n#define F 3072\n#define V 50257\n#define NM 50000\n#define Z 131071\nfloat*W;int tk[1024],nt,bt[256];char ts[V][32];int tl[V],th[Z],tn[Z],mh[Z],mn[Z],ml[NM],mr[NM];\nunsigned char rb[V][32];int rl[V];\nunsigned hf(const char*s,int n){unsigned h=5381;for(int i=0;i<n;i++)h=h*33+(unsigned char)s[i];return h%Z;}\nvoid ti(int i){unsigned h=hf(ts[i],tl[i]);tn[i]=th[h];th[h]=i;}\nint tf(const char*s,int n){unsigned h=hf(s,n);for(int i=th[h];i>=0;i=tn[i])if(tl[i]==n&&!memcmp(ts[i],s,n))return i;return-1;}\nunsigned mhash(int l,int r){return((unsigned)l*V+r)%Z;}\nint mf(int l,int r){unsigned h=mhash(l,r);for(int i=mh[h];i>=0;i=mn[i])if(ml[i]==l&&mr[i]==r)return i;return-1;}\nvoid mi(int i){unsigned h=mhash(ml[i],mr[i]);mn[i]=mh[h];mh[h]=i;}\nvoid lb(char*p){memset(th,-1,sizeof(th));memset(mh,-1,sizeof(mh));unsigned s[256];int n=0;\nfor(int i=0;i<256;i++)if((i>=33&&i<=126)||(i>=161&&i<=172)||(i>=174&&i<=255))s[i]=i;else s[i]=256+n++;\nfor(int b=0;b<256;b++){int q=0;for(int j=0;j<256;j++)if(s[j]<s[b])q++;bt[b]=q;}\nfor(int b=0;b<256;b++){int t=bt[b];unsigned c=s[b];rb[t][0]=b;rl[t]=1;\nif(c<128){ts[t][0]=c;tl[t]=1;}else if(c<2048){ts[t][0]=0xC0|(c>>6);ts[t][1]=0x80|(c&63);tl[t]=2;}\nelse{ts[t][0]=0xE0|(c>>12);ts[t][1]=0x80|((c>>6)&63);ts[t][2]=0x80|(c&63);tl[t]=3;}ti(t);}\nFILE*f=fopen(p,\"r\");char ln[256];fgets(ln,256,f);int x=0;\nwhile(fgets(ln,256,f)&&x<NM){int l=strlen(ln);if(ln[l-1]=='\\n')ln[--l]=0;int sp=-1;\nfor(int i=0;i<l;i++)if(ln[i]==' '){sp=i;break;}if(sp<0)continue;\nint li=tf(ln,sp),ri=tf(ln+sp+1,l-sp-1);if(li<0||ri<0)continue;\nml[x]=li;mr[x]=ri;int a=tl[li];memcpy(ts[256+x],ts[li],a);\nmemcpy(ts[256+x]+a,ts[ri],tl[ri]);tl[256+x]=a+tl[ri];\nmemcpy(rb[256+x],rb[li],rl[li]);memcpy(rb[256+x]+rl[li],rb[ri],rl[ri]);\nrl[256+x]=rl[li]+rl[ri];ti(256+x);mi(x);x++;}fclose(f);}\nint tokenize(char*t,int*o){int n=strlen(t);for(int i=0;i<n;i++)o[i]=bt[(unsigned char)t[i]];\nwhile(1){int bs=NM,bp=-1;for(int i=0;i<n-1;i++){int r=mf(o[i],o[i+1]);if(r>=0&&r<bs){bs=r;bp=i;}}\nif(bp<0)break;o[bp]=256+bs;memmove(o+bp+1,o+bp+2,(n-bp-2)*sizeof(int));n--;}return n;}\nfloat sc[1024];\nfloat G(float x){return.5f*x*(1+tanhf(.7978845608f*(x+.044715f*x*x*x)));}\nvoid Ln(float*x,float*o,float*g,float*b,int T){for(int t=0;t<T;t++){float m=0,v=0;\nfor(int i=0;i<C;i++)m+=x[t*C+i];m/=C;\nfor(int i=0;i<C;i++)v+=(x[t*C+i]-m)*(x[t*C+i]-m);v=sqrtf(v/C+1e-5f);\nfor(int i=0;i<C;i++)o[t*C+i]=(x[t*C+i]-m)/v*g[i]+b[i];}}\nfloat lo[2];\n/* qkv_order: 0=QKV, 1=KQV */\nvoid run(int wm,int qkv){\nfloat*wte=W,*wpe=W+V*C,*p=wpe+1024*C;\nfloat*x=calloc(1024*C,sizeof(float)),*xn=malloc(1024*C*sizeof(float)),\n*qk=malloc(1024*3*C*sizeof(float)),*ao=malloc(1024*C*sizeof(float)),\n*ff=malloc(1024*F*sizeof(float));\nint T=nt;\nfor(int t=0;t<T;t++)for(int i=0;i<C;i++)x[t*C+i]=wte[tk[t]*C+i]+wpe[t*C+i];\nfor(int l=0;l<12;l++){\nLn(x,xn,p,p+C,T);p+=2*C;\nfor(int t=0;t<T;t++)for(int j=0;j<3*C;j++){float s=p[C*3*C+j];\nif(wm==0)for(int i=0;i<C;i++)s+=xn[t*C+i]*p[i*3*C+j];\nelse for(int i=0;i<C;i++)s+=xn[t*C+i]*p[j*C+i];\nqk[t*3*C+j]=s;}p+=C*3*C+3*C;\nfor(int h=0;h<H;h++)for(int t=0;t<T;t++){\nfor(int s=0;s<=t;s++){float d=0;for(int i=0;i<D;i++){\nint qi=0,ki=C;\nif(qkv==1){qi=C;ki=0;}\nd+=qk[t*3*C+qi+h*D+i]*qk[s*3*C+ki+h*D+i];}sc[s]=d/sqrtf(D);}\nfloat mx=-1e30f;for(int s=0;s<=t;s++)if(sc[s]>mx)mx=sc[s];\nfloat ss=0;for(int s=0;s<=t;s++){sc[s]=expf(sc[s]-mx);ss+=sc[s];}\nfor(int s=0;s<=t;s++)sc[s]/=ss;\nfor(int i=0;i<D;i++){float v=0;for(int s=0;s<=t;s++)v+=sc[s]*qk[s*3*C+2*C+h*D+i];ao[t*C+h*D+i]=v;}}\nfor(int t=0;t<T;t++)for(int j=0;j<C;j++){float s=p[C*C+j];\nif(wm==0)for(int i=0;i<C;i++)s+=ao[t*C+i]*p[i*C+j];\nelse for(int i=0;i<C;i++)s+=ao[t*C+i]*p[j*C+i];x[t*C+j]+=s;}p+=C*C+C;\nLn(x,xn,p,p+C,T);p+=2*C;\nfor(int t=0;t<T;t++)for(int j=0;j<F;j++){float s=p[C*F+j];\nif(wm==0)for(int i=0;i<C;i++)s+=xn[t*C+i]*p[i*F+j];\nelse for(int i=0;i<C;i++)s+=xn[t*C+i]*p[j*C+i];ff[t*F+j]=G(s);}p+=C*F+F;\nfor(int t=0;t<T;t++)for(int j=0;j<C;j++){float s=p[F*C+j];\nif(wm==0)for(int i=0;i<F;i++)s+=ff[t*F+i]*p[i*C+j];\nelse for(int i=0;i<F;i++)s+=ff[t*F+i]*p[j*F+i];x[t*C+j]+=s;}p+=F*C+C;}\nLn(x,xn,p,p+C,T);\nint lt=T-1,best=0;float bv=-1e30f;\nfor(int j=0;j<V;j++){float s=0;for(int i=0;i<C;i++)s+=xn[lt*C+i]*wte[j*C+i];if(s>bv){bv=s;best=j;}}\nlo[0]=bv;lo[1]=best;\nfree(x);free(xn);free(qk);free(ao);free(ff);}\nint main(int argc,char**argv){\nFILE*f=fopen(argv[1],\"rb\");fseek(f,0,SEEK_END);long sz=ftell(f);fseek(f,0,SEEK_SET);\nW=malloc(sz);fread(W,1,sz,f);fclose(f);\nlb(argv[2]);nt=tokenize(argv[3],tk);\nfor(int wm=0;wm<2;wm++)for(int qkv=0;qkv<2;qkv++){\nrun(wm,qkv);\nint best=(int)lo[1];\nprintf(\"wm=%d qkv=%d: tok=%d logit=%.2f str=\\\"\",wm,qkv,best,lo[0]);\nfwrite(rb[best],1,rl[best],stdout);printf(\"\\\"\\n\");}\nreturn 0;}\nCEOF\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "wc -c /app/test_kqv.c && gcc -O3 -o /app/test_kqv /app/test_kqv.c -lm 2>&1 | grep error; /app/test_kqv gpt2-124M.ckpt vocab.bpe \"The meaning of life is\" 2>&1 | grep -v warn\n",
+      "duration": 120.0
+    }
+  ]
+}

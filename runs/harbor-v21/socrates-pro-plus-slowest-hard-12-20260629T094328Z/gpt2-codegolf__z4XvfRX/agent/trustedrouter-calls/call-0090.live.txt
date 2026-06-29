@@ -1,0 +1,355 @@
+
+[tr-stream call-0090:socrates:trustedrouter/socrates-pro-plus-1.0] socrates.started
+
+[tr-stream call-0090:worker:xiaomi/mimo-v2.5-pro-ultraspeed] worker.started
+[tr-thinking call-0090:worker:xiaomi/mimo-v2.5-pro-ultraspeed] This produces empty output - just "The meaning of life is" with nothing after. The gamma+1 with [out,in] weights made the output empty. Let me think about this differently.
+
+The key issue is that none of the standard per-layer weight orderings work. But the grouped layout with [out,in] weights gave alternating tokens with logit ~8, which is at least more reasonable.
+
+Let me think about what the grouped layout gives: alternating "mayhem stereotypical imped" etc. This suggests the model is partially working but something is still wrong.
+
+Actually, wait - let me reconsider. The task says "I have downloaded the gpt-2 weights stored as a TF .ckpt." But 
+[tr-thinking call-0090:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 497759232 bytes / 4 = 124439808 floats. Let me verify this exactly matches GPT-2 124M:
+- wte: 50257 * 768 = 38,597,376
+- wpe: 1024 * 768 = 786,432
+- per layer: 768*2 (ln1) + 768*2304+2304 (attn) + 768*768+768 (proj) + 768*2 (ln2) + 768*3072+3072 (fc) + 3072*768+768 (fc
+[tr-thinking call-0090:worker:xiaomi/mimo-v2.5-pro-ultraspeed] proj) = 1536 + 1771776 + 590592 + 1536 + 2362368 + 2359296 = 7087104
+
+Wait, let me recalculate:
+- ln1_g: 768, ln1_b: 768
+- c_attn_w: 768*2304 = 1,769,472, c_attn_b: 2304
+- c_proj_w: 768*768 = 589,824, c_proj_b: 768
+- ln2_g:
+[tr-thinking call-0090:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  768, ln2_b: 768
+- c_fc_w: 768*3072 = 2,359,296, c_fc_b: 3072
+- c_fc_proj_w: 3072*768 = 2,359,296, c_fc_proj_b: 768
+
+Total per layer: 1536 + 1769472 + 2304 + 589824 + 768 + 1536 + 2359296 + 3072 + 2359296 + 768 = 70
+[tr-thinking call-0090:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 87872
+
+12 layers * 7087872 = 85,054,464
+ln_f: 1536
+Total layers+lnf: 85,056,000
+wte+wpe: 38,597,376 + 786,432 = 39,383,808
+Grand total: 39,383,808 + 85,056,000 = 124,439,808 ✓
+
+So the
+[tr-thinking call-0090:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  parameter count is exactly right. The file layout must be one of the standard ones I've tested.
+
+The fact that I'm getting empty output with gamma+1 and [out,in] is suspicious. The original no-gamma with [out,in] gave "Rover" (logit 11.56). Let me think about what combination I haven't tried...
+
+Actually wait - I've been assuming [out,in] for TF conv1d but TF's conv1d actually stores weights as [kernel, in_channels, out_channels] which for a 1x1 conv is [1, in, out]. When flattened for
+[tr-thinking call-0090:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  the bias-less conv layer, the weight matrix is [in, out]. But when using tf.Variable or when converting from a dense layer, it could be [in, out].
+
+Actually, the key question is: what format was this checkpoint created in? The task just says "a TF .ckpt". The standard GPT-2 TF checkpoint (from the original OpenAI release) stores:
+- model/h0/attn/c_attn/w:0 with shape [768, 2304]
+
+So the weight IS [in_features, out_features]. My original [in,out] indexing should be correct.
+
+Let me re-examine why the output is wrong. The
+[tr-thinking call-0090:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  best results so far:
+1. Standard layout, direct gamma, [in,out]: "stereotypical" x20 (logit 46)
+2. Standard layout, direct gamma, [out,in]: "Rover" x20 (logit 11.56)
+3. TF-alpha layout, direct gamma, [out,in]: "Rover" x20 (logit 11.56)
+4. TF-alpha layout, direct gamma, [in,out]: "stereotypical" x20 (logit 46)
+5. Grouped layout, direct gamma, [in,out]: "stereotypical" x20 (logit 47.5)
+6. Grouped layout,
+[tr-thinking call-0090:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  direct gamma, [out,in]: alternating "mayhem stereotypical" (logit 8.12)
+
+Hmm, the logit of 46 for "stereotypical" is way too high. A reasonable logit for a top token in GPT-2 is typically 5-15. The logit of 8.12 for the grouped layout with [out,in] is actually in the right range!
+
+But the grouped layout gives alternating tokens. That's a sign that the model is partially right but something is still off.
+
+Let me think about what could cause alternating tokens... If the hidden states are too noisy, the model might oscillate between different predictions. This
+[tr-thinking call-0090:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  could happen if some weights are slightly off in their indexing.
+
+Actually, let me reconsider the issue. When I use [out,in] weights with the standard layout, I get logit ~11 for "Rover". With [out,in] and grouped layout, I get logit ~8 for "mayhem". The difference is the grouped vs standard layer ordering.
+
+What if the issue is that the c_attn weight is stored differently from the other weights? What if it's a combined QKV weight that's organized differently?
+
+Actually, in TF GPT-2, the c_attn weight has shape [768, 2304].
+[tr-thinking call-0090:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  The 2304 = 3 * 768 = Q + K + V concatenated. In the standard implementation, the first 768 columns are Q, next 768 are K, last 768 are V. This is the same as what I have.
+
+But wait - what if the heads are interleaved? Like, instead of [Q_all, K_all, V_all], it might be [Q_head0, K_head0, V_head0, Q_head1, K_head1, V_head1, ...]? No, that doesn't make sense for a single linear
+[tr-thinking call-0090:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  layer.
+
+Hmm, let me try yet another thing. What if the problem is that I'm applying the norm to x and writing to xn, then using xn for everything. But what if the residual connection should be x += output_of_sublayer, not x = ... + output_of_sublayer? Actually that's the same thing. Let me re-read my code...
+
+In my code:
+```
+Ln(x,xn,g1,b1,T);  // xn = LN(x)
+// compute attention using xn
+// x += attn_output
+Ln(x,xn,g2,b2,T);  // xn = LN(x) 
+// compute FFN using xn
+// x += ffn_output
+```
+
+This is correct Pre-LN: x is preserved through the residual,
+[tr-thinking call-0090:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  and LN is applied to x before each sublayer.
+
+Wait, but maybe the issue is that I'm not resetting p correctly. Let me check... yes, p is set to P at the start of each generation step, and advanced through the weights layer by layer. That should be correct.
+
+Let me try a completely different approach. What if the weight file is using a variable-size header or metadata? What if there are a few bytes of padding somewhere that I'm not accounting for?
+
+Actually, the parameter count matches exactly (124,439,808 floats = 497,759,232 bytes), so there's no room for headers or
+[tr-thinking call-0090:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  padding. The entire file is just raw float32 data.
+
+Let me try to verify my implementation by checking the intermediate values at each layer. I could add diagnostic output for the norm of x at each layer to see if it's growing/shrinking as expected.
+
+Actually, I have a new idea. What if the issue is simpler than I think - what if I have the TF-alphabetical ordering wrong? Let me carefully check the exact variable names in a TF GPT-2 model.
+
+The variable names are:
+- model/wte:0
+- model/wpe:0
+- model/h0/attn/c_attn/b
+[tr-thinking call-0090:worker:xiaomi/mimo-v2.5-pro-ultraspeed] :0
+- model/h0/attn/c_attn/w:0
+- model/h0/attn/c_proj/b:0
+- model/h0/attn/c_proj/w:0
+- model/h0/ln_1/b:0
+- model/h0/ln_1/g:0
+- model/h0/ln_2/b:0
+- model/h0/ln_2/g:0
+- model/h0/mlp/c_fc/b:0
+- model/h0/mlp/c_fc/w:0
+- model/h0/mlp/c_proj/b:0
+- model/h0/mlp/c_proj/w:0
+- model/h1/...
+- ...
+- model/h11/...
+- model/ln_f/b:0
+- model/ln_f/g:0
+
+So
+[tr-thinking call-0090:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  the alphabetical order within each layer is:
+attn/c_attn/b, attn/c_attn/w, attn/c_proj/b, attn/c_proj/w, ln_1/b, ln_1/g, ln_2/b, ln_2/g, mlp/c_fc/b, mlp/c_fc/w, mlp/c_proj/b, mlp/c_proj/w
+
+This is: bias of c_attn (2304), weight of c_attn (768*2304), bias of c_proj (768), weight of c_proj (768*768), ln1_b (768), ln1_g (768), ln2_b (768), ln2_g (768), bias of c_fc (3
+[tr-thinking call-0090:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 072), weight of c_fc (768*3072), bias of c_proj (768), weight of c_proj (3072*768)
+
+And the global order: h0, h1, ..., h11, ln_f/b, ln_f/g, wpe, wte
+
+This is what I tested as "TF-alphabetical" layout. With [out,in] weights (wm=1), it gave logit ~8 with alternating tokens.
+
+But wait - the variable ordering within each layer: "c_attn" comes before "c_proj" which comes before "ln_1" which comes before "ln_2" which comes before "mlp". So the attention weights
+[tr-thinking call-0090:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  come first, then the layer norms, then the MLP. This is different from both the "ln-first" and "attn-first" I tested!
+
+Actually, let me re-read my diagnostic from diag6:
+```
+Layer 0 layout probe (wpe+wte first):
+  c_attn_w [0]: avg|v|=0.2265     <- [in, out] has avg ~0.11, so this is probably [in, out] for 768*2304
+  c_attn_b [1769472]: avg|v|=0.1223, vals:0.0194 -0.
+[tr-thinking call-0090:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 2557 0.1600 0.0810
+  c_proj_w [1771776]: avg|v|=0.1454
+  c_proj_b [2361600]: avg|v|=0.0788
+  ?? [2362368]: avg|v|=0.1079     <- this would be at offset 2362368 = 768*3074 + 768 from layer start
+  ?? [2363136]: avg|v|=0.1185
+ 
+[tr-thinking call-0090:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  fc_w [2363904]: avg|v|=0.1050
+  fc_b [4723200]: avg|v|=0.0702
+  fc_proj_w [4726272]: avg|v|=0.0543
+  fc_proj_b [7085568]: avg|v|=0.1185
+  ?? [7086336]: avg|v|=0.0753
+  ?? [7087104]: avg|v|=0.1061
+```
+
+Wait, this was probing at offset 1024*768 = 
+[tr-thinking call-0090:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 786432, which is the wte start, not the layer start at 39383808. So this diagnostic was reading wte data, not layer data. The "c_attn_w" reading was actually reading wte token embeddings, not attention weights!
+
+Actually, looking at my diagnostic more carefully: base=39383808, p=0 means it's probing at offset 39383808 from the start of the file. The first 768 floats at that offset had avg|v|=0.1022, which looked like biases. But they
+[tr-thinking call-0090:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  were actually the first 768 floats of the layer parameters.
+
+So at offset 39383808 (wte+wpe = 50257*768 + 1024*768), we have the first 768 floats of the layer data. Their avg|v| is 0.1022.
+
+In the TF-alphabetical ordering, the first parameter for layer 0 is c_attn_b (2304 floats). So the first 768 floats at offset 39383808 would be the first 768 elements
+[tr-thinking call-0090:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  of the 2304-dimensional c_attn_b vector. That has avg|v| = 0.1022, which is consistent with attention biases.
+
+So the layout IS: wte, wpe, then per-layer: c_attn_b, c_attn_w, c_proj_b, c_proj_w, ln1_b, ln1_g, ln2_b, ln2_g, c_fc_b, c_fc_w, c_fc_proj_b, c_fc_proj_w, then ln_f_b, ln_f_g.
+
+But I already tested this layout! My "TF-alpha" test in the brute force
+[tr-thinking call-0090:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  had lmode=1 which was supposed to be this ordering. Let me double check that test...
+
+Actually, looking back at my tf2.c test, I had:
+```c
+float*ab_=p;p+=3*C;   // c_attn_b: 3*768=2304
+float*aw=p;p+=C*3*C;  // c_attn_w: 768*2304
+float*ob_=p;p+=C;      // c_proj_b: 768
+float*ow=p;p+=C*C;     // c_proj_w: 768*768
+float*b1=p;p+=C;       // ln1_b: 768
+float*g1=p;p+=C;       // ln1_g: 768
+float*b2=p;p+=
+[tr-thinking call-0090:worker:xiaomi/mimo-v2.5-pro-ultraspeed] C;       // ln2_b: 768
+float*g2=p;p+=C;       // ln2_g: 768
+float*fb_=p;p+=F;      // c_fc_b: 3072
+float*fw=p;p+=C*F;     // c_fc_w: 768*3072
+float*pb_=p;p+=C;      // c_fc_proj_b: 768
+float*pw=p;p+=F*C;     // c_fc_proj_w: 3072*768
+```
+
+This reads 2304+1769472+768+5
+[tr-thinking call-0090:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 89824+768+768+768+768+3072+2359296+768+2359296 = 7087872 per layer. ✓
+
+And I tested with gm=0 (no gamma fix) and wm=0/1 (both weight formats). wm=0 gave logit 45.9 ("stereotypical"), wm=1 gave logit 13.34 ("Rover").
+
+Then I tried the grouped layout where all layers share the same parameter type. That also gave the same issue.
+
+OK wait, I just realized something.
+[tr-thinking call-0090:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  What if the issue is in the BPE encoding of the vocab? What if token ID 46107 decodes to "stereotypical" but that's actually correct output? No, that doesn't make sense because the prompt is "The meaning of life is" and the model should say something like "to" or "a", not "stereotypical".
+
+Let me think about what could cause the model to strongly prefer one wrong token... The hidden state norm might be way too high, causing one logit to dominate. With logit 46, that's an extremely high confidence. Normal GPT-2 logits for the top token are
+[tr-thinking call-0090:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  usually in the range 5-20.
+
+The issue might be that the hidden state has very high norm because the layer norms aren't working correctly. If gamma is stored as gamma-1, then using gamma directly means the layer norm output has much smaller variance than intended, causing the hidden states to grow through the residual connections without being properly normalized.
+
+Actually wait - if gamma values are near 0 (stored as gamma-1 where gamma~1), and I use them directly as gamma, then the layer norm output would be near zero (since g[i] ≈ 0). That would mean the sublayer gets almost-zero input, and the
+[tr-thinking call-0090:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  residual connection just accumulates the embedding. With 12 layers of this, the final hidden state would be approximately the sum of all embeddings, which has very high norm.
+
+But I already tried gamma+1 and got empty output. That's even more confusing.
+
+Actually wait, I got empty output with the STANDARD layout (ln-first, [out,in], gamma+1). But the TF-alpha layout with gamma+1 might give different results because the parameter order is different.
+
+Let me try: TF-alpha layout, [in,out] weights, gamma+1. I think this combination hasn't been tested yet.
+
+Actually, looking at my test history:
+- TF
+[tr-thinking call-0090:worker:xiaomi/mimo-v2.5-pro-ultraspeed] -alpha, gm=0, wm=0: "stereotypical" logit 45.9
+- TF-alpha, gm=0, wm=1: "Rover" logit 13.34
+- TF-alpha, gm=1, wm=0: "stereotypical" logit 45.9
+- TF-alpha, gm=1, wm=1: "Rover" logit 13.34
+
+Wait, gm had no effect! That's because in my tf2.c test, gm was not actually being used in the Ln function. Let me check...
+
+Looking at my tf2.c code:
+```c
+void Ln(float*x,float*o,float*g,float*b,int T
+[tr-thinking call-0090:worker:xiaomi/mimo-v2.5-pro-ultraspeed] ){for(int t=0;t<T;t++){float m=0,v=0;
+...
+for(int i=0;i<C;i++)o[t*C+i]=(x[t*C+i]-m)/v*g[i]+b[i];}}
+```
+
+The Ln function doesn't take a gm parameter! It always uses g[i] directly. So gm was never applied. That's why gm=0 and gm=1 gave identical results in the tf2 test!
+
+So I need to properly test TF-alpha layout with gamma+1 applied. Let me write a clean test for this.
+
+Also, let me check the lnf position. The TF global alphabetical order is
+[tr-thinking call-0090:worker:xiaomi/mimo-v2.5-pro-ultraspeed] : h0-h11, ln_f/b, ln_f/g, wpe, wte. So:
+- layers: offset 0
+- ln_f_b: offset 85054464
+- ln_f_g: offset 85054464+768 = 85055232
+- wpe: offset 85056000
+- wte: offset 85056000+786432 = 85842432
+
+Let me write a clean test with all 8
+[tr-thinking call-0090:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  combinations properly tested.
+
+Actually, let me think about this more carefully. The "no gamma" version gives logit 46 with [in,out]. That's way too high. The "no gamma" with [out,in] gives logit 13.34 which is more reasonable but wrong token.
+
+If gamma is stored as gamma-1 (actual_value - 1), then:
+- Using g[i] directly: gamma ≈ 0, so layer norm output ≈ 0 (near mean), sublayer gets no signal
+- Using g[i]+1: gamma ≈ 1, layer norm works correctly
+
+But with g[i] ≈ 0, the layer norm output should be near zero, meaning the sublayers get no useful
+[tr-thinking call-0090:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  input. The residual connections would then just pass through the original embeddings. After 12 layers, x ≈ sum of embedding. The final logit would be wte^T @ (wte[token] + wpe[pos]), which is essentially a nearest-neighbor lookup in embedding space.
+
+If logit 46 is the dot product of the embedding of token "stereotypical" with itself (or with the prompt embedding), that would make sense - it's basically computing similarity in embedding space without any transformer processing.
+
+Now with [out,in] weights and gamma ≈ 0: the sublayers still get near-zero input, but the weight transposition means the
+[tr-thinking call-0090:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  dot products are computed differently, leading to different (but still wrong) results.
+
+So the gamma+1 fix IS necessary, but I need to apply it correctly. The issue with my previous test (that gave empty output) might be that the standard per-layer layout is wrong, and the TF-alpha layout with gamma+1 is the correct combination.
+
+Let me write a comprehensive test that properly tests TF-alpha layout with gamma+1.
+
+But actually, I already have strong evidence:
+1. With gamma=0 (no gamma+1), both weight formats give wrong results
+2. The logit of 46 is consistent with layer norms being near-zero (gamma ≈ 0)
+
+So gamma+1 IS needed. But my test of standard layout + gamma+1 + [out,in] gave empty output.
+[tr-thinking call-0090:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  Maybe the issue is that [out,in] with gamma+1 together are wrong, and I need [in,out] + gamma+1 with TF-alpha layout.
+
+Let me test: TF-alpha layout (layers at offset 0, wpe at 85056000, wte at 85842432), [in,out] weights, gamma+1.
+
+Actually, I should test all 4 combinations (2 weight formats × 2 layouts) all with gamma+1 applied.
+
+Hmm, but I also need to test: maybe the layer parameter within each "group" is different
+[tr-thinking call-0090:worker:xiaomi/mimo-v2.5-pro-ultraspeed] . In the TF-alpha layout, each layer has:
+- c_attn_b[2304], c_attn_w[768][2304]
+- c_proj_b[768], c_proj_w[768][768]  
+- ln1_b[768], ln1_g[768]
+- ln2_b[768], ln2_g[768]
+- c_fc_b[3072], c_fc_w[768][3072]
+- c_fc_proj_b[768], c_fc_proj_w[3072][768]
+
+But maybe the w is
+[tr-thinking call-0090:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  transposed: maybe c_attn_w is stored as [2304][768] instead of [768][2304]. In TF, the variable shape for c_attn/w is [768, 2304]. So in the flat file, element [i][j] is at offset i*2304+j. With [in,out] indexing, we compute output[j] += input[i] * weight[i][j], which means we access weight[i*2304+j].
+
+Actually, let me reconsider. For TF conv1d:
+- Weight shape: [1, in_channels, out_channels] = [1, 7
+[tr-thinking call-0090:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 68, 2304]
+- But when flattened: [768, 2304]
+- For computation: output = input @ weight (matrix multiply where weight is [768, 2304])
+- So for output j: sum over i of input[i] * weight[i*2304 + j]
+
+This is the [in,out] format I had originally. My original code was:
+```c
+s+=xn[t*C+i]*aw[i*3*C+j]
+```
+which is: s += xn[i] * aw[i*2304+j]. This IS [in,out] and should be correct for TF.
+
+But then with
+[tr-thinking call-0090:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  [in,out], the model gives logit 46 with gamma=0. And with gamma=1 (proper norm), it gives empty output.
+
+Hmm, let me recheck. With the standard layout and [in,out]:
+- gamma=0: "stereotypical" x20 (logit 46)
+- gamma=1: empty output (no tokens after prompt)
+
+Empty output means the best token is... what? Let me check what token 0 or the empty string token would be. Actually "empty output" might mean the output has no visible bytes for the generated tokens.
+
+Let me just write a
+[tr-thinking call-0090:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  comprehensive test that prints more info.
+
+Actually, I think the issue might be even simpler. When I get "empty output", maybe the model is generating newline or some whitespace token, and the output just looks empty. Or maybe the generated tokens are all the empty string token.
+
+Let me write a test that prints the token IDs for the generated tokens.
+[tr-stream call-0090:worker:xiaomi/mimo-v2.5-pro-ultraspeed] Let me add more diagnostic output to understand what's happening with the different combinations.
+
+{
+  "analysis": "The gamma+1 with standard layout and [out,in] gave empty output. I need to understand what tokens are being generated. Let me add diagnostic output to see token IDs,
+[tr-stream call-0090:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  and also try the TF-alpha layout with gamma+1.",
+  "plan": "Write a clean test that shows generated token IDs and tests multiple layouts with gamma+1.",
+  "commands": [
+    {
+      "keystrokes": "cat > /app/gpt2.c << 'CEOF'\n#include<stdio.h>\n#include<stdlib.h>\n#include<string.h>\n#include<math.h>\n#define C 768\n#define H 12\n#define D 64\n#define F 3072\n#define V 50257\n#define NM 50000\n#define Z 131071\nfloat*W;int tk[1024],nt
+[tr-stream call-0090:worker:xiaomi/mimo-v2.5-pro-ultraspeed] ,bt[256];char ts[V][32];int tl[V],th[Z],tn[Z],mh[Z],mn[Z],ml[NM],mr[NM];\nunsigned char rb[V][32];int rl[V];\nunsigned hf(const char*s,int n){unsigned h=5381;for(int i=0;i<n;i++)h=h*33+(unsigned char)s[i];return h%Z;}\nvoid ti(int i){unsigned h=hf(ts[i],tl[i]);tn[i]=th[h];th[h]=i;}\nint tf(const char*s,int n){unsigned h=hf(s,n);for(int i=th[h];i>=0;i=tn[i])if(tl[i]==n&&!memcmp(ts[i],s,n))return i;return
+[tr-stream call-0090:worker:xiaomi/mimo-v2.5-pro-ultraspeed] -1;}\nunsigned mhash(int l,int r){return((unsigned)l*V+r)%Z;}\nint mf(int l,int r){unsigned h=mhash(l,r);for(int i=mh[h];i>=0;i=mn[i])if(ml[i]==l&&mr[i]==r)return i;return-1;}\nvoid mi(int i){unsigned h=mhash(ml[i],mr[i]);mn[i]=mh[h];mh[h]=i;}\nvoid lb(char*p){memset(th,-1,sizeof(th));memset(mh,-1,sizeof(mh));unsigned s[256];int n=0;\nfor(int i=0;i<256;i++)if((i>=33&&i<=126)||(i>=161&&i<=172)||(i>=174&&i<=2
+[tr-stream call-0090:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 55))s[i]=i;else s[i]=256+n++;\nfor(int b=0;b<256;b++){int q=0;for(int j=0;j<256;j++)if(s[j]<s[b])q++;bt[b]=q;}\nfor(int b=0;b<256;b++){int t=bt[b];unsigned c=s[b];rb[t][0]=b;rl[t]=1;\nif(c<128){ts[t][0]=c;tl[t]=1;}else if(c<2048){ts[t][0]=0xC0|(c>>6);ts[t][1]=0x80|(c&63);tl[t]=2;}\nelse{ts[t][0]=0xE0|(c>>1
+[tr-stream call-0090:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 2);ts[t][1]=0x80|((c>>6)&63);ts[t][2]=0x80|(c&63);tl[t]=3;}ti(t);}\nFILE*f=fopen(p,\"r\");char ln[256];fgets(ln,256,f);int x=0;\nwhile(fgets(ln,256,f)&&x<NM){int l=strlen(ln);if(ln[l-1]=='\\n')ln[--l]=0;int sp=-1;\nfor(int i=0;i<l;i++)if(ln[i]==' '){sp=i;break;}if(sp<0)continue;\nint li=tf(ln,sp),ri=tf(ln+sp+1,l-sp-1);if(li<0||ri<0)continue;\nml[x]=li
+[tr-stream call-0090:worker:xiaomi/mimo-v2.5-pro-ultraspeed] ;mr[x]=ri;int a=tl[li];memcpy(ts[256+x],ts[li],a);\nmemcpy(ts[256+x]+a,ts[ri],tl[ri]);tl[256+x]=a+tl[ri];\nmemcpy(rb[256+x],rb[li],rl[li]);memcpy(rb[256+x]+rl[li],rb[ri],rl[ri]);\nrl[256+x]=rl[li]+rl[ri];ti(256+x);mi(x);x++;}fclose(f);}\nint tokenize(char*t,int*o){int n=strlen(t);for(int i=0;i<n;i++)o[i]=bt[(unsigned char)t[i]];\nwhile(1){int bs
+[tr-stream call-0090:worker:xiaomi/mimo-v2.5-pro-ultraspeed] =NM,bp=-1;for(int i=0;i<n-1;i++){int r=mf(o[i],o[i+1]);if(r>=0&&r<bs){bs=r;bp=i;}}\nif(bp<0)break;o[bp]=256+bs;memmove(o+bp+1,o+bp+2,(n-bp-2)*sizeof(int));n--;}return n;}\nfloat sc[1024];\nfloat G(float x){return.5f*x*(1+tanhf(.7978845608f*(x+.044715f*x*x*x)));}\nfloat rms(float*x,int
+[tr-stream call-0090:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  T){float s=0;for(int t=0;t<T;t++)for(int i=0;i<C;i++)s+=x[t*C+i]*x[t*C+i];return sqrtf(s/(T*C));}\nvoid Ln(float*x,float*o,float*g,float*b,int T,int gm){for(int t=0;t<T;t++){float m=0,v=0;\nfor(int i=0;i<C;i++)m+=x[t*C+i];m/=C;\nfor(int i=0;i<C;i++)v+=(x[t*C+i]-m)*(x[t*C+i]-m);v=sqrtf(v/C+1e-5f);\nfloat gm1=gm?1.0f
+[tr-stream call-0090:worker:xiaomi/mimo-v2.5-pro-ultraspeed] :0.0f;\nfor(int i=0;i<C;i++)o[t*C+i]=(x[t*C+i]-m)/v*(g[i]+gm1)+b[i];}}\nint main(int argc,char**argv){\nif(argc<4)return 1;\nFILE*f=fopen(argv[1],\"rb\");fseek(f,0,SEEK_END);long sz=ftell(f);fseek(f,0,SEEK_SET);\nW=malloc(sz);fread(W,1,sz,f);fclose(f);\nfloat*wte=W,*wpe=W+V*C;\nlb(argv[2]);nt
+[tr-stream call-0090:worker:xiaomi/mimo-v2.5-pro-ultraspeed] =tokenize(argv[3],tk);\nfloat*x=calloc(1024*C,sizeof(float)),*xn=malloc(1024*C*sizeof(float)),\n*qk=malloc(1024*3*C*sizeof(float)),*ao=malloc(1024*C*sizeof(float)),\n*ff=malloc(1024*F*sizeof(float));\nint T=nt;\nfor(int t=0;t<T;t++)for(int i=0;i<C;i++)x[t*C+i]=wte[tk[t]*C+i]+wpe[t*C+i];\nprintf(\"emb rms: %.3f\\n\",rms(x,T
+[tr-stream call-0090:worker:xiaomi/mimo-v2.5-pro-ultraspeed] ));\nfloat*p=wpe+1024*C;\nfor(int l=0;l<12;l++){\nLn(x,xn,p,p+C,T,0);p+=2*C;\nprintf(\"layer %d ln1 rms: %.3f\\n\",l,rms(xn,T));\nfor(int t=0;t<T;t++)for(int j=0;j<3*C;j++){float s=p[C*3*C+j];\nfor(int i=0;i<C;i++)s+=xn[t*C+i]*p[i*3*C+j];qk[t*3*C+j]=s;}p+=C*3*C+3*C;\nfor
+[tr-stream call-0090:worker:xiaomi/mimo-v2.5-pro-ultraspeed] (int h=0;h<H;h++)for(int t=0;t<T;t++){\nfor(int s=0;s<=t;s++){float d=0;for(int i=0;i<D;i++)d+=qk[t*3*C+h*D+i]*qk[s*3*C+C+h*D+i];sc[s]=d/sqrtf(D);}\nfloat mx=-1e30f;for(int s=0;s<=t;s++)if(sc[s]>mx)mx=sc[s];\nfloat ss=0;for(int s=0;s<=t;s++){sc[s]=expf(sc[s]-mx);ss+=sc[s];}\nfor(int s=0;s<=t;s++)sc[s]/=ss;\nfor(int i=0;i<D;i++){float v=0;for(int s=
+[tr-stream call-0090:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 0;s<=t;s++)v+=sc[s]*qk[s*3*C+2*C+h*D+i];ao[t*C+h*D+i]=v;}}\nfor(int t=0;t<T;t++)for(int j=0;j<C;j++){float s=p[C*C+j];\nfor(int i=0;i<C;i++)s+=ao[t*C+i]*p[i*C+j];x[t*C+j]+=s;}p+=C*C+C;\nprintf(\"layer %d post-attn rms: %.3f\\n\",l,rms(x,T));\nLn(x,xn,p,p+C,T,0);p+=2*C;\nfor(int t=0;t<T;t++)for(int j=0;j<F;j++){float s=p[C*F+j];\nfor(int i=0;i<C;i++)s+=xn[t*C+i]*p
+[tr-stream call-0090:worker:xiaomi/mimo-v2.5-pro-ultraspeed] [i*F+j];ff[t*F+j]=G(s);}p+=C*F+F;\nfor(int t=0;t<T;t++)for(int j=0;j<C;j++){float s=p[F*C+j];\nfor(int i=0;i<F;i++)s+=ff[t*F+i]*p[i*C+j];x[t*C+j]+=s;}p+=F*C+C;\nprintf(\"layer %d post-mlp rms: %.3f\\n\",l,rms(x,T));\nif(l==0)break;}\nfree(x);free(xn);free(qk);free(ao);free(ff);\nreturn 0;}\nCE
+[tr-stream call-0090:worker:xiaomi/mimo-v2.5-pro-ultraspeed] OF\nwc -c /app/gpt2.c && gcc -O3 -o /app/a.out /app/gpt2.c -lm 2>&1 | grep error; /app/a.out gpt2-124M.ckpt vocab.bpe \"Hello\" 2>&1 | grep -v warn\n",
+      "duration": 10.0
+    }
+  ]
+}
+
+[tr-stream call-0090:worker:xiaomi/mimo-v2.5-pro-ultraspeed] worker.done finish=stop cost_microdollars=324826
+[tr-stream call-0090:xiaomi/mimo-v2.5-pro-ultraspeed] Let me add more diagnostic output to understand what's happening with the different combinations.
+
+{
+  "analysis": "The gamma+1 with standard layout and [out,in] gave empty output. I need to understand what tokens are being generated. Let me add diagnostic output to see token IDs, and also try the TF-alpha layout with gamma+1.",
+  "plan": "Write a clean test that shows generated token IDs and tests multiple layouts with gamma+1.",
+  "commands": [
+    {
+      "keystrokes": "cat > /app/gpt2.c << 'CEOF'\n#include<stdio.h>\n#include<stdlib.h>\n#include<string.h>\n#include<math.h>\n#define C 768\n#define H 12\n#define D 64\n#define F 3072\n#define V 50257\n#define NM 50000\n#define Z 131071\nfloat*W;int tk[1024],nt,bt[256];char ts[V][32];int tl[V],th[Z],tn[Z],mh[Z],mn[Z],ml[NM],mr[NM];\nunsigned char rb[V][32];int rl[V];\nunsigned hf(const char*s,int n){unsigned h=5381;for(int i=0;i<n;i++)h=h*33+(unsigned char)s[i];return h%Z;}\nvoid ti(int i){unsigned h=hf(ts[i],tl[i]);tn[i]=th[h];th[h]=i;}\nint tf(const char*s,int n){unsigned h=hf(s,n);for(int i=th[h];i>=0;i=tn[i])if(tl[i]==n&&!memcmp(ts[i],s,n))return i;return-1;}\nunsigned mhash(int l,int r){return((unsigned)l*V+r)%Z;}\nint mf(int l,int r){unsigned h=mhash(l,r);for(int i=mh[h];i>=0;i=mn[i])if(ml[i]==l&&mr[i]==r)return i;return-1;}\nvoid mi(int i){unsigned h=mhash(ml[i],mr[i]);mn[i]=mh[h];mh[h]=i;}\nvoid lb(char*p){memset(th,-1,sizeof(th));memset(mh,-1,sizeof(mh));unsigned s[256];int n=0;\nfor(int i=0;i<256;i++)if((i>=33&&i<=126)||(i>=161&&i<=172)||(i>=174&&i<=255))s[i]=i;else s[i]=256+n++;\nfor(int b=0;b<256;b++){int q=0;for(int j=0;j<256;j++)if(s[j]<s[b])q++;bt[b]=q;}\nfor(int b=0;b<256;b++){int t=bt[b];unsigned c=s[b];rb[t][0]=b;rl[t]=1;\nif(c<128){ts[t][0]=c;tl[t]=1;}else if(c<2048){ts[t][0]=0xC0|(c>>6);ts[t][1]=0x80|(c&63);tl[t]=2;}\nelse{ts[t][0]=0xE0|(c>>12);ts[t][1]=0x80|((c>>6)&63);ts[t][2]=0x80|(c&63);tl[t]=3;}ti(t);}\nFILE*f=fopen(p,\"r\");char ln[256];fgets(ln,256,f);int x=0;\nwhile(fgets(ln,256,f)&&x<NM){int l=strlen(ln);if(ln[l-1]=='\\n')ln[--l]=0;int sp=-1;\nfor(int i=0;i<l;i++)if(ln[i]==' '){sp=i;break;}if(sp<0)continue;\nint li=tf(ln,sp),ri=tf(ln+sp+1,l-sp-1);if(li<0||ri<0)continue;\nml[x]=li;mr[x]=ri;int a=tl[li];memcpy(ts[256+x],ts[li],a);\nmemcpy(ts[256+x]+a,ts[ri],tl[ri]);tl[256+x]=a+tl[ri];\nmemcpy(rb[256+x],rb[li],rl[li]);memcpy(rb[256+x]+rl[li],rb[ri],rl[ri]);\nrl[256+x]=rl[li]+rl[ri];ti(256+x);mi(x);x++;}fclose(f);}\nint tokenize(char*t,int*o){int n=strlen(t);for(int i=0;i<n;i++)o[i]=bt[(unsigned char)t[i]];\nwhile(1){int bs=NM,bp=-1;for(int i=0;i<n-1;i++){int r=mf(o[i],o[i+1]);if(r>=0&&r<bs){bs=r;bp=i;}}\nif(bp<0)break;o[bp]=256+bs;memmove(o+bp+1,o+bp+2,(n-bp-2)*sizeof(int));n--;}return n;}\nfloat sc[1024];\nfloat G(float x){return.5f*x*(1+tanhf(.7978845608f*(x+.044715f*x*x*x)));}\nfloat rms(float*x,int T){float s=0;for(int t=0;t<T;t++)for(int i=0;i<C;i++)s+=x[t*C+i]*x[t*C+i];return sqrtf(s/(T*C));}\nvoid Ln(float*x,float*o,float*g,float*b,int T,int gm){for(int t=0;t<T;t++){float m=0,v=0;\nfor(int i=0;i<C;i++)m+=x[t*C+i];m/=C;\nfor(int i=0;i<C;i++)v+=(x[t*C+i]-m)*(x[t*C+i]-m);v=sqrtf(v/C+1e-5f);\nfloat gm1=gm?1.0f:0.0f;\nfor(int i=0;i<C;i++)o[t*C+i]=(x[t*C+i]-m)/v*(g[i]+gm1)+b[i];}}\nint main(int argc,char**argv){\nif(argc<4)return 1;\nFILE*f=fopen(argv[1],\"rb\");fseek(f,0,SEEK_END);long sz=ftell(f);fseek(f,0,SEEK_SET);\nW=malloc(sz);fread(W,1,sz,f);fclose(f);\nfloat*wte=W,*wpe=W+V*C;\nlb(argv[2]);nt=tokenize(argv[3],tk);\nfloat*x=calloc(1024*C,sizeof(float)),*xn=malloc(1024*C*sizeof(float)),\n*qk=malloc(1024*3*C*sizeof(float)),*ao=malloc(1024*C*sizeof(float)),\n*ff=malloc(1024*F*sizeof(float));\nint T=nt;\nfor(int t=0;t<T;t++)for(int i=0;i<C;i++)x[t*C+i]=wte[tk[t]*C+i]+wpe[t*C+i];\nprintf(\"emb rms: %.3f\\n\",rms(x,T));\nfloat*p=wpe+1024*C;\nfor(int l=0;l<12;l++){\nLn(x,xn,p,p+C,T,0);p+=2*C;\nprintf(\"layer %d ln1 rms: %.3f\\n\",l,rms(xn,T));\nfor(int t=0;t<T;t++)for(int j=0;j<3*C;j++){float s=p[C*3*C+j];\nfor(int i=0;i<C;i++)s+=xn[t*C+i]*p[i*3*C+j];qk[t*3*C+j]=s;}p+=C*3*C+3*C;\nfor(int h=0;h<H;h++)for(int t=0;t<T;t++){\nfor(int s=0;s<=t;s++){float d=0;for(int i=0;i<D;i++)d+=qk[t*3*C+h*D+i]*qk[s*3*C+C+h*D+i];sc[s]=d/sqrtf(D);}\nfloat mx=-1e30f;for(int s=0;s<=t;s++)if(sc[s]>mx)mx=sc[s];\nfloat ss=0;for(int s=0;s<=t;s++){sc[s]=expf(sc[s]-mx);ss+=sc[s];}\nfor(int s=0;s<=t;s++)sc[s]/=ss;\nfor(int i=0;i<D;i++){float v=0;for(int s=0;s<=t;s++)v+=sc[s]*qk[s*3*C+2*C+h*D+i];ao[t*C+h*D+i]=v;}}\nfor(int t=0;t<T;t++)for(int j=0;j<C;j++){float s=p[C*C+j];\nfor(int i=0;i<C;i++)s+=ao[t*C+i]*p[i*C+j];x[t*C+j]+=s;}p+=C*C+C;\nprintf(\"layer %d post-attn rms: %.3f\\n\",l,rms(x,T));\nLn(x,xn,p,p+C,T,0);p+=2*C;\nfor(int t=0;t<T;t++)for(int j=0;j<F;j++){float s=p[C*F+j];\nfor(int i=0;i<C;i++)s+=xn[t*C+i]*p[i*F+j];ff[t*F+j]=G(s);}p+=C*F+F;\nfor(int t=0;t<T;t++)for(int j=0;j<C;j++){float s=p[F*C+j];\nfor(int i=0;i<F;i++)s+=ff[t*F+i]*p[i*C+j];x[t*C+j]+=s;}p+=F*C+C;\nprintf(\"layer %d post-mlp rms: %.3f\\n\",l,rms(x,T));\nif(l==0)break;}\nfree(x);free(xn);free(qk);free(ao);free(ff);\nreturn 0;}\nCEOF\nwc -c /app/gpt2.c && gcc -O3 -o /app/a.out /app/gpt2.c -lm 2>&1 | grep error; /app/a.out gpt2-124M.ckpt vocab.bpe \"Hello\" 2>&1 | grep -v warn\n",
+      "duration": 10.0
+    }
+  ]
+}

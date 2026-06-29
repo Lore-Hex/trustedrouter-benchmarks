@@ -1,0 +1,441 @@
+[?2004hroot@fdaaec16ff47:/app# ls -la /app/
+[?2004ltotal 0
+drwxr-xr-x 1 root root  0 Oct 22  2025 [0m[01;34m.[0m
+drwxr-xr-x 1 root root 26 Jun 29 17:12 [01;34m..[0m
+[?2004hroot@fdaaec16ff47:/app# find /app -name '*.py' | head -20
+[?2004l[?2004hroot@fdaaec16ff47:/app# pip list | grep -E 'torch|transformers|llama'
+[?2004lbash: pip: command not found
+[?2004hroot@fdaaec16ff47:/app# find / -name 'test_pipeline*' 2>/dev/null | head -5
+[?2004l[?2004hroot@fdaaec16ff47:/app# which python3 python pip3
+[?2004l/usr/bin/python3
+[?2004hroot@fdaaec16ff47:/app# python3 -c 'import torch; print(torch.__version__)'
+[?2004lTraceback (most recent call last):
+  File "<string>", line 1, in <module>
+ModuleNotFoundError: No module named 'torch'
+[?2004hroot@fdaaec16ff47:/app# python3 -c 'import transformers; print(transformers.__version__)'
+[?2004lTraceback (most recent call last):
+  File "<string>", line 1, in <module>
+ModuleNotFoundError: No module named 'transformers'
+[?2004hroot@fdaaec16ff47:/app# cat > /app/pipeline_parallel.py << 'ENDOFFILE'
+[?2004l[?2004h> import torch
+[?2004l[?2004h> import torch.distributed as dist
+[?2004l[?2004h> import torch.nn.functional as F
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> def train_step_pipeline_afab(model, inputs, targets, device, dtype):
+[?2004l[?2004h>     """
+[?2004l[?2004h>     Runs one training step using pipeline parallelism with AFAB scheduling.
+[?2004l[?2004h>     
+[?2004l[?2004h>     Args:
+[?2004l[?2004h>         model: LlamaForCausalLM instance
+[?2004l[?2004h>         inputs: list of microbatch input ID tensors
+[?2004l[?2004h>         targets: list of microbatch target ID tensors  
+[?2004l[?2004h>         device: torch device
+[?2004l[?2004h>         dtype: torch dtype
+[?2004l[?2004h>     """
+[?2004l[?2004h>     rank = dist.get_rank()
+[?2004l[?2004h>     world_size = dist.get_world_size()
+[?2004l[?2004h>     num_microbatches = len(inputs)
+[?2004l[?2004h>     
+[?2004l[?2004h>     # Partition transformer layers across ranks
+[?2004l[?2004h>     all_layers = list(model.model.layers)
+[?2004l[?2004h>     num_layers = len(all_layers)
+[?2004l[?2004h>     layers_per_rank = num_layers // world_size
+[?2004l[?2004h>     remainder = num_layers % world_size
+[?2004l[?2004h>     
+[?2004l[?2004h>     # Calculate layer range for this rank (roughly balanced)
+[?2004l[?2004h>     start_idx = rank * layers_per_rank + min(rank, remainder)
+[?2004l[?2004h>     if rank < remainder:
+[?2004l[?2004h>         end_idx = start_idx + layers_per_rank + 1
+[?2004l[?2004h>     else:
+[?2004l[?2004h>         end_idx = start_idx + layers_per_rank
+[?2004l[?2004h>     my_layers = all_layers[start_idx:end_idx]
+[?2004l[?2004h>     
+[?2004l[?2004h>     # Components per rank:
+[?2004l[?2004h>     # Rank 0: embed_tokens + first partition of layers
+[?2004l[?2004h>     # Last rank: last partition of layers + norm + lm_head
+[?2004l[?2004h>     # Others: just their partition of layers
+[?2004l[?2004h>     
+[?2004l[?2004h>     is_first_rank = (rank == 0)
+[?2004l[?2004h>     is_last_rank = (rank == world_size - 1)
+[?2004l[?2004h>     
+[?2004l[?2004h>     # Storage for AFAB
+[?2004l[?2004h>     saved_inputs = []   # Input to our layer block for each microbatch
+[?2004l[?2004h>     saved_outputs = []  # Output from our layer block for each microbatch
+[?2004l[?2004h>     
+[?2004l[?2004h>     # ============ FORWARD PHASE ============
+[?2004l[?2004h>     for mb_idx in range(num_microbatches):
+[?2004l[?2004h>         input_ids = inputs[mb_idx].to(device=device, dtype=torch.long)
+[?2004l[?2004h>         target_ids = targets[mb_idx].to(device=device, dtype=torch.long)
+[?2004l[?2004h>         
+[?2004l[?2004h>         if is_first_rank:
+[?2004l[?2004h>             # Embed tokens
+[?2004l[?2004h>             hidden_states = model.model.embed_tokens(input_ids)
+[?2004l[?2004h>             hidden_states = hidden_states.to(device=device, dtype=dtype)
+[?2004l[?2004h>         else:
+[?2004l[?2004h>             # Receive hidden states from previous rank
+[?2004l[?2004h>             # Need to know the shape: [mb_size, seq_len, hidden_size]
+[?2004l[?2004h>             # We'll use a metadata exchange first
+[?2004l[?2004h>             recv_shape = torch.zeros(3, dtype=torch.long, device=device)
+[?2004l[?2004h>             dist.recv(recv_shape, src=rank - 1)
+[?2004l[?2004h>             hidden_states = torch.empty(
+[?2004l[?2004h>                 recv_shape.tolist(), device=device, dtype=dtype
+[?2004l[?2004h>             )
+[?2004l[?2004h>             dist.recv(hidden_states, src=rank - 1)
+[?2004l[?2004h>             hidden_states = hidden_states.detach().requires_grad_(True)
+[?2004l[?2004h>         
+[?2004l[?2004h>         # Save input for backward
+[?2004l[?2004h>         saved_input = hidden_states
+[?2004l[?2004h>         
+[?2004l[?2004h>         # Forward through this rank's layers
+[?2004l[?2004h>         for layer in my_layers:
+[?2004l[?2004h>             hidden_states = layer(hidden_states)[0]  # layer returns (output,)
+[?2004l[?2004h>         
+[?2004l[?2004h>         if is_last_rank:
+[?2004l[?2004h>             # Apply final norm and LM head
+[?2004l[?2004h>             hidden_states = model.model.norm(hidden_states)
+[?2004l[?2004h>             logits = model.lm_head(hidden_states.to(model.lm_head.weight.dtype))
+[?2004l[?2004h>             logits = logits.float()
+[?2004l[?2004h>             
+[?2004l[?2004h>             # Compute loss for this microbatch
+[?2004l[?2004h>             loss = F.cross_entropy(
+[?2004l[?2004h>                 logits.view(-1, logits.size(-1)),
+[?2004l[?2004h>                 target_ids.view(-1)
+[?2004l[?2004h>             )
+[?2004l[?2004h>             
+[?2004l[?2004h>             if mb_idx == 0:
+[?2004l[?2004h>                 total_loss = loss / num_microbatches
+[?2004l[?2004h>             else:
+[?2004l[?2004h>                 total_loss = total_loss + loss / num_microbatches
+[?2004l[?2004h>             
+[?2004l[?2004h>             # Save for backward
+[?2004l[?2004h>             saved_inputs.append(saved_input.detach().requires_grad_(True) if not saved_input.requires_grad else saved_input)
+[?2004l[?2004h>             saved_outputs.append(hidden_states)
+[?2004l[?2004h>         else:
+[?2004l[?2004h>             # Send hidden states to next rank
+[?2004l[?2004h>             out_tensor = hidden_states.contiguous()
+[?2004l[?2004h>             # Send shape first
+[?2004l[?2004h>             shape_tensor = torch.tensor(list(out_tensor.shape), dtype=torch.long, device=device)
+[?2004l[?2004h>             dist.send(shape_tensor, dst=rank + 1)
+[?2004l[?2004h>             dist.send(out_tensor.to(dtype), dst=rank + 1)
+[?2004l[?2004h>             
+[?2004l[?2004h>             # Save for backward
+[?2004l[?2004h>             saved_inputs.append(saved_input)
+[?2004l[?2004h>             saved_outputs.append(out_tensor)
+[?2004l[?2004h>     
+[?2004l[?2004h>     # ============ BACKWARD PHASE ============
+[?2004l[?2004h>     for mb_idx in range(num_microbatches):
+[?2004l[?2004h>         if is_last_rank:
+[?2004l[?2004h>             # Backward from loss
+[?2004l[?2004h>             total_loss.backward(
+[?2004l[?2004h>                 retain_graph=(mb_idx < num_microbatches - 1)
+[?2004l[?2004h>             )
+[?2004l[?2004h>             # Get gradient w.r.t. our input for this microbatch
+[?2004l[?2004h>             input_grad = saved_inputs[mb_idx].grad
+[?2004l[?2004h>             if not is_first_rank and input_grad is not None:
+[?2004l[?2004h>                 # Send gradient to previous rank
+[?2004l[?2004h>                 shape_tensor = torch.tensor(list(input_grad.shape), dtype=torch.long, device=device)
+[?2004l[?2004h>                 dist.send(shape_tensor, dst=rank - 1)
+[?2004l[?2004h>                 dist.send(input_grad.to(dtype), dst=rank - 1)
+[?2004l[?2004h>         else:
+[?2004l[?2004h>             if is_first_rank:
+[?2004l[?2004h>                 # Receive gradient from next rank
+[?2004l[?2004h>                 recv_shape = torch.zeros(3, dtype=torch.long, device=device)
+[?2004l[?2004h>                 dist.recv(recv_shape, src=rank + 1)
+[?2004l[?2004h>                 grad_output = torch.empty(recv_shape.tolist(), device=device, dtype=dtype)
+[?2004l[?2004h>                 dist.recv(grad_output, src=rank + 1)
+[?2004l[?2004h>             else:
+[?2004l[?2004h>                 # Receive gradient from next rank
+[?2004l[?2004h>                 recv_shape = torch.zeros(3, dtype=torch.long, device=device)
+[?2004l[?2004h>                 dist.recv(recv_shape, src=rank + 1)
+[?2004l[?2004h>                 grad_output = torch.empty(recv_shape.tolist(), device=device, dtype=dtype)
+[?2004l[?2004h>                 dist.recv(grad_output, src=rank + 1)
+[?2004l[?2004h>             
+[?2004l[?2004h>             # Backward through our layers
+[?2004l[?2004h>             saved_outputs[mb_idx].backward(grad_output)
+[?2004l[?2004h>             
+[?2004l[?2004h>             if not is_first_rank:
+[?2004l[?2004h>                 # Send gradient to previous rank
+[?2004l[?2004h>                 input_grad = saved_inputs[mb_idx].grad
+[?2004l[?2004h>                 if input_grad is not None:
+[?2004l[?2004h>                     shape_tensor = torch.tensor(list(input_grad.shape), dtype=torch.long, device=device)
+[?2004l[?2004h>                     dist.send(shape_tensor, dst=rank - 1)
+[?2004l[?2004h>                     dist.send(input_grad.to(dtype), dst=rank - 1)
+[?2004l[?2004h>     
+[?2004l[?2004h>     return total_loss.item() if is_last_rank else None
+[?2004l[?2004h> ENDOFFILE
+[?2004l[?2004hroot@fdaaec16ff47:/app# cat > /app/pipeline_parallel.py << 'ENDOFFILE'
+[?2004l[?2004h> import torch
+[?2004l[?2004h> import torch.distributed as dist
+[?2004l  [?2004h> import torch.nn.functional as F
+[?2004lut[?2004h> 
+[?2004l_[?2004h> 
+[?2004l[?2004h> def train_step_pipeline_afab(model, inputs, targets, device, dtype):
+[?2004l[?2004h>     """
+[?2004lfro[?2004h>     Runs one training step using pipeline parallelism with AFAB scheduling.
+[?2004lce[?2004h>     All forward passes first, then all backward passes.
+[?2004l[?2004h>     """
+[?2004l [?2004h>     rank = dist.get_rank()
+[?2004l[?2004h>     world_size = dist.get_world_size()
+[?2004lt([?2004h>     num_microbatches = len(inputs)
+[?2004l[?2004h>     
+[?2004l     [?2004h>     # Partition transformer layers across ranks (roughly balanced)
+[?2004l[?2004h>     all_layers = list(model.model.layers)
+[?2004l[?2004h>     num_layers = len(all_layers)
+[?2004l[?2004h>     layers_per_rank = num_layers // world_size
+[?2004l[?2004h>     remainder = num_layers % world_size
+[?2004l[?2004h>     
+[?2004l     [?2004h>     # Compute start/end indices for this rank's layers
+[?2004l[?2004h>     start_idx = rank * layers_per_rank + min(rank, remainder)
+[?2004l[?2004h>     if rank < remainder:
+[?2004l No[?2004h>         end_idx = start_idx + layers_per_rank + 1
+[?2004l[?2004h>     else:
+[?2004l   [?2004h>         end_idx = start_idx + layers_per_rank
+[?2004l[?2004h>     my_layers = all_layers[start_idx:end_idx]
+[?2004l[?2004h>     
+[?2004l[?2004h>     is_first_rank = (rank == 0)
+[?2004l[?2004h>     is_last_rank = (rank == world_size - 1)
+[?2004l[?2004h>     
+[?2004l[?2004h>     # Storage for AFAB scheduling
+[?2004lan[?2004h>     losses = []          # Per-microbatch losses (last rank only)
+[?2004l[?2004h>     saved_inputs = []    # Input to this stage's layer block per microbatch
+[?2004l[?2004h>     saved_outputs = []   # Output from this stage's layer block per microbatch
+[?2004l[?2004h>     
+[?2004l[?2004h>     # ===== FORWARD PHASE: process all microbatches =====
+[?2004l[?2004h>     for mb_idx in range(num_microbatches):
+[?2004l[?2004h>         input_ids = inputs[mb_idx].to(device=device)
+[?2004l[?2004h>         target_ids = targets[mb_idx].to(device=device)
+[?2004l[?2004h>         
+[?2004l[?2004h>         if is_first_rank:
+[?2004l[?2004h>             # Embed tokens on the first rank
+[?2004l[?2004h>             hidden_states = model.model.embed_tokens(input_ids.long())
+[?2004l[?2004h>             hidden_states = hidden_states.to(device=device, dtype=dtype)
+[?2004l[?2004h>         else:
+[?2004l[?2004h>             # Receive hidden states from previous rank
+[?2004l[?2004h>             recv_shape = torch.zeros(3, dtype=torch.long, device=device)
+[?2004l[?2004h>             dist.recv(recv_shape, src=rank - 1)
+[?2004l[?2004h>             hidden_states = torch.empty(
+[?2004l[?2004h>                 recv_shape.tolist(), device=device, dtype=dtype
+[?2004l[?2004h>             )
+[?2004l[?2004h>             dist.recv(hidden_states, src=rank - 1)
+[?2004l[?2004h>             hidden_states = hidden_states.detach().requires_grad_(True)
+[?2004l[?2004h>         
+[?2004l[?2004h>         # Save input for backward pass
+[?2004l[?2004h>         saved_inputs.append(hidden_states)
+[?2004l[?2004h>         
+[?2004l[?2004h>         # Compute position_ids for this microbatch
+[?2004l[?2004h>         batch_size, seq_len = hidden_states.shape[:2]
+[?2004l[?2004h>         position_ids = torch.arange(seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
+[?2004l[?2004h>         
+[?2004l[?2004h>         # Forward through this rank's transformer layers
+[?2004l[?2004h>         for layer in my_layers:
+[?2004l[?2004h>             hidden_states = layer(hidden_states, position_ids=position_ids)[0]
+[?2004l[?2004h>         
+[?2004l[?2004h>         if is_last_rank:
+[?2004l[?2004h>             # Last rank: apply final norm and language model head
+[?2004l[?2004h>             normed = model.model.norm(hidden_states)
+[?2004l[?2004h>             logits = model.lm_head(normed.to(model.lm_head.weight.dtype))
+[?2004l[?2004h>             logits = logits.float()
+[?2004l[?2004h>             
+[?2004l[?2004h>             # Compute cross-entropy loss for this microbatch
+[?2004l[?2004h>             loss = F.cross_entropy(
+[?2004l[?2004h>                 logits.reshape(-1, logits.size(-1)),
+[?2004l[?2004h>                 target_ids.long().reshape(-1)
+[?2004l[?2004h>             )
+[?2004l[?2004h>             losses.append(loss)
+[?2004l[?2004h>         else:
+[?2004l[?2004h>             # Intermediate rank: save output and send to next rank
+[?2004l[?2004h>             saved_outputs.append(hidden_states)
+[?2004l[?2004h>             out = hidden_states.contiguous()
+[?2004l[?2004h>             shape_tensor = torch.tensor(list(out.shape), dtype=torch.long, device=device)
+[?2004l[?2004h>             dist.send(shape_tensor, dst=rank + 1)
+[?2004l[?2004h>             dist.send(out.to(dtype), dst=rank + 1)
+[?2004l[?2004h>     
+[?2004l[?2004h>     # ===== BACKWARD PHASE: backward all microbatches =====
+[?2004l[?2004h>     for mb_idx in range(num_microbatches):
+[?2004l[?2004h>         if is_last_rank:
+[?2004l[?2004h>             # Backward from per-microbatch loss
+[?2004l[?2004h>             losses[mb_idx].backward()
+[?2004l[?2004h>             
+[?2004l[?2004h>             if not is_first_rank:
+[?2004l[?2004h>                 # Send gradient w.r.t. input to previous rank
+[?2004l[?2004h>                 input_grad = saved_inputs[mb_idx].grad
+[?2004l[?2004h>                 if input_grad is not None:
+[?2004l[?2004h>                     shape_tensor = torch.tensor(
+[?2004l[?2004h>                         list(input_grad.shape), dtype=torch.long, device=device
+[?2004l[?2004h>                     )
+[?2004l[?2004h>                     dist.send(shape_tensor, dst=rank - 1)
+[?2004l[?2004h>                     dist.send(input_grad.to(dtype), dst=rank - 1)
+[?2004l[?2004h>         else:
+[?2004l[?2004h>             # Receive gradient from next rank
+[?2004l[?2004h>             recv_shape = torch.zeros(3, dtype=torch.long, device=device)
+[?2004l[?2004h>             dist.recv(recv_shape, src=rank + 1)
+[?2004l[?2004h>             grad_output = torch.empty(
+[?2004l[?2004h>                 recv_shape.tolist(), device=device, dtype=dtype
+[?2004l[?2004h>             )
+[?2004l[?2004h>             dist.recv(grad_output, src=rank + 1)
+[?2004l[?2004h>             
+[?2004l[?2004h>             # Backward through this stage's layers
+[?2004l[?2004h>             saved_outputs[mb_idx].backward(grad_output)
+[?2004l[?2004h>             
+[?2004l[?2004h>             if not is_first_rank:
+[?2004l[?2004h>                 # Send gradient w.r.t. input to previous rank
+[?2004l[?2004h>                 input_grad = saved_inputs[mb_idx].grad
+[?2004l[?2004h>                 if input_grad is not None:
+[?2004l[?2004h>                     shape_tensor = torch.tensor(
+[?2004l[?2004h>                         list(input_grad.shape), dtype=torch.long, device=device
+[?2004l[?2004h>                     )
+[?2004l[?2004h>                     dist.send(shape_tensor, dst=rank - 1)
+[?2004l[?2004h>                     dist.send(input_grad.to(dtype), dst=rank - 1)
+[?2004l[?2004h>     
+[?2004l[?2004h>     # Return total loss (scaled by number of microbatches)
+[?2004l[?2004h>     if losses:
+[?2004l[?2004h>         total_loss = sum(l.item() for l in losses) / num_microbatches
+[?2004l[?2004h>         return total_loss
+[?2004l[?2004h>     return None
+[?2004l[?2004h> ENDOFFILE
+[?2004l[?2004hroot@fdaaec16ff47:/app# python3 -c "import ast; ast.parse(open('/app/pipeline_parallel.py').read()); print('Syntax OK')"
+[?2004lSyntax OK
+[?2004hroot@fdaaec16ff47:/app# wc -l /app/pipeline_parallel.py && head -5 /app/pipeline_parallel.py && echo '...' && tail -5 /app/pipeline_parallel.py
+[?2004l128 /app/pipeline_parallel.py
+import torch
+import torch.distributed as dist
+import torch.nn.functional as F
+
+
+...
+    # Return total loss (scaled by number of microbatches)
+    if losses:
+        total_loss = sum(l.item() for l in losses) / num_microbatches
+        return total_loss
+    return None
+[?2004hroot@fdaaec16ff47:/app# cat /app/pipeline_parallel.py
+[?2004limport torch
+import torch.distributed as dist
+import torch.nn.functional as F
+
+
+def train_step_pipeline_afab(model, inputs, targets, device, dtype):
+    """
+    Runs one training step using pipeline parallelism with AFAB scheduling.
+    All forward passes first, then all backward passes.
+    """
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    num_microbatches = len(inputs)
+    
+    # Partition transformer layers across ranks (roughly balanced)
+    all_layers = list(model.model.layers)
+    num_layers = len(all_layers)
+    layers_per_rank = num_layers // world_size
+    remainder = num_layers % world_size
+    
+    # Compute start/end indices for this rank's layers
+    start_idx = rank * layers_per_rank + min(rank, remainder)
+    if rank < remainder:
+        end_idx = start_idx + layers_per_rank + 1
+    else:
+        end_idx = start_idx + layers_per_rank
+    my_layers = all_layers[start_idx:end_idx]
+    
+    is_first_rank = (rank == 0)
+    is_last_rank = (rank == world_size - 1)
+    
+    # Storage for AFAB scheduling
+    losses = []          # Per-microbatch losses (last rank only)
+    saved_inputs = []    # Input to this stage's layer block per microbatch
+    saved_outputs = []   # Output from this stage's layer block per microbatch
+    
+    # ===== FORWARD PHASE: process all microbatches =====
+    for mb_idx in range(num_microbatches):
+        input_ids = inputs[mb_idx].to(device=device)
+        target_ids = targets[mb_idx].to(device=device)
+        
+        if is_first_rank:
+            # Embed tokens on the first rank
+            hidden_states = model.model.embed_tokens(input_ids.long())
+            hidden_states = hidden_states.to(device=device, dtype=dtype)
+        else:
+            # Receive hidden states from previous rank
+            recv_shape = torch.zeros(3, dtype=torch.long, device=device)
+            dist.recv(recv_shape, src=rank - 1)
+            hidden_states = torch.empty(
+                recv_shape.tolist(), device=device, dtype=dtype
+            )
+            dist.recv(hidden_states, src=rank - 1)
+            hidden_states = hidden_states.detach().requires_grad_(True)
+        
+        # Save input for backward pass
+        saved_inputs.append(hidden_states)
+        
+        # Compute position_ids for this microbatch
+        batch_size, seq_len = hidden_states.shape[:2]
+        position_ids = torch.arange(seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
+        
+        # Forward through this rank's transformer layers
+        for layer in my_layers:
+            hidden_states = layer(hidden_states, position_ids=position_ids)[0]
+        
+        if is_last_rank:
+            # Last rank: apply final norm and language model head
+            normed = model.model.norm(hidden_states)
+            logits = model.lm_head(normed.to(model.lm_head.weight.dtype))
+            logits = logits.float()
+            
+            # Compute cross-entropy loss for this microbatch
+            loss = F.cross_entropy(
+                logits.reshape(-1, logits.size(-1)),
+                target_ids.long().reshape(-1)
+            )
+            losses.append(loss)
+        else:
+            # Intermediate rank: save output and send to next rank
+            saved_outputs.append(hidden_states)
+            out = hidden_states.contiguous()
+            shape_tensor = torch.tensor(list(out.shape), dtype=torch.long, device=device)
+            dist.send(shape_tensor, dst=rank + 1)
+            dist.send(out.to(dtype), dst=rank + 1)
+    
+    # ===== BACKWARD PHASE: backward all microbatches =====
+    for mb_idx in range(num_microbatches):
+        if is_last_rank:
+            # Backward from per-microbatch loss
+            losses[mb_idx].backward()
+            
+            if not is_first_rank:
+                # Send gradient w.r.t. input to previous rank
+                input_grad = saved_inputs[mb_idx].grad
+                if input_grad is not None:
+                    shape_tensor = torch.tensor(
+                        list(input_grad.shape), dtype=torch.long, device=device
+                    )
+                    dist.send(shape_tensor, dst=rank - 1)
+                    dist.send(input_grad.to(dtype), dst=rank - 1)
+        else:
+            # Receive gradient from next rank
+            recv_shape = torch.zeros(3, dtype=torch.long, device=device)
+            dist.recv(recv_shape, src=rank + 1)
+            grad_output = torch.empty(
+                recv_shape.tolist(), device=device, dtype=dtype
+            )
+            dist.recv(grad_output, src=rank + 1)
+            
+            # Backward through this stage's layers
+            saved_outputs[mb_idx].backward(grad_output)
+            
+            if not is_first_rank:
+                # Send gradient w.r.t. input to previous rank
+                input_grad = saved_inputs[mb_idx].grad
+                if input_grad is not None:
+                    shape_tensor = torch.tensor(
+                        list(input_grad.shape), dtype=torch.long, device=device
+                    )
+                    dist.send(shape_tensor, dst=rank - 1)
+                    dist.send(input_grad.to(dtype), dst=rank - 1)
+    
+    # Return total loss (scaled by number of microbatches)
+    if losses:
+        total_loss = sum(l.item() for l in losses) / num_microbatches
+        return total_loss
+    return None
+[?2004hroot@fdaaec16ff47:/app# 

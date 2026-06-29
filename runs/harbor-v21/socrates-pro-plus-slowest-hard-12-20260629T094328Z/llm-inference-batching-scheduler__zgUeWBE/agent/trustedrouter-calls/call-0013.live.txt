@@ -1,0 +1,126 @@
+
+[tr-stream call-0013:socrates:trustedrouter/socrates-pro-plus-1.0] socrates.started
+
+[tr-stream call-0013:worker:xiaomi/mimo-v2.5-pro-ultraspeed] worker.started
+[tr-thinking call-0013:worker:xiaomi/mimo-v2.5-pro-ultraspeed] We are close but need to meet all thresholds. Let's look at the thresholds:
+
+For bucket 1: cost < 3.0e11, pad_ratio < 0.055, p95_latency < 2.1e6, sequential_timecost < 2.7e8.
+For bucket 2: cost < 4.8e10, pad_ratio < 0.15, p95_latency < 2.1e5, sequential_timecost < 3.2e7.
+
+Current best (frac=0.05, abs=4):
+  B1: cost=3.0824e+11 (still above 
+[tr-thinking call-0013:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 3.0e11 by ~2.7%), pad=0.0542 (just under 0.055), p95=2.1812e+06 (above 2.1e6 by ~3.8%), seq=1.6285e+08 (well under 2.7e8).
+  B2: cost=4.5199e+10 (under 4.8e10), pad=0.1400 (under 0.15), p95=1.9237e+05 (under 2.1e5), seq=3.0757e+07 (under 3.2e7).
+
+So bucket 2 is
+[tr-thinking call-0013:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  okay, but bucket 1 still fails on cost and p95_latency. We need to reduce cost and p95_latency for bucket 1.
+
+Observing the numbers, the main issue is the high cost and p95_latency for bucket 1. The cost and p95_latency depend on both pad_ratio and the distribution of requests across batches. Currently, we are using shapes [64,128,256,384,512,640,1280,2048]. Note that bucket 1 has many requests with prompt_len in the range 1088-2
+[tr-thinking call-0013:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 048. These are assigned to shape 1280 or 2048. This means for many requests, seq_align is 1280 or 2048, which is much larger than their actual aligned prompt (e.g., a request with prompt_len 1090 has aligned prompt 1152, but assigned to shape 1280 -> padding of 128). This increases pad_ratio and cost.
+
+We can try to adjust the shapes to cover the higher range more finely. However, we are limited to 8 shapes total. Currently, we use two shapes for the high range: 1280
+[tr-thinking call-0013:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  and 2048. But note that bucket 1 has many distinct aligned prompts in the high range (from 1088 to 2048 in steps of 64). We cannot cover all with only 8 shapes. We need to choose shapes that minimize the average padding for bucket 1 while not affecting bucket 2 too much.
+
+Alternatively, we could assign each request to the smallest shape that is >= its aligned prompt, but we can also allow assigning to a smaller shape if the shape is at least as large as the aligned prompt? Actually, the requirement is: seq_align >= ceil(prompt_len/64)*64. So we can assign to
+[tr-thinking call-0013:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  any shape that is at least the aligned prompt. However, the shape must be a multiple of 64, and we are allowed up to 8 shapes.
+
+We are currently using a set of shapes that are multiples of 64. We can try to choose shapes that are "representative" of the distribution. For bucket 1, the high range has many requests. Let's look at the distribution of aligned prompts for bucket 1 in the high range:
+
+From earlier:
+  1088: 9
+  1152: 8
+  1216: 9
+  1280: 4
+  1344: 6
+  1408: 11
+  1472: 
+[tr-thinking call-0013:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 5
+  1536: 7
+  1600: 5
+  1664: 7
+  1728: 8
+  1792: 2
+  1856: 11
+  1920: 8
+  1984: 5
+  2048: 17
+
+Total in high range (>=1088): 9+8+9+4+6+11+5+7+5+7+8+2+11+8+5+17 = 122 requests.
+
+If we use only
+[tr-thinking call-0013:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  two shapes for this range (say 1280 and 2048), then requests with aligned prompt from 1088 to 1280 go to 1280, and from 1344 to 2048 go to 2048? Actually, with shapes [1280,2048], requests with aligned prompt 1088,1152,1216,1280 go to 1280 (9+8+9+4=30), and the rest (92 requests) go to 2048. But note that requests with
+[tr-thinking call-0013:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  aligned prompt 1344 have to be padded to 2048 (padding 704). This is a lot of padding.
+
+We can try to add more shapes in the high range, but we only have 8 shapes total. Currently, we use 6 shapes for the low range (64,128,256,384,512,640) and 2 for high. We could reduce the low range shapes to free up more for the high range. For example, bucket 1 low range (<=640) has many requests too. But note that bucket 2 only has requests up to 704,
+[tr-thinking call-0013:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  so we need shapes that cover up to 704. We can use shapes: 64,128,192,320,448,704 for low, and then two for high: 1280,2048? But then bucket 1 high range still has two shapes. Alternatively, we can use shapes: 64,128,192,320,448,704,1024,2048. Then for bucket 1, requests with aligned prompt from 704 to 1024 go to 1024, and from 1088 to 2048 go to 2048.
+[tr-thinking call-0013:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  But 1024 is not enough for many in the high range. Actually, the next shape after 704 is 1024, then 2048. This still has a big gap.
+
+Maybe we can use a non-linear set of shapes. Since the distribution is skewed, we can choose shapes that are quantiles. Let's compute the quantiles for bucket 1 aligned prompts:
+
+We can write a quick script to find 8 shapes that minimize the average padding (or some cost) for both buckets. But note that the cost model is more complex than just padding; it also depends on batching. However, we can try to optimize the shape selection.
+
+Alternatively, we can try a different packing
+[tr-thinking call-0013:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  strategy: instead of assigning each request to the smallest shape >= its aligned prompt, we can allow it to be assigned to any shape that is >= its aligned prompt, and we can choose assignments to minimize cost. But that's more complex.
+
+Given the time, let's try to adjust the shapes to cover the high range better. We have 8 shapes. Let's use:
+
+For bucket 2: needs shapes up to 704. For bucket 1: needs shapes up to 2048.
+
+We can try: [64, 128, 256, 448, 704, 1088, 1472, 2048].
+[tr-thinking call-0013:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  This covers the high range with three shapes: 1088,1472,2048. But note that 1088 is a multiple of 64? 1088/64=17, yes. 1472/64=23, yes. 2048/64=32, yes.
+
+Let's test this shape set.
+
+We'll also try to optimize the gen_len tolerance to reduce cost and p95_latency. We need to reduce p95_latency for bucket 1. The p95_latency is the 95th percentile of
+[tr-thinking call-0013:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  per-request latencies. This is likely dominated by requests with high seq_align and high gen_len. By reducing the seq_align for some requests (by assigning to a smaller shape) and by putting high gen_len requests in their own batches (so G_max is not too high), we can reduce p95_latency.
+
+We can also try to split the high gen_len requests into separate batches even if they have the same seq_align. Currently, we sort by gen_len and group within a tolerance. We can try a smaller tolerance for the high seq_align shapes.
+
+Let's write a script that tries different shape sets and gen_tol parameters to
+[tr-thinking call-0013:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  find one that meets the thresholds.
+
+But first, let's try the shape set [64,128,256,448,704,1088,1472,2048] with the current packing (frac=0.05, abs=4).
+[tr-stream call-0013:worker:xiaomi/mimo-v2.5-pro-ultraspeed] {
+  "analysis": "We're close but bucket 1 still fails on cost and p95_latency. Need to optimize shapes and packing further. The high range (1088-2048) has many requests with large gaps between shapes. Need to refine shape selection and gen_len grouping. Also need to ensure the shapes
+[tr-stream call-0013:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  are multiples of 64 and cover both buckets.",
+  "plan": "1) Try shape sets that cover high range more finely while still covering bucket 2 up to 704. 2) Optimize gen_len tolerance, maybe separate high gen_len requests into own batches. 3) Write script to search over shape sets and parameters, then output final plans.",
+  "commands": [
+    {
+      "keystrokes": "cat > /app/task_file/scripts/optimizer2.py << 'PYEOF'\n#!/usr/bin/env python3\nimport json, math, os, sys, itertools\nfrom collections import defaultdict\nsys
+[tr-stream call-0013:worker:xiaomi/mimo-v2.5-pro-ultraspeed] .path.insert(0, os.path.dirname(__file__))\nfrom cost_model import CostModel, CostConsts, align, HEADS, HIDDEN\n\ndef load_requests(path):\n    reqs = {}\n    with open(path) as f:\n        for line in f:\n            r = json.loads(line)\n            reqs[r['request_id']] = r\n    return reqs\n\ndef build_plan(reqs, shapes, gen_tol_frac=0.10, gen_tol_abs=8, max_batch=64):\n    shape_groups = defaultdict(list)\n    for rid, r in reqs.items():\n        s = align(r['prompt_len'], 64)\n        assigned = None\n        for sh in shapes:\n            if sh >= s:\n                assigned = sh\n                break\n        if assigned is None
+[tr-stream call-0013:worker:xiaomi/mimo-v2.5-pro-ultraspeed] :\n            assigned = shapes[-1]\n        shape_groups[assigned].append((rid, s, r['gen_len']))\n\n    plan = []\n    bc = 0\n    for shape_val in sorted(shape_groups.keys()):\n        group = sorted(shape_groups[shape_val], key=lambda x: x[2])\n        cur = []\n        cur_min = None\n        for item in group:\n            g = item[2]\n            if not cur:\n                cur = [item]; cur_min = g\n            else:\n                gmax = max(item[2], max(x[2] for x in cur))\n                limit = max(cur_min*(1+gen_tol_frac), cur_min+gen_tol_abs)\n                if gmax <= limit and len(cur) < max_batch:\n                    cur.append(item)\n                else
+[tr-stream call-0013:worker:xiaomi/mimo-v2.5-pro-ultraspeed] :\n                    bc += 1\n                    bid = f\"b-{bc:04d}\"\n                    for rid2,s2,g2 in cur:\n                        plan.append({'request_id':rid2,'batch_id':bid,'shape':{'seq_align':shape_val,'heads_align':HEADS,'hidden_align':HIDDEN}})\n                    cur=[item]; cur_min=g\n        if cur:\n            bc += 1\n            bid = f\"b-{bc:04d}\"\n            for rid2,s2,g2 in cur:\n                plan.append({'request_id':rid2,'batch_id':bid,'shape':{'seq_align':shape_val,'heads_align':HEADS,'hidden_align':HIDDEN}})\n    return plan\n\ndef evaluate(reqs, plan, label=\"\"):\n    cm = CostModel(64)\n   
+[tr-stream call-0013:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  m = cm.plan_metrics(reqs, plan)\n    shapes = set((p['shape']['seq_align'],p['shape']['heads_align'],p['shape']['hidden_align']) for p in plan)\n    nb = len(set(p['batch_id'] for p in plan))\n    return m, len(shapes), nb\n\nif __name__ == '__main__':\n    root = os.path.dirname(os.path.dirname(__file__))\n    reqs1 = load_requests(os.path.join(root,'input_data','requests_bucket_1.jsonl'))\n    reqs2 = load_requests(os.path.join(root,'input_data','requests_bucket_2.jsonl'))\n\n    # Candidate shape sets (must be multiples of 64
+[tr-stream call-0013:worker:xiaomi/mimo-v2.5-pro-ultraspeed] , sorted, max 8)\n    candidates = [\n        [64,128,256,448,704,1088,1472,2048],\n        [64,128,192,384,640,1088,1472,2048],\n        [64,128,192,384,640,1024,1408,2048],\n        [64,128,192,32
+[tr-stream call-0013:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 0,448,704,1152,2048],\n        [64,128,192,320,448,704,1088,2048],\n        [64,128,192,320,448,704,1024,2048],\n        [64,128,192,320,448,704,1024,1600],\n        [64,128,192,320,448,704,11
+[tr-stream call-0013:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 52,1792],\n        [64,128,192,320,448,704,1280,2048],\n    ]\n    best = None\n    for shapes in candidates:\n        for frac, ab in [(0.05,4), (0.03,3), (0.02,2), (0.10,8)]:\n            plan1 = build_plan(reqs1, shapes, frac, ab, 64)\n            plan2 = build_plan(reqs2, shapes, frac, ab, 64)\n            m1, s1, nb1 = evaluate(reqs1, plan1)\n            m2, s2, nb2 = evaluate(req
+[tr-stream call-0013:worker:xiaomi/mimo-v2.5-pro-ultraspeed] s2, plan2)\n            ok1 = (m1['cost'] < 3.0e11 and m1['pad_ratio'] < 0.055 and m1['p95_latency_ms'] < 2.1e6 and m1['sequential_timecost'] < 2.7e8)\n            ok2 = (m2['cost'] < 4.8e10 and m2['pad_ratio'] < 0.15 and m2['p95_latency_ms'] < 2.1e5 and m2['sequential_timecost'] < 3.2e7)\n            score = m1['cost'] + m2['cost']\n            if best
+[tr-stream call-0013:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  is None or (ok1 and ok2 and score < best['score']) or (not best['ok'] and (ok1 and ok2)):\n                best = {'shapes':shapes,'frac':frac,'ab':ab,'m1':m1,'m2':m2,'ok':ok1 and ok2,'score':score}\n                print(f\"Candidate: {shapes} frac={frac} abs={ab} => B1 cost={m1['cost']:.4e} pad={m1['pad_ratio']:.4f} p95={m1['p95_latency_ms']:.4e} seq={m1['sequential_timecost']:.4e} B2 cost={m2['cost']:.4e} pad={m2['pad_ratio']:.4f}
+[tr-stream call-0013:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  p95={m2['p95_latency_ms']:.4e} seq={m2['sequential_timecost']:.4e} ok={ok1 and ok2}\")\n    print(f\"\\nBest: {best['shapes']} frac={best['frac']} abs={best['ab']}\")\n    print(f\"  B1: cost={best['m1']['cost']:.4e} pad={best['m1']['pad_ratio']:.4f} p95={best['m1']['p95_latency_ms']:.4e} seq={best['m1']['sequential_timecost']:.4e}\")\n    print(f\" 
+[tr-stream call-0013:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  B2: cost={best['m2']['cost']:.4e} pad={best['m2']['pad_ratio']:.4f} p95={best['m2']['p95_latency_ms']:.4e} seq={best['m2']['sequential_timecost']:.4e}\")\nPYEOF\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "cd /app/task_file && python3 scripts/optimizer2.py 2>&1\n",
+      "duration": 10.0
+    }
+  ],
+  "task_complete": false
+}
+
+[tr-stream call-0013:worker:xiaomi/mimo-v2.5-pro-ultraspeed] worker.done finish=stop cost_microdollars=40418
+[tr-stream call-0013:xiaomi/mimo-v2.5-pro-ultraspeed] {
+  "analysis": "We're close but bucket 1 still fails on cost and p95_latency. Need to optimize shapes and packing further. The high range (1088-2048) has many requests with large gaps between shapes. Need to refine shape selection and gen_len grouping. Also need to ensure the shapes are multiples of 64 and cover both buckets.",
+  "plan": "1) Try shape sets that cover high range more finely while still covering bucket 2 up to 704. 2) Optimize gen_len tolerance, maybe separate high gen_len requests into own batches. 3) Write script to search over shape sets and parameters, then output final plans.",
+  "commands": [
+    {
+      "keystrokes": "cat > /app/task_file/scripts/optimizer2.py << 'PYEOF'\n#!/usr/bin/env python3\nimport json, math, os, sys, itertools\nfrom collections import defaultdict\nsys.path.insert(0, os.path.dirname(__file__))\nfrom cost_model import CostModel, CostConsts, align, HEADS, HIDDEN\n\ndef load_requests(path):\n    reqs = {}\n    with open(path) as f:\n        for line in f:\n            r = json.loads(line)\n            reqs[r['request_id']] = r\n    return reqs\n\ndef build_plan(reqs, shapes, gen_tol_frac=0.10, gen_tol_abs=8, max_batch=64):\n    shape_groups = defaultdict(list)\n    for rid, r in reqs.items():\n        s = align(r['prompt_len'], 64)\n        assigned = None\n        for sh in shapes:\n            if sh >= s:\n                assigned = sh\n                break\n        if assigned is None:\n            assigned = shapes[-1]\n        shape_groups[assigned].append((rid, s, r['gen_len']))\n\n    plan = []\n    bc = 0\n    for shape_val in sorted(shape_groups.keys()):\n        group = sorted(shape_groups[shape_val], key=lambda x: x[2])\n        cur = []\n        cur_min = None\n        for item in group:\n            g = item[2]\n            if not cur:\n                cur = [item]; cur_min = g\n            else:\n                gmax = max(item[2], max(x[2] for x in cur))\n                limit = max(cur_min*(1+gen_tol_frac), cur_min+gen_tol_abs)\n                if gmax <= limit and len(cur) < max_batch:\n                    cur.append(item)\n                else:\n                    bc += 1\n                    bid = f\"b-{bc:04d}\"\n                    for rid2,s2,g2 in cur:\n                        plan.append({'request_id':rid2,'batch_id':bid,'shape':{'seq_align':shape_val,'heads_align':HEADS,'hidden_align':HIDDEN}})\n                    cur=[item]; cur_min=g\n        if cur:\n            bc += 1\n            bid = f\"b-{bc:04d}\"\n            for rid2,s2,g2 in cur:\n                plan.append({'request_id':rid2,'batch_id':bid,'shape':{'seq_align':shape_val,'heads_align':HEADS,'hidden_align':HIDDEN}})\n    return plan\n\ndef evaluate(reqs, plan, label=\"\"):\n    cm = CostModel(64)\n    m = cm.plan_metrics(reqs, plan)\n    shapes = set((p['shape']['seq_align'],p['shape']['heads_align'],p['shape']['hidden_align']) for p in plan)\n    nb = len(set(p['batch_id'] for p in plan))\n    return m, len(shapes), nb\n\nif __name__ == '__main__':\n    root = os.path.dirname(os.path.dirname(__file__))\n    reqs1 = load_requests(os.path.join(root,'input_data','requests_bucket_1.jsonl'))\n    reqs2 = load_requests(os.path.join(root,'input_data','requests_bucket_2.jsonl'))\n\n    # Candidate shape sets (must be multiples of 64, sorted, max 8)\n    candidates = [\n        [64,128,256,448,704,1088,1472,2048],\n        [64,128,192,384,640,1088,1472,2048],\n        [64,128,192,384,640,1024,1408,2048],\n        [64,128,192,320,448,704,1152,2048],\n        [64,128,192,320,448,704,1088,2048],\n        [64,128,192,320,448,704,1024,2048],\n        [64,128,192,320,448,704,1024,1600],\n        [64,128,192,320,448,704,1152,1792],\n        [64,128,192,320,448,704,1280,2048],\n    ]\n    best = None\n    for shapes in candidates:\n        for frac, ab in [(0.05,4), (0.03,3), (0.02,2), (0.10,8)]:\n            plan1 = build_plan(reqs1, shapes, frac, ab, 64)\n            plan2 = build_plan(reqs2, shapes, frac, ab, 64)\n            m1, s1, nb1 = evaluate(reqs1, plan1)\n            m2, s2, nb2 = evaluate(reqs2, plan2)\n            ok1 = (m1['cost'] < 3.0e11 and m1['pad_ratio'] < 0.055 and m1['p95_latency_ms'] < 2.1e6 and m1['sequential_timecost'] < 2.7e8)\n            ok2 = (m2['cost'] < 4.8e10 and m2['pad_ratio'] < 0.15 and m2['p95_latency_ms'] < 2.1e5 and m2['sequential_timecost'] < 3.2e7)\n            score = m1['cost'] + m2['cost']\n            if best is None or (ok1 and ok2 and score < best['score']) or (not best['ok'] and (ok1 and ok2)):\n                best = {'shapes':shapes,'frac':frac,'ab':ab,'m1':m1,'m2':m2,'ok':ok1 and ok2,'score':score}\n                print(f\"Candidate: {shapes} frac={frac} abs={ab} => B1 cost={m1['cost']:.4e} pad={m1['pad_ratio']:.4f} p95={m1['p95_latency_ms']:.4e} seq={m1['sequential_timecost']:.4e} B2 cost={m2['cost']:.4e} pad={m2['pad_ratio']:.4f} p95={m2['p95_latency_ms']:.4e} seq={m2['sequential_timecost']:.4e} ok={ok1 and ok2}\")\n    print(f\"\\nBest: {best['shapes']} frac={best['frac']} abs={best['ab']}\")\n    print(f\"  B1: cost={best['m1']['cost']:.4e} pad={best['m1']['pad_ratio']:.4f} p95={best['m1']['p95_latency_ms']:.4e} seq={best['m1']['sequential_timecost']:.4e}\")\n    print(f\"  B2: cost={best['m2']['cost']:.4e} pad={best['m2']['pad_ratio']:.4f} p95={best['m2']['p95_latency_ms']:.4e} seq={best['m2']['sequential_timecost']:.4e}\")\nPYEOF\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "cd /app/task_file && python3 scripts/optimizer2.py 2>&1\n",
+      "duration": 10.0
+    }
+  ],
+  "task_complete": false
+}

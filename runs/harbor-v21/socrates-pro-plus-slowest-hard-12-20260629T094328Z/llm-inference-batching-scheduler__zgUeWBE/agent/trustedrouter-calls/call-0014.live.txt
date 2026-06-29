@@ -1,0 +1,112 @@
+
+[tr-stream call-0014:socrates:trustedrouter/socrates-pro-plus-1.0] socrates.started
+
+[tr-stream call-0014:worker:xiaomi/mimo-v2.5-pro-ultraspeed] worker.started
+[tr-thinking call-0014:worker:xiaomi/mimo-v2.5-pro-ultraspeed] We are getting closer but still not meeting thresholds. Let's analyze:
+- Bucket 1: cost < 3.0e11, pad_ratio < 0.055, p95_latency < 2.1e6, sequential_timecost < 2.7e8
+- Bucket 2: cost < 4.8e10, pad_ratio < 0.15, p95_latency < 2.1e5, sequential_timecost < 3.2e7
+
+Our current best:
+B1: cost=3.0631e+11 (slightly over 3.0e11), pad=0.0543 (
+[tr-thinking call-0014:worker:xiaomi/mimo-v2.5-pro-ultraspeed] under 0.055), p95=2.1812e+06 (over 2.1e6), seq=1.6303e+08 (under 2.7e8)
+B2: cost=4.4961e+10 (under 4.8e10), pad=0.1399 (under 0.15), p95=1.9237e+05 (under 2.1e5), seq=2.9627e+07 (under 3.2e7)
+
+So Bucket 1 is failing on cost and p95_latency. We need to reduce cost and p95
+[tr-thinking call-0014:worker:xiaomi/mimo-v2.5-pro-ultraspeed] _latency for bucket 1.
+
+Observations:
+- The high latency for bucket 1 is likely due to large S_max (aligned prompt) in batches. The cost model's decode cost depends on S_max^2 * G_max. We need to keep S_max as small as possible for batches with large G_max.
+- Currently we are grouping by gen_len tolerance, but not by prompt length. For bucket 1, there are many requests with large prompt lengths (up to 2048). We should further sub-batch by prompt length within each shape group.
+
+Let's try a different approach: within each shape group, we can also
+[tr-thinking call-0014:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  sort by prompt_len (or aligned prompt) and then by gen_len. However, note that the shape already groups by aligned prompt. But within a shape, there can be a range of aligned prompts? Actually, by definition, if we assign a request to a shape, its aligned prompt is <= shape_val. But within a shape, the actual aligned prompts can vary (e.g., shape 128 includes aligned prompts 64 and 128). So we should also consider sub-batching by aligned prompt within a shape.
+
+Alternatively, we can use a more granular shape set for bucket 1 to reduce the spread of aligned prompts within each shape. But
+[tr-thinking call-0014:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  we are limited to 8 shapes total across both buckets. We already use 7 shapes for bucket 1 (since bucket 2 only uses up to 704, we have shapes 64,128,256,448,704,1088,1472,2048). Actually bucket 2 uses shapes up to 704 (which is one of the shapes). So we have 8 shapes total.
+
+Maybe we can adjust the shape set to have more granularity in the high range for bucket 1, while still covering bucket 2's range. For example, bucket 2 only needs up to 704. So we can use shapes: 64,128,2
+[tr-thinking call-0014:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 56,448,704,1024,1536,2048. That gives 8 shapes, and the high range has 1024,1536,2048 which are more evenly spread than 1088,1472,2048.
+
+Let's try that and also improve the sub-batching by also grouping by aligned prompt within a shape.
+
+We'll modify the build_plan function to:
+1. Group by shape (assigned by smallest shape >= aligned prompt)
+2. Within each shape, group by aligned prompt (actual aligned prompt value)
+3. Within each aligned prompt subgroup
+[tr-thinking call-0014:worker:xiaomi/mimo-v2.5-pro-ultraspeed] , sort by gen_len and sub-batch by gen_len tolerance.
+
+This should reduce S_max variation within batches and also keep G_max tight.
+
+We'll also experiment with gen_len tolerance parameters.
+
+But first, let's compute the current pad_ratio for bucket 1 more precisely. We have pad_ratio = 0.0543, which is close to the limit 0.055. So we need to reduce padding a bit more.
+
+We can also try to adjust the gen_len tolerance to be even tighter (e.g., frac=0.02, abs=2) but that will increase the number of batches and overhead cost.
+
+Alternatively, we can try to use a different shape set that reduces prompt padding.
+[tr-thinking call-0014:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  Let's analyze the prompt padding for bucket 1: we have many requests with aligned prompt 64 and 128. If we use shape 64 for those with aligned prompt 64, and shape 128 for those with aligned prompt 128, then there is no prompt padding. But for aligned prompt 320, if we assign to shape 448, then there is padding of 128 tokens. So we want shapes that are as close as possible to the aligned prompts.
+
+Maybe we can use more shapes in the lower range for bucket 1, but bucket 2 also needs shapes in
+[tr-thinking call-0014:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  the lower range. We have 8 shapes total, and bucket 2 uses up to 704. So we can allocate: 64,128,192,256,320,384,448,704 for bucket 2, but then bucket 1 needs shapes for 512,576,640,1088,... We can't have both.
+
+We need to find a balance.
+
+Let's try a shape set that is more evenly distributed across the entire range of both buckets. The maximum prompt length in bucket 1 is 2038, so we need a shape near
+[tr-thinking call-0014:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  2048. Bucket 2 max is 677, so we need a shape near 704.
+
+We can try: 64,128,256,448,704,1024,1536,2048.
+
+Now, let's implement the improved build_plan with sub-batching by aligned prompt within shape.
+
+We'll also try a few different gen_len tolerance parameters.
+
+Let's write a new script.
+
+Note: We must also ensure that the total number of unique shapes across both plans does not exceed 8. Since we are using the same shape set for both,
+[tr-thinking call-0014:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  we are safe.
+
+Let's proceed.
+[tr-stream call-0014:worker:xiaomi/mimo-v2.5-pro-ultraspeed] {
+  "analysis": "We're close to meeting thresholds but Bucket 1 still exceeds on cost and p95_latency. Need to further optimize by: 1) Using a shape set that better matches prompt distributions in both buckets, 2) Adding sub-batching by aligned prompt within each shape group to reduce S_max variation within batches. Let's try shape set [64,128,256,448,704,1024,1536,2048] which provides better coverage for high-range prompts in Bucket 1 while
+[tr-stream call-0014:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  still covering Bucket 2's range. Also need to tighten gen_len grouping further and add prompt-level grouping within shapes.",
+  "plan": "Write an improved optimizer that groups by both shape and aligned prompt length within shape, then by gen_len. Test multiple shape sets and gen_len parameters. Once we find a configuration meeting all thresholds, generate the final plan files.",
+  "commands": [
+    {
+      "keystrokes": "cat > /app/task_file/scripts/optimizer_final.py << 'PYEOF'\n#!/usr/bin/env python3\nimport json, math, os, sys\nfrom collections import defaultdict\nsys.path.insert(0, os.path.dirname(__file__))\nfrom cost_model import CostModel, CostConsts, align,
+[tr-stream call-0014:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  HEADS, HIDDEN\n\ndef load_requests(path):\n    reqs = {}\n    with open(path) as f:\n        for line in f:\n            r = json.loads(line)\n            reqs[r['request_id']] = r\n    return reqs\n\ndef build_plan(reqs, shapes, gen_tol_frac=0.10, gen_tol_abs=8, max_batch=64):\n    shape_groups = defaultdict(list)\n    for rid, r in reqs.items():\n        s = align(r['prompt_len'], 64)\n        assigned = None\n        for sh in shapes:\n            if sh >= s:\n                assigned = sh\n                break\n        if assigned is None:\n            assigned = shapes[-1]\n        shape_groups[
+[tr-stream call-0014:worker:xiaomi/mimo-v2.5-pro-ultraspeed] assigned].append((rid, s, r['gen_len']))\n\n    plan = []\n    bc = 0\n    for shape_val in sorted(shape_groups.keys()):\n        group = shape_groups[shape_val]\n        # Group by aligned prompt within shape\n        prompt_groups = defaultdict(list)\n        for rid, s, g in group:\n            prompt_groups[s].append((rid, s, g))\n        \n        for s_val in sorted(prompt_groups.keys()):\n            subgroup = sorted(prompt_groups[s_val], key=lambda x: x[2])\n            cur = []\n            cur_min = None\n            for item in subgroup:\n                g = item[2]\n                if not cur:\n                    cur = [item]; cur_min = g\n                else:\n                    gmax = max(item[2], max(x
+[tr-stream call-0014:worker:xiaomi/mimo-v2.5-pro-ultraspeed] [2] for x in cur))\n                    limit = max(cur_min*(1+gen_tol_frac), cur_min+gen_tol_abs)\n                    if gmax <= limit and len(cur) < max_batch:\n                        cur.append(item)\n                    else:\n                        bc += 1\n                        bid = f\"b-{bc:04d}\"\n                        for rid2,s2,g2 in cur:\n                            plan.append({'request_id':rid2,'batch_id':bid,'shape':{'seq_align':shape_val,'heads_align':HEADS,'hidden_align':HIDDEN}})\n                        cur=[item]; cur_min=g\n            if cur:\n                bc += 1\n                bid = f\"b-{bc:04d}\"\n                for rid2,s2,g2 in cur:\n                    plan.append({'request_id':rid2,'batch
+[tr-stream call-0014:worker:xiaomi/mimo-v2.5-pro-ultraspeed] _id':bid,'shape':{'seq_align':shape_val,'heads_align':HEADS,'hidden_align':HIDDEN}})\n    return plan\n\ndef evaluate(reqs, plan, label=\"\"):\n    cm = CostModel(64)\n    m = cm.plan_metrics(reqs, plan)\n    shapes = set((p['shape']['seq_align'],p['shape']['heads_align'],p['shape']['hidden_align']) for p in plan)\n    nb = len(set(p['batch_id'] for p in plan))\n    return m, len(shapes), nb\n\nif __name__ == '__main__':\n    root = os.path.dirname(os.path.dirname(__file__))\n    reqs1 = load_requests(os.path.join(root,'input_data','requests_bucket_1.jsonl'))\n    reqs2 = load_requests(os.path.join(root,'input_data
+[tr-stream call-0014:worker:xiaomi/mimo-v2.5-pro-ultraspeed] ','requests_bucket_2.jsonl'))\n\n    # Candidate shape sets\n    candidates = [\n        [64,128,256,448,704,1024,1536,2048],\n        [64,128,256,448,704,1088,1472,2048],\n        [64,128,192,384,640,1088,1472,2048],\n        [64,128,192,320,448,704,1088,2048],\n        [64,12
+[tr-stream call-0014:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 8,192,320,448,704,1024,2048],\n        [64,128,256,448,704,1024,1408,2048],\n        [64,128,256,384,640,1024,1472,2048],\n        [64,128,192,384,704,1024,1536,2048],\n    ]\n    best = None\n    for shapes in candidates:\n        for frac, ab in
+[tr-stream call-0014:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  [(0.05,4), (0.03,3), (0.02,2), (0.01,1)]:\n            plan1 = build_plan(reqs1, shapes, frac, ab, 64)\n            plan2 = build_plan(reqs2, shapes, frac, ab, 64)\n            m1, s1, nb1 = evaluate(reqs1, plan1)\n            m2, s2, nb2 = evaluate(reqs2, plan2)\n            ok1 = (m1['cost'] < 3.0e11 and m1['pad_ratio'] < 0.055 and m1['p95_latency_ms'] < 2.1e6 and m1['sequential_timecost'] < 2.7e8)\n
+[tr-stream call-0014:worker:xiaomi/mimo-v2.5-pro-ultraspeed]             ok2 = (m2['cost'] < 4.8e10 and m2['pad_ratio'] < 0.15 and m2['p95_latency_ms'] < 2.1e5 and m2['sequential_timecost'] < 3.2e7)\n            ok = ok1 and ok2\n            score = m1['cost'] + m2['cost']\n            if best is None or (ok and (not best['ok'] or score < best['score'])):\n                best = {'shapes':shapes,'frac':frac,'ab':ab,'m1':m1,'m2':m2,'ok':ok,'score':score,'plan1':plan1,'plan2':plan2}\n                print(f
+[tr-stream call-0014:worker:xiaomi/mimo-v2.5-pro-ultraspeed] \"Best so far: {shapes} frac={frac} abs={ab} ok={ok}\")\n                print(f\"  B1: cost={m1['cost']:.4e} pad={m1['pad_ratio']:.4f} p95={m1['p95_latency_ms']:.4e} seq={m1['sequential_timecost']:.4e}\")\n                print(f\"  B2: cost={m2['cost']:.4e} pad={m2['pad_ratio']:.4f} p95={m2['p95_latency_ms']:.4e} seq={m2['sequential_timecost']:.4e}\")\n   
+[tr-stream call-0014:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  \n    if best and best['ok']:\n        # Write output files\n        out_dir = os.path.join(root, 'output_data')\n        os.makedirs(out_dir, exist_ok=True)\n        with open(os.path.join(out_dir, 'plan_b1.jsonl'), 'w') as f:\n            for rec in best['plan1']:\n                f.write(json.dumps(rec) + '\\n')\n        with open(os.path.join(out_dir, 'plan_b2.jsonl'), 'w') as f:\n            for rec in best['plan2']:\n                f.write(json.dumps(rec) + '\\n')\n        print(\"\\nOutput
+[tr-stream call-0014:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  files written.\")\n    else:\n        print(\"No solution found meeting all thresholds.\")\nPYEOF\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "cd /app/task_file && python3 scripts/optimizer_final.py 2>&1\n",
+      "duration": 30.0
+    }
+  ],
+  "task_complete": false
+}
+
+[tr-stream call-0014:worker:xiaomi/mimo-v2.5-pro-ultraspeed] worker.done finish=stop cost_microdollars=44661
+[tr-stream call-0014:xiaomi/mimo-v2.5-pro-ultraspeed] {
+  "analysis": "We're close to meeting thresholds but Bucket 1 still exceeds on cost and p95_latency. Need to further optimize by: 1) Using a shape set that better matches prompt distributions in both buckets, 2) Adding sub-batching by aligned prompt within each shape group to reduce S_max variation within batches. Let's try shape set [64,128,256,448,704,1024,1536,2048] which provides better coverage for high-range prompts in Bucket 1 while still covering Bucket 2's range. Also need to tighten gen_len grouping further and add prompt-level grouping within shapes.",
+  "plan": "Write an improved optimizer that groups by both shape and aligned prompt length within shape, then by gen_len. Test multiple shape sets and gen_len parameters. Once we find a configuration meeting all thresholds, generate the final plan files.",
+  "commands": [
+    {
+      "keystrokes": "cat > /app/task_file/scripts/optimizer_final.py << 'PYEOF'\n#!/usr/bin/env python3\nimport json, math, os, sys\nfrom collections import defaultdict\nsys.path.insert(0, os.path.dirname(__file__))\nfrom cost_model import CostModel, CostConsts, align, HEADS, HIDDEN\n\ndef load_requests(path):\n    reqs = {}\n    with open(path) as f:\n        for line in f:\n            r = json.loads(line)\n            reqs[r['request_id']] = r\n    return reqs\n\ndef build_plan(reqs, shapes, gen_tol_frac=0.10, gen_tol_abs=8, max_batch=64):\n    shape_groups = defaultdict(list)\n    for rid, r in reqs.items():\n        s = align(r['prompt_len'], 64)\n        assigned = None\n        for sh in shapes:\n            if sh >= s:\n                assigned = sh\n                break\n        if assigned is None:\n            assigned = shapes[-1]\n        shape_groups[assigned].append((rid, s, r['gen_len']))\n\n    plan = []\n    bc = 0\n    for shape_val in sorted(shape_groups.keys()):\n        group = shape_groups[shape_val]\n        # Group by aligned prompt within shape\n        prompt_groups = defaultdict(list)\n        for rid, s, g in group:\n            prompt_groups[s].append((rid, s, g))\n        \n        for s_val in sorted(prompt_groups.keys()):\n            subgroup = sorted(prompt_groups[s_val], key=lambda x: x[2])\n            cur = []\n            cur_min = None\n            for item in subgroup:\n                g = item[2]\n                if not cur:\n                    cur = [item]; cur_min = g\n                else:\n                    gmax = max(item[2], max(x[2] for x in cur))\n                    limit = max(cur_min*(1+gen_tol_frac), cur_min+gen_tol_abs)\n                    if gmax <= limit and len(cur) < max_batch:\n                        cur.append(item)\n                    else:\n                        bc += 1\n                        bid = f\"b-{bc:04d}\"\n                        for rid2,s2,g2 in cur:\n                            plan.append({'request_id':rid2,'batch_id':bid,'shape':{'seq_align':shape_val,'heads_align':HEADS,'hidden_align':HIDDEN}})\n                        cur=[item]; cur_min=g\n            if cur:\n                bc += 1\n                bid = f\"b-{bc:04d}\"\n                for rid2,s2,g2 in cur:\n                    plan.append({'request_id':rid2,'batch_id':bid,'shape':{'seq_align':shape_val,'heads_align':HEADS,'hidden_align':HIDDEN}})\n    return plan\n\ndef evaluate(reqs, plan, label=\"\"):\n    cm = CostModel(64)\n    m = cm.plan_metrics(reqs, plan)\n    shapes = set((p['shape']['seq_align'],p['shape']['heads_align'],p['shape']['hidden_align']) for p in plan)\n    nb = len(set(p['batch_id'] for p in plan))\n    return m, len(shapes), nb\n\nif __name__ == '__main__':\n    root = os.path.dirname(os.path.dirname(__file__))\n    reqs1 = load_requests(os.path.join(root,'input_data','requests_bucket_1.jsonl'))\n    reqs2 = load_requests(os.path.join(root,'input_data','requests_bucket_2.jsonl'))\n\n    # Candidate shape sets\n    candidates = [\n        [64,128,256,448,704,1024,1536,2048],\n        [64,128,256,448,704,1088,1472,2048],\n        [64,128,192,384,640,1088,1472,2048],\n        [64,128,192,320,448,704,1088,2048],\n        [64,128,192,320,448,704,1024,2048],\n        [64,128,256,448,704,1024,1408,2048],\n        [64,128,256,384,640,1024,1472,2048],\n        [64,128,192,384,704,1024,1536,2048],\n    ]\n    best = None\n    for shapes in candidates:\n        for frac, ab in [(0.05,4), (0.03,3), (0.02,2), (0.01,1)]:\n            plan1 = build_plan(reqs1, shapes, frac, ab, 64)\n            plan2 = build_plan(reqs2, shapes, frac, ab, 64)\n            m1, s1, nb1 = evaluate(reqs1, plan1)\n            m2, s2, nb2 = evaluate(reqs2, plan2)\n            ok1 = (m1['cost'] < 3.0e11 and m1['pad_ratio'] < 0.055 and m1['p95_latency_ms'] < 2.1e6 and m1['sequential_timecost'] < 2.7e8)\n            ok2 = (m2['cost'] < 4.8e10 and m2['pad_ratio'] < 0.15 and m2['p95_latency_ms'] < 2.1e5 and m2['sequential_timecost'] < 3.2e7)\n            ok = ok1 and ok2\n            score = m1['cost'] + m2['cost']\n            if best is None or (ok and (not best['ok'] or score < best['score'])):\n                best = {'shapes':shapes,'frac':frac,'ab':ab,'m1':m1,'m2':m2,'ok':ok,'score':score,'plan1':plan1,'plan2':plan2}\n                print(f\"Best so far: {shapes} frac={frac} abs={ab} ok={ok}\")\n                print(f\"  B1: cost={m1['cost']:.4e} pad={m1['pad_ratio']:.4f} p95={m1['p95_latency_ms']:.4e} seq={m1['sequential_timecost']:.4e}\")\n                print(f\"  B2: cost={m2['cost']:.4e} pad={m2['pad_ratio']:.4f} p95={m2['p95_latency_ms']:.4e} seq={m2['sequential_timecost']:.4e}\")\n    \n    if best and best['ok']:\n        # Write output files\n        out_dir = os.path.join(root, 'output_data')\n        os.makedirs(out_dir, exist_ok=True)\n        with open(os.path.join(out_dir, 'plan_b1.jsonl'), 'w') as f:\n            for rec in best['plan1']:\n                f.write(json.dumps(rec) + '\\n')\n        with open(os.path.join(out_dir, 'plan_b2.jsonl'), 'w') as f:\n            for rec in best['plan2']:\n                f.write(json.dumps(rec) + '\\n')\n        print(\"\\nOutput files written.\")\n    else:\n        print(\"No solution found meeting all thresholds.\")\nPYEOF\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "cd /app/task_file && python3 scripts/optimizer_final.py 2>&1\n",
+      "duration": 30.0
+    }
+  ],
+  "task_complete": false
+}

@@ -1,0 +1,318 @@
+
+[tr-stream call-0089:socrates:trustedrouter/socrates-pro-plus-1.0] socrates.started
+
+[tr-stream call-0089:worker:xiaomi/mimo-v2.5-pro-ultraspeed] worker.started
+[tr-thinking call-0089:worker:xiaomi/mimo-v2.5-pro-ultraspeed] The program is crashing during R_Init. The issue is likely that the program terminates because it jumps to PC=0x0. Let me think about what could cause this.
+
+Looking at the VM's runProgram:
+```
+if (result !== 0 || this.pc === 0 || this.pc === oldPc) {
+    console.log(`Program terminated at PC=0x${this.pc.toString(16)}`);
+    break;
+}
+```
+
+So it terminates when PC becomes 0. This could happen if:
+1. A function pointer is NULL
+2. A function returns to an address of 0 (no return address
+[tr-thinking call-0089:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  or corrupted stack)
+3. The heap is exhausted and malloc returns NULL, then the program tries to call through a NULL pointer
+
+The most likely cause is that during R_Init, some calculation fails because of our math stubs, or memory allocation fails, or there's a stack overflow.
+
+Let me look more carefully at R_Init and what it does. R_Init calls R_InitLightTables which probably uses fixed-point math and tables. The issue might be in the table generation.
+
+Actually, wait - the bigger issue might be that we're using `readelf` to see the binary has sections .text, .data, .rodata, and .bss. But the VM's run
+[tr-thinking call-0089:worker:xiaomi/mimo-v2.5-pro-ultraspeed] Elf only loads .text, .data, and .rodata sections - it does NOT load .bss! The .bss section is uninitialized data that should be zero-filled, but the VM doesn't load it at all.
+
+Let me check if the heap (32MB) is in .bss. Yes, it would be. And all the static/global variables that are zero-initialized would be in .bss.
+
+But wait, looking at the runElf code more carefully:
+```
+const sectionsToLoad = [textSection, dataSection, rodataSection].filter(s => s !== null);
+```
+
+It only loads .text, .data, and
+[tr-thinking call-0089:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  .rodata. It doesn't load .bss. This means all the uninitialized global variables will be 0 (since the memory object returns 0 for missing keys). But the 32MB heap in .bss - its memory IS allocated in the VM's memory object as needed when the program writes to it, since writeMemoryByte creates entries.
+
+Actually, that's the issue. The heap is a static array `static char heap[32 * 1024 * 1024];` which would be in .bss. The VM doesn't load .bss, so accessing this memory would read
+[tr-thinking call-0089:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  0. But when we write to heap via malloc, writeMemoryByte creates entries. So reading from the heap should work after writing.
+
+But the initial state: heap_offset = 0, and `static block_header_t *free_list = NULL;` and `static int heap_initialized = 0;`. These would all be 0 because the memory defaults to 0 for unaccessed addresses.
+
+Actually, the problem might be something else entirely. Let me think about what R_Init does that could crash...
+
+Actually, the most likely issue is the size of the .bss section. The 32MB heap means the .
+[tr-thinking call-0089:worker:xiaomi/mimo-v2.5-pro-ultraspeed] bss section is huge. The VM's runElf might not be setting up the memory correctly for this.
+
+But actually, since memory is a dictionary (object) and undefined entries return 0, .bss should "just work" - reads return 0, writes create entries. The 32MB heap is just 32 million bytes that will be used as needed.
+
+Let me look at what R_Init does more carefully. It calls:
+- R_InitBuffer (setup screen buffer)
+- R_InitTextureMapping (calc tan tables etc)
+- R_InitPlanes
+- R_InitLightTables
+- R_InitSkyMap
+[tr-thinking call-0089:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 
+
+These involve a lot of fixed-point math. The issue might be in our math functions, or in the fixed-point arithmetic.
+
+Actually wait, let me re-read the error message more carefully. The program prints "R_Init: Init DOOM refresh daemon -" and then terminates. This suggests it crashes during R_Init.
+
+But actually, looking again at the termination condition:
+```
+if (result !== 0 || this.pc === 0 || this.pc === oldPc)
+```
+
+PC = 0 could mean:
+1. Function pointer is NULL
+2. Return to address 0 (stack corruption)
+3. Something else
+
+The
+[tr-thinking call-0089:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  fact that it says "Executed 2581479 instructions" means it ran a lot of instructions before crashing. This could be a stack overflow (stack at 0x7FFFFFFC growing down into data/heap).
+
+Actually, looking at the stack pointer initialization:
+```
+this.registers[29] = 0x7FFFFFFC
+```
+
+And our code section starts at 0x400000. With a 1.9MB binary, code might go up to ~0x600000. Then data/rodata after that, and heap from
+[tr-thinking call-0089:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  .bss. The stack starts at 0x7FFFFFFC and grows down. If the heap is 32MB starting from the .bss section (which is after .data), it might overlap with the stack.
+
+Let me check: the linker script puts .bss after .data. If .data ends at, say, 0x500000, then .bss starts at 0x500000. 32MB of .bss would extend to 0x500000 + 0x2000000 = 0x2500000. Stack at 0x8000000. So there's
+[tr-thinking call-0089:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  plenty of room.
+
+But the doom program itself allocates a lot of memory from the heap. The zone memory allocator uses Z_Malloc which calls our malloc. If malloc runs out of heap space, it returns NULL, and doom might crash.
+
+Actually, let me check what the zone memory size is. From the output:
+"zone memory: 0x0059cc18, 600000 allocated for zone"
+
+600000 bytes for zone. That's fine. But there might be other large allocations.
+
+Actually, the real problem might be something simpler. Let me think about what happens during R_Init:
+
+R_Init calls R_InitLightTables,
+[tr-thinking call-0089:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  which calls Z_Malloc with potentially large sizes for light tables.
+
+But actually, looking at the output again:
+"I_Init: Setting up machine state.
+M_Init: Init miscellaneous info.
+R_Init: Init DOOM refresh daemon -"
+
+The program prints "R_Init: Init DOOM refresh daemon -" and then presumably tries to print something like "R_InitData" before crashing.
+
+Let me look at the r_main.c R_Init function to see what it prints.
+
+Actually, I think the issue might be that some function in R_Init uses float/double math through our stubs, which return constant values. For example, `R_InitLightTables` likely uses `pow
+[tr-thinking call-0089:worker:xiaomi/mimo-v2.5-pro-ultraspeed] ()` to compute light levels. Our stub returns 1.0 always, which might cause an infinite loop or division by zero.
+
+Actually wait, looking at R_InitTextureMapping:
+```
+for (i=0; i<FINEANGLES/2; i++)
+{
+    anglea = ...
+    ...
+    ...
+}
+```
+
+These use fixed-point math with tangent tables. The tangent table generation likely uses integer math and should be fine.
+
+But R_InitLightTables probably does something with light level falloff. In doom, the light diminishing function uses `pow()` or similar. If our `pow()` returns 1.0 always, it might generate incorrect table
+[tr-thinking call-0089:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  values but shouldn't crash.
+
+Hmm, let me think differently. The PC becomes 0, which usually means a jump through a NULL function pointer or return to NULL. Given the execution of 2.5M instructions, it's likely that the stack grows into something, or a NULL pointer is dereferenced as a function pointer.
+
+Let me take a different approach: rebuild with more debugging, and also look at whether the __start function has proper startup code. Our __start function just calls main(0,0). But typically, a MIPS program needs to:
+1. Initialize $gp (global pointer) for PIC access
+2. Initialize .bss to zero
+3. Call constructors
+4. Call
+[tr-thinking call-0089:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  main
+
+We compiled with -fno-pic -mno-abicalls, so $gp shouldn't matter. But there might be other initialization issues.
+
+Actually, let me look at this from a different angle. The program prints "R_Init: Init DOOM refresh daemon -" which is from r_main.c. Let me check what R_Init does after printing that.
+
+I think the crash might be in one of the table generation functions that uses a lot of stack space or has a bug in our math. Let me try to reduce the heap to something that won't cause issues, and also make sure we're handling the `__start` function correctly.
+
+Actually, a very
+[tr-thinking call-0089:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  important observation: the entry point from the ELF is 0x400030, which is `main`. Not `__start`. The VM looks for the `main` symbol as the entry point:
+```
+if (symbolName === 'main') {
+    entryPoint = symbol.value;
+}
+```
+
+So `main` is at 0x400030, and `__start` is at 0x400058. The program starts directly at `main`. The `__start` function is never called.
+
+The `main` function in doomgeneric_img.c calls `doomgeneric_Create
+[tr-thinking call-0089:worker:xiaomi/mimo-v2.5-pro-ultraspeed] (argc, argv)` with argc=0, argv=NULL. This should be fine since doom handles NULL argv.
+
+Wait, but `doomgeneric_Create` does:
+```
+myargc = argc;
+myargv = argv;
+M_FindResponseFile();
+DG_ScreenBuffer = malloc(...);
+DG_Init();
+D_DoomMain();
+```
+
+If `myargv` is NULL and any code tries to access `myargv[0]`, it will crash. But it seems to work fine up to R_Init.
+
+Hmm, let me think about this more carefully. The problem could be:
+1. Stack overflow (stack too small)
+2. Math errors causing bad memory access
+[tr-thinking call-0089:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 
+3. NULL pointer dereference
+
+Let me try rebuilding with some debugging and a larger stack, or with -O0 to disable optimizations that might cause issues with our simple math stubs.
+
+Actually, wait. I just realized something important. The problem might be with `DG_ScreenBuffer = malloc(DOOMGENERIC_RESX * DOOMGENERIC_RESY * 4)`. That's 640*400*4 = 1,024,000 bytes. Our static heap is 32MB, so that should be fine.
+
+But looking at the zone memory initialization: "zone memory: 0x0
+[tr-thinking call-0089:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 059cc18, 600000 allocated for zone". This is about 600KB. So heap usage is roughly 1.6MB for these two allocations, plus other allocations. 32MB should be plenty.
+
+Let me try a different approach: rebuild with -O0 to avoid optimization issues, and check if the .bss section is properly handled.
+
+Actually, I think the issue might be simpler than I thought. Let me look at the `__start` function:
+```
+void __start(void) __attribute__((section(".text.startup")));
+void __start(void) {
+  main(0, 0);
+  while (1);
+}
+```
+
+And in the
+[tr-thinking call-0089:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  linker script:
+```
+.text : { *(.text.startup) *(.text*) }
+```
+
+But the VM uses `main` as the entry point, not `__start`. So `__start` is irrelevant.
+
+Let me try a different approach: let me check if the problem is with math by looking at what functions R_Init calls.
+
+Actually, let me just try rebuilding with -O0 and see if that helps. The optimization might be causing issues with our stub functions.
+
+Also, I should check if there's a division by zero issue. Our `sqrt(0)` returns 0, `sqrt(x)` returns 1.0 for positive x. But
+[tr-thinking call-0089:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  if doom expects a proper sqrt, the values might be wrong and cause div-by-zero.
+
+Actually, let me look more carefully. The R_Init function in r_main.c:
+```c
+void R_Init (void)
+{
+    R_InitData ();
+    printf (".");
+    R_InitPointToAngle ();
+    printf (".");
+    R_InitTables ();
+    printf (".");
+    R_InitPlanes ();
+    printf (" ");
+    R_InitLightTables ();
+    printf (".");
+    R_InitSkyMap ();
+    printf (".");
+}
+```
+
+The output shows "R_Init: Init DOOM refresh daemon -" which is printed by
+[tr-thinking call-0089:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  the caller, and then it should print dots. But it crashes immediately. So it crashes in `R_InitData()`.
+
+`R_InitData` calls:
+- R_InitTextures
+- R_InitFlats
+- R_InitSprites
+- R_InitColormaps
+
+`R_InitColormaps` uses `pow()` to generate light colormaps. If `pow()` returns 1.0 always, the loop might not terminate or might write to invalid memory.
+
+Actually, `R_InitColormaps` generates colormaps using `pow(2, -...)` which would return 1.0 with our stub. This means all the light
+[tr-thinking call-0089:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  levels would be the same, but shouldn't crash.
+
+Wait, actually let me look at R_InitTextures more carefully. It allocates memory for textures. If the zone allocator runs out of memory, it might call `I_Error`, which calls `printf` and then `exit`, which calls `while(1)`. This would explain the program "terminating at PC=0" - no wait, exit goes to while(1), which means PC == oldPc, which is also a termination condition.
+
+Actually, looking at the VM code again:
+```
+if (result !== 0 || this.pc === 0 || this.pc === oldPc) {
+    console.log(`Program terminated at PC=0x${this.pc.toString(16)}`);
+    break;
+}
+
+[tr-thinking call-0089:worker:xiaomi/mimo-v2.5-pro-ultraspeed] ```
+
+"Program terminated at PC=0x0" means PC is 0, not that PC == oldPc. So the program jumps to address 0.
+
+This could happen if:
+1. A function pointer stored in memory is 0 (NULL)
+2. The $ra (return address) register is 0 and the function does `jr $ra`
+3. An indirect jump through a NULL pointer
+
+Looking at the code flow: after R_Init, D_DoomMain continues and eventually calls D_ScreenReSize and then loops in D_DoomLoop. D_DoomLoop calls TryRunTics which calls D_ProcessEvents. If there's an event handling
+[tr-thinking call-0089:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  issue...
+
+Actually, I think the issue might be in the I_Init or M_Init phase, not R_Init. Let me look at the output more carefully:
+
+```
+I_Init: Setting up machine state.
+M_Init: Init miscellaneous info.
+R_Init: Init DOOM refresh daemon - 
+```
+
+The program prints "R_Init: Init DOOM refresh daemon - " and then crashes. This is exactly at the point where R_Init starts printing dots. The first thing R_Init does is call R_InitData().
+
+R_InitData calls:
+- R_InitTextures
+- R_InitFlats
+- R_InitSprites
+- R_InitColormaps
+
+R_InitTextures might fail if
+[tr-thinking call-0089:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  it can't allocate enough memory. But with 32MB heap, that shouldn't be the issue.
+
+Actually, wait. I just realized that our heap is 32MB but it's in .bss. The VM doesn't explicitly load .bss. Memory is initialized to 0 for unloaded addresses. When the program writes to the heap (via malloc), writeMemoryByte creates entries. But the heap base address needs to be correctly calculated.
+
+The heap is a static array: `static char heap[32 * 1024 * 1024];`. This gets placed in .bss. The linker allocates space for it, and the
+[tr-thinking call-0089:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  symbol `heap` has an address in the .bss section.
+
+When malloc is called, it does:
+```
+block_header_t *block = (block_header_t *)(heap + heap_offset);
+```
+
+`heap` is the address of the static array. `heap + heap_offset` is a valid address in .bss. The VM should handle reads/writes to this address correctly (creating entries in the memory dictionary as needed).
+
+But wait - the heap is 32MB. When the VM loads the ELF, it only loads .text, .data, and .rodata. It doesn't load .bss. But .bss has addresses assigned by the linker. The heap's
+[tr-thinking call-0089:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  addresses are valid, just not pre-loaded. This should be fine since the memory object is a dictionary that creates entries on write.
+
+Hmm, but there's another issue. The `heap_offset` is a static variable in .bss. Its initial value is 0 (since .bss is zero-initialized). The `free_list` is NULL (0). This should be correct.
+
+Let me try a completely different approach. Let me add some printf debugging to find exactly where the crash happens.
+
+Actually, let me try something simpler first: let me rebuild with -O0 and see if it helps. Optimization at -O2 might cause issues with our inline asm syscall functions
+[tr-thinking call-0089:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  or with undefined behavior in the stubs.
+[tr-stream call-0089:worker:xiaomi/mimo-v2.5-pro-ultraspeed] {
+  "analysis": "The build is successful and doom runs, finding the WAD file and printing startup messages. But it crashes during R_Init with PC=0x0. Likely causes: math stubs causing issues with R_InitColormaps (pow), optimization issues, or memory issues. Let me rebuild with -O0 and add better math stubs, plus debug output.",
+  "plan": "1. Rebuild with -O0 to eliminate optimization issues. 2. Improve math stubs. 3. Add debug printf to find exact crash point.",
+  "commands": [
+    {"keystrokes": "sed -i 's|-O2|-O0|' /app/doomgeneric/doomgeneric/Makefile.mips\n", "duration": 0
+[tr-stream call-0089:worker:xiaomi/mimo-v2.5-pro-ultraspeed] .1},
+    {"keystrokes": "grep -n 'R_Init\\b' /app/doomgeneric/doomgeneric/r_main.c | head -20\n", "duration": 0.1},
+    {"keystrokes": "sed -n '700,750p' /app/doomgeneric/doomgeneric/r_main.c\n", "duration": 0.1}
+  ]
+}
+
+[tr-stream call-0089:worker:xiaomi/mimo-v2.5-pro-ultraspeed] worker.done finish=stop cost_microdollars=112458
+[tr-stream call-0089:xiaomi/mimo-v2.5-pro-ultraspeed] {
+  "analysis": "The build is successful and doom runs, finding the WAD file and printing startup messages. But it crashes during R_Init with PC=0x0. Likely causes: math stubs causing issues with R_InitColormaps (pow), optimization issues, or memory issues. Let me rebuild with -O0 and add better math stubs, plus debug output.",
+  "plan": "1. Rebuild with -O0 to eliminate optimization issues. 2. Improve math stubs. 3. Add debug printf to find exact crash point.",
+  "commands": [
+    {"keystrokes": "sed -i 's|-O2|-O0|' /app/doomgeneric/doomgeneric/Makefile.mips\n", "duration": 0.1},
+    {"keystrokes": "grep -n 'R_Init\\b' /app/doomgeneric/doomgeneric/r_main.c | head -20\n", "duration": 0.1},
+    {"keystrokes": "sed -n '700,750p' /app/doomgeneric/doomgeneric/r_main.c\n", "duration": 0.1}
+  ]
+}

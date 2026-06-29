@@ -1,0 +1,1273 @@
+
+[tr-stream call-0126:socrates:trustedrouter/socrates-pro-plus-1.0] socrates.started
+
+[tr-stream call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed] worker.started
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed] I can see the issue now. The first read at position 0 returns 12 bytes (WAD header: "IWAD" + numlumps(4) + dir_offset(4)). The bytes shown are b0=73='I', b4=240=0xF0.
+
+Let me check: "IWAD" = 0x49 0x57 0x41 0x44 = 73 87 65 68. So b0=73 is correct ('I'). b4 should be numlumps (1264). 1264 in LE = 0x000004
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed] F0 = 240 is the low byte. That matches! So b4=240 means the low byte of numlumps is 240 (0xF0). 1264 = 0x4F0. So byte 4 is 0xF0 (240), byte 5 is 0x04, byte 6 is 0x00, byte 7 is 0x00. That's correct!
+
+Wait, but the read at position 0 reads to address 0x7ffefda8 which is on the STACK (0x7FFF0000 area). So the
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  WAD header is being read to the stack. That seems correct for the initial `open`/`read` to identify the file.
+
+The second read at position 4175796 (which is the directory offset!) reads 20224 bytes (= 1264 * 16) to address 0x5e6bb0. b0=12 means the first lump offset starts with 12 (0x0C), which matches lump 0 at offset 12 in the WAD! That looks correct!
+
+The third read at position 20 with size 244 is reading... what? Position 20 is inside
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  the WAD header or the beginning of lump data. Wait, 20 bytes from start: after 12-byte header, position 12 is the start of PLAYPAL. But position 20 is 8 bytes into PLAYPAL.
+
+Hmm, but the size is 244 which doesn't match any known structure. Actually wait, let me re-read the lseek sequence:
+
+S fd=4 o=0 w=2 (SEEK_END, offset 0 → get file size = 4196020)
+S fd=4 o=0 w=0 (SEEK_SET, offset 0 → go back to
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  start)
+S fd=4 o=0 w=0 (SEEK_SET, offset 0 → go back to start again)
+
+Then:
+R fd=4 from=0 n=12 got=12 → read 12 bytes of WAD header
+R fd=4 from=4175796 n=20224 got=20224 → read directory
+R fd=4 from=20 n=244 got=244 → this is reading from offset 20
+
+Wait, offset 20 in the WAD is... the WAD header is 12 bytes (4
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  magic + 4 numlumps + 4 dir_offset). The actual lump data starts at offset 12. But offset 20 is byte 20, which is 8 bytes into the first lump (PLAYPAL). That doesn't make sense for a directory-based operation.
+
+Hmm, but maybe the binary is reading lumpinfo structures in a different way. Let me think...
+
+Actually, the `W_CacheLumpNum` function at 0x437fcc computes: `sll at,s1,0x2` (at = lumpnum*4), `sll v0,s1,0x5` (v0 = lumpnum*32),
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  `subu s3,v0,at` (s3 = lumpnum*32 - lumpnum*4 = lumpnum*28). So each lumpinfo entry is 28 bytes.
+
+Then it loads `lumpinfo = *(0x4b0000+0x5c4)`. Let me look at what `lumpinfo[lumpnum].data` looks like at offset 8 (s3+8) and `lumpinfo[lumpnum].size` at offset 20 (s3+20 = 0x14).
+
+Looking at the W_CacheLumpNum code:
+- `
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed] lw at,8(v1)` → load pointer at offset 8 (this is the `data` field)
+- `lw a0,4(at)` → load from data+4 (checking if cached)
+- `lw s2,20(v1)` → load `size` from offset 20
+
+So the size is at offset 20 in the lumpinfo struct. For the first texture, `lumpinfo[0].size` should be 10752 (PLAYPAL size).
+
+The bad Z_Malloc value of 0x2d2d2c1c... that's
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  757935132. But if I look at the memory at the lumpinfo pointer, maybe the lumpinfo struct itself is not being populated correctly.
+
+Wait - the trace shows `b4=0` at the directory read destination. Let me trace more carefully what the directory data looks like.
+
+Actually, looking at the WAD directory entry format:
+- 4 bytes: filepos (offset)
+- 4 bytes: size
+- 8 bytes: name
+
+For lump 0: offset=12, size=10752, name=PLAYPAL
+For lump 1: offset=10
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 764, size=8704, name=COLORMAP
+
+The directory is read at 0x5e6bb0. b0=12 which is the low byte of offset 12 for the first entry. Let me check b4 (which is 5 bytes into the directory = last byte of the first entry's offset field + first byte of size field). Actually wait, offset field is 4 bytes at positions 0-3, size field is 4 bytes at positions 4-7.
+
+12 = 0x0C as 32-bit LE = 0x0C 0x00 0x00 0x00.
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  So bytes 0-3 of directory = 12, 0, 0, 0.
+10752 = 0x2A00 as 32-bit LE = 0x00 0x2A 0x00 0x00. So bytes 4-7 = 0, 42, 0, 0.
+
+b4 in the trace = r8(a1+4) = r8(0x5e6bb0+4) = 0. That matches the first byte of the size field! So b4=0 is correct.
+
+So the directory IS being read correctly. But the
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  Z_Malloc call is getting a bad size from somewhere else. The read at offset 20 with size 244 is suspicious - it reads a lump that's only 10752 bytes long starting at offset 12, so offset 20 is 8 bytes into the PLAYPAL lump.
+
+Actually, the read at offset 20 is separate from the directory read. Let me re-examine the read sequence. The 3rd read (from=20, n=244) might be reading something else entirely.
+
+Actually wait - the lumpinfo struct has 28 bytes per entry. If there are 1264 entries, the binary
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  allocates 1264*28 bytes of lumpinfo. The first read after the directory might be reading lump data, not lumpinfo.
+
+But the problem is the Z_Malloc gets a bad size from `lumpinfo[x].size`. The issue is that the binary doesn't read the WAD directory entries one by one - it reads the whole directory in one go, then parses it in memory. The directory data looks correct based on the b0/b4 check.
+
+So why is lumpinfo[x].size garbage? Let me look at how the binary stores lumpinfo. It calls W_AddFile which parses the directory and stores lumpinfo entries.
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  Maybe the issue is in how the binary's W_AddFile function stores the parsed directory entries into the lumpinfo array.
+
+Actually, I think the problem might be that the binary expects the WAD to be loaded into the fake filesystem (in-memory), not read via file I/O. Looking at my_stdlib.c, there's `init_filesystem` and `load_wad` functions that load the WAD into memory and then route read/write/close/lseek to the in-memory filesystem.
+
+But the binary at 0x427c58 does a `jal 4380e0` (W_CacheLumpName) which eventually calls W_ReadLump. Let
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  me check if W_ReadLump uses file I/O or memory I/O.
+
+Actually, I think the issue is simpler. Let me check what happens at 0x427c58:
+
+```
+427c44: jal 4380e0 <W_CacheLumpName>
+```
+
+This calls W_CacheLumpName which calls W_CacheLumpNum. W_CacheLumpNum at 0x437fcc:
+1. Checks if lumpnum < numlumps
+2. Gets lumpinfo[lumpnum]
+3. If lumpinfo[].data is non-null (cached), returns it
+4. Otherwise
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed] , calls Z_Malloc(lumpinfo[].size, ...) and W_ReadLump()
+
+The lumpinfo[].size is loaded from offset 20 of the struct. The struct base is at `lumpinfo + lumpnum * 28`.
+
+Now, `lumpinfo` pointer is at 0x4b05c4 (a global). Let me check what value it has.
+
+At 0x43801c: `lui at,0x4b; lw v0,0x5c4(at)` → loads `*(0x4b05c4)` which is the lumpinfo pointer.
+
+The
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  lumpinfo array was populated by W_AddFile when the WAD was first opened. W_AddFile reads the directory from the file and stores the entries.
+
+Wait, I see something. The binary calls `W_InitMultipleFiles` which calls `W_AddFile` for each WAD. W_AddFile opens the WAD, reads its header, reads the directory, and stores lumpinfo entries. This all happens via the `open/read/lseek/close` syscalls that I traced.
+
+But what if the `open` of `doom.wad` succeeds (fd=4), but then the directory data is correctly read to a
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  buffer, and then the parsed lumpinfo entries are stored in memory... and the issue is that my `read` syscall copies data to the wrong location or the `w8` byte-by-byte copy has an issue for large reads?
+
+Let me check: the second read reads 20224 bytes from the WAD directory to 0x5e6bb0. This goes through my `w8` function byte by byte. If even one byte is wrong, the lumpinfo could be corrupted.
+
+Actually, let me look at this more carefully. The read is:
+- Read 20224 bytes from WAD at offset 4175796
+- Destination: 0x5e6bb0
+
+Each
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  directory entry is 16 bytes: 4 bytes offset + 4 bytes size + 8 bytes name.
+
+For the first entry (PLAYPAL): offset=12, size=10752
+In the trace: b0=12 (offset byte 0), b4=0 (size byte 0)
+
+10752 = 0x2A00 → LE bytes: 0x00, 0x2A, 0x00, 0x00
+So bytes 4-7 of the directory should be: 0x00,
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  0x2A, 0x00, 0x00
+
+b4=r8(a1+4) = 0x00 ✓
+
+But the third read at offset 20 with size 244 reads from a different location. Maybe this is reading the first lump's data? Let me check: W_ReadLump reads the lump data, not the directory.
+
+Wait, but the third read is at WAD offset 20. The first lump (PLAYPAL) starts at offset 12. Offset 20 is 8 bytes into PLAYPAL. Why would it read from there?
+
+Actually, maybe the binary is reading the
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  lumpinfo struct itself from the WAD... no, that doesn't make sense.
+
+Let me look at W_ReadLump at 0x437f1c:
+```
+437f1c <W_ReadLump>
+```
+
+W_ReadLump would seek to lump->position and read lump->size bytes. So the third read at position 20 with size 244 means there's a lump at WAD offset 20 with size 244. But the WAD shows no such lump - the first few lumps are PLAYPAL(12, 10752), COLORM
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed] AP(10764, 8704), ENDOOM(19468, 4000).
+
+So the lumpinfo has wrong offset/size values! The directory was read correctly (bytes 0 and 4 check out for the first entry), but maybe the parsing code is confused because the directory entry format doesn't match what it expects.
+
+Let me check: the directory entry format is:
+- 4 bytes: filepos (int32 LE)
+- 4 bytes: size (int32 LE)
+- 8 bytes: name (char[8])
+
+For PLAYPAL: filepos=12, size=10752, name="
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed] PLAYPAL\0"
+
+The binary reads this and stores it in lumpinfo. But the lumpinfo struct in the source code has these fields at specific offsets. Let me check the lumpinfo_t struct:
+
+```c
+typedef struct
+{
+    char name[8];
+    int handle;
+    int position;
+    int size;
+} lumpinfo_t;
+```
+
+Wait, this struct has `name` first (8 bytes), then `handle` (4 bytes), then `position` (4 bytes), then `size` (4 bytes). Total = 20 bytes? No: 8 + 4 + 4 + 4 = 20. But the binary computes lumpnum*28 (0
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed] x1c).
+
+Let me check again. In W_CacheLumpNum:
+```
+sll at,s1,0x2    // at = lumpnum * 4
+sll v0,s1,0x5    // v0 = lumpnum * 32
+subu s3,v0,at    // s3 = lumpnum * (32-4) = lumpnum * 28
+```
+
+So each lumpinfo entry is 28 bytes. The struct must be:
+```c
+typedef struct {
+    char name[8];      // 8 bytes
+    int* data;          // 
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 4 bytes (pointer to cached data)
+    int handle;         // 4 bytes
+    int position;       // 4 bytes
+    int size;           // 4 bytes
+} lumpinfo_t;           // total = 24? No...
+```
+
+Actually 28 bytes: maybe pad to 28? Or there's another field.
+
+In W_CacheLumpNum:
+- offset 8: `lw at,8(v1)` → lumpinfo[i].something (a pointer, checked against 0)
+- offset 12: `lw a0,4(at)` → *(something + 4)
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  - this is checking if cached data exists
+- offset 12: `lw at,12(v1)` → lumpinfo[i].handle
+- offset 20: `lw s2,20(v1)` → lumpinfo[i].size
+
+So the struct is:
+- [0-7]: name (8 bytes)
+- [8-11]: data pointer (4 bytes)
+- [12-15]: handle (4 bytes) 
+- [16-19]: position (4 bytes)
+- [20-23]: size (4 bytes)
+- [24-27]: ??? (4 bytes)
+
+2
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 8 bytes total. The `size` field is at offset 20.
+
+Now, W_AddFile reads the directory from the WAD and populates lumpinfo. The WAD directory entries are: filepos(4) + size(4) + name(8) = 16 bytes each.
+
+W_AddFile reads these 16-byte entries and stores them into 28-byte lumpinfo entries. The mapping should be:
+- WAD entry.filepos → lumpinfo.position (offset 16)
+- WAD entry.size → lumpinfo.size (offset 20)
+- WAD entry.name → lumpinfo.name (offset 0)
+
+So at
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  offset 20 of each 28-byte entry, we expect the lump size.
+
+For the first entry (PLAYPAL): size = 10752 = 0x2A00
+At the directory buffer (0x5e6bb0), bytes 4-7 should be: 0x00, 0x2A, 0x00, 0x00
+
+The trace showed b4=0 at the directory buffer start. But that's byte 4 of the FIRST entry, which is the first byte of the size field. For PLAYPAL size=10752=0x2A00, the first byte is 0x00. ✓
+
+So the
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  directory data IS correct in memory.
+
+But the binary then parses this into lumpinfo structs. If the parsing has a bug in my interpreter, the lumpinfo entries would be wrong.
+
+Actually, wait. The binary reads the directory into a temp buffer, then parses it to fill lumpinfo entries. But I see the read at offset 20 with size 244 going to 0x5e7f88. What is at offset 20 in the WAD?
+
+0x5e7f88 is 0x5e6bb0 + 0x13D8. That's after the directory buffer (which is 20224 =
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  0x4F00 bytes). So 0x5e6bb0 + 0x4F00 = 0x5EBAB0. But the trace says the 3rd read goes to 0x5e7f88 which is 0x5e6bb0 + 0x13D8 = 5080 bytes into the directory buffer. That's within the directory!
+
+Wait no, the trace says `dst=0x5e7f88`. The first read goes to 0x5e6bb0, and the third read goes to 0x5e7f88. The difference is 0x5e7f88 - 0x5e6bb0 = 0x13D
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 8 = 5080. That's about 317 directory entries * 16 bytes = 5072, close to 5080.
+
+But the third read is reading from WAD offset 20, not the directory. This is W_ReadLump reading the actual lump data. Let me check: if lumpinfo[x].position = 20 and lumpinfo[x].size = 244, that would be some lump at offset 20 in the WAD.
+
+But looking at the WAD, offset 20 is 8 bytes into PLAYPAL (which starts at offset 12). The WAD doesn't have a lump at offset 20. This means the
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  lumpinfo struct has wrong position/size values.
+
+The directory IS read correctly into memory (we verified b0=12 and b4=0 which match the first entry). But when the binary parses the directory buffer into lumpinfo structs, it may be using the wrong byte order or wrong struct layout.
+
+Wait - I just realized something. The MIPS binary was compiled for MIPS32r2 little-endian. The WAD file is also LE. So the byte order should be the same. But my `read` syscall reads from the host file (which is LE) and writes bytes to the guest memory byte-by-byte. So there shouldn't be an endianness issue.
+
+Unless... there's an alignment
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  issue with my lwl/lwr fix. I recently changed the lwl/lwr/swl/swr instructions. Let me reconsider whether my "fix" was correct or wrong.
+
+For MIPS LE (little-endian), lwl and lwr work as follows:
+
+lwl (load word left) loads the most-significant bytes of the register from memory.
+lwr (load word right) loads the least-significant bytes of the register from memory.
+
+In a little-endian MIPS:
+- Memory at addr stores byte at that address
+- addr&3==0: lwl loads bytes at addr, addr+1, addr+2, addr+3 into the full register (bits 0
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed] -31)
+- addr&3==1: lwl loads bytes at addr, addr+1, addr+2 into bits 8-31 (shifted left by 8)
+- addr&3==2: lwl loads bytes at addr, addr+1 into bits 16-31
+- addr&3==3: lwl loads byte at addr into bits 24-31
+
+Wait, actually for LE MIPS, the byte ordering is reversed from what I think. Let me look this up.
+
+In MIPS LE (little-endian), memory is stored with the least significant byte at the lowest address. For a
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  32-bit word at aligned address A:
+- A+0: bits 0-7
+- A+1: bits 8-15
+- A+2: bits 16-23
+- A+3: bits 24-31
+
+lwl (load word left) for LE MIPS:
+For unaligned access at address A with offset bo = A&3:
+- bo=0: all 4 bytes from aligned word (this is just a regular lw)
+- bo=1: bytes 1,2,3 from aligned word → register bits 0-23,
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  keep register bits 24-31
+- bo=2: bytes 2,3 from aligned word → register bits 0-15, keep register bits 16-31
+- bo=3: byte 3 from aligned word → register bits 0-7, keep register bits 8-31
+
+lwr (load word right) for LE MIPS:
+- bo=0: byte 0 from aligned word → register bits 24-31, keep register bits 0-23
+- bo=1: bytes 0,1 from aligned word → register bits 16-31, keep register bits 0-15
+- bo=2: bytes 0,1,2 from aligned word → register bits 8
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed] -31, keep register bits 0-7
+- bo=3: all 4 bytes (this is just a regular lw)
+
+Wait, I think I have the convention wrong. Let me think more carefully.
+
+Actually, the MIPS lwl/lwr instructions are about loading the LEFT part (most significant) or RIGHT part (least significant) of a word, regardless of endianness. The behavior depends on the endianness.
+
+For little-endian MIPS:
+lwl at addr with bo=3 (aligned to the right): loads the byte at addr into the MSB (bits 24-31) of the
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  register, keeping the rest.
+lwl at addr with bo=0 (aligned): loads all 4 bytes.
+
+Wait, I need to think about this differently. Let me look at the actual MIPS spec.
+
+In MIPS:
+- `lwl` loads the left (most significant in big-endian) portion of a word
+- `lwr` loads the right (least significant in big-endian) portion
+
+For little-endian, the mapping is:
+- `lwl addr` with addr%4==0: loads all 4 bytes (same as lw)
+- `lwl addr` with addr%4==1: loads bytes at addr, addr+1, addr+2 into register[31:8]
+
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed] - `lwl addr` with addr%4==2: loads bytes at addr, addr+1 into register[31:16]
+- `lwl addr` with addr%4==3: loads byte at addr into register[31:24]
+
+Actually wait, this is for big-endian. For little-endian, the bit positions are swapped.
+
+Let me look at this from a practical perspective. The MIPS32 Architecture for Programmers Vol II says:
+
+For a little-endian MIPS:
+```
+lwl addr (addr = aligned + bo):
+  bo=0: RT = mem[aligned][31:0]  (all 4 bytes)
+  bo=1: RT[
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 31:8] = mem[aligned][31:8]  (bytes at aligned+1, aligned+2, aligned+3)
+  bo=2: RT[31:16] = mem[aligned][31:16]  (bytes at aligned+2, aligned+3)
+  bo=3: RT[31:24] = mem[aligned][31:24]  (byte at aligned+3)
+```
+
+Wait no, for little-endian, the byte at address A maps to bits 7:0 of the word. So byte at A+0 is
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  bits 7:0, A+1 is bits 15:8, A+2 is bits 23:16, A+3 is bits 31:24.
+
+Let me look at the actual MIPS documentation more carefully.
+
+Actually, the MIPS spec defines lwl/lwr for big-endian, and for little-endian they swap lwl↔lwr and adjust the byte positions.
+
+For little-endian MIPS:
+```
+lwl effective_addr:
+  vAddr = effective_addr
+  byte = vAddr & 3
+  pAddr = vAddr & ~3
+  memval = Memory[pAddr]  // 32-bit word from
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  aligned address
+  if byte == 0:
+    RT = memval
+  elif byte == 1:
+    RT = (RT & 0xFF000000) | (memval >>> 8)
+  elif byte == 2:
+    RT = (RT & 0xFFFF0000) | (memval >>> 16)
+  elif byte == 3:
+    RT = (RT & 0xFFFFFF00) | (memval >>> 24)
+```
+
+Wait, that's what the ORIGINAL code had! Let me re-check.
+
+My original code:
+```javascript
+case 34: { // lwl
+  const a=(R[rs]+si
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed] )>>>0, al=a&~3, bo=a&3, mv=r32(al);
+  switch(bo) {
+    case 0: R[rt]=mv; break;
+    case 1: R[rt]=(R[rt]&0xFF000000|mv>>>8)>>>0; break;
+    case 2: R[rt]=(R[rt]&0xFFFF0000|mv>>>16)>>>0; break;
+    case 3: R[rt]=(R[rt]&0xFFFFFF00|mv>>>24)>>>0; break;
+  }
+  break;
+}
+```
+
+And I "fixed" it to:
+```javascript
+case 34: { // l
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed] wl
+  R[rt] = bo === 0 ? mv 
+        : bo === 1 ? ((mv & 0xFFFFFF00) | (R[rt] & 0xFF)) >>> 0
+        : bo === 2 ? ((mv & 0xFFFF0000) | (R[rt] & 0xFFFF)) >>> 0
+        : ((mv & 0xFF000000) | (R[rt] & 0x00FFFFFF)) >>> 0;
+  break;
+}
+```
+
+Actually wait, I think the original was correct for LE MIPS. Let me verify with a concrete example.
+
+For LE MIPS lwl at address 
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 0x1001 (bo=1):
+- It should load bytes at 0x1001, 0x1002, 0x1003 into the HIGH bytes of the register
+- In LE, "high bytes" means the most significant bits
+- Memory at 0x1000: byte0 at 0x1000 (bits 0-7), byte1 at 0x1001 (bits 8-15), byte2 at 0x1002 (bits 16-23), byte3 at 0x1003 (bits 24-31)
+- lwl at
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  0x1001 (bo=1) should load bytes 1,2,3 into the register's upper 3 bytes
+- In a 32-bit LE register, the loaded value should be: byte3<<24 | byte2<<16 | byte1<<8 | old_reg[7:0]
+- memval = r32(0x1000) = byte0 | byte1<<8 | byte2<<16 | byte3<<24
+- The result should be: (memval & 0xFFFFFF00) | (old_reg & 0xFF) ... NO
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed] !
+- Actually, I want the upper 3 bytes of memval to go into the upper 3 bytes of the register
+- memval >>> 8 = byte1 | byte2<<8 | byte3<<16
+- (old_reg & 0xFF000000) | (memval >>> 8) = old_byte3<<24 | byte3<<16 | byte2<<8 | byte1
+
+Hmm, that puts byte1 in bits 0-7, byte2 in bits 8-15, byte3 in bits 16-23, and keeps old bits
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  24-31. But we want byte1 in bits 8-15, byte2 in bits 16-23, byte3 in bits 24-31.
+
+Wait, I'm confusing myself. Let me think about what lwl is supposed to do.
+
+lwl = "load word left" in big-endian context means load the leftmost (most significant) bytes. In little-endian MIPS, the semantic is adjusted.
+
+Let me look at an actual MIPS reference. From the MIPS32 instruction set:
+
+For big-endian:
+```
+lwl rt, offset(base):
+  vAddr = offset + GPR[base]
+  byte = vAddr[
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 1:0]  (vAddr & 3)
+  pAddr = SignExtend(vAddr[31:2] || 02)  (vAddr & ~3)
+  memword = Memory(pAddr, 4)
+  GPR[rt] = GPR[rt] MERGE memword
+```
+
+Where MERGE depends on byte:
+- byte=0: GPR[rt] = memword (all 4 bytes)
+- byte=1: GPR[rt][31:8] = memword[31:8]
+- byte=2: GPR[rt][31:16] = memword[31:16]
+- byte=3: GPR[rt][
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 31:24] = memword[31:24]
+
+For little-endian, lwl and lwr are SWAPPED. So what would be lwl in big-endian becomes lwr in little-endian and vice versa. But the encoding is the same.
+
+So for little-endian MIPS, the opcode 0x22 (lwl in big-endian) actually performs what lwr would do in big-endian, and vice versa.
+
+Actually, I think the spec handles it differently. Let me re-read.
+
+From MIPS32 Architecture Vol II, Rev 6.05, for little-endian:
+
+l
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed] wl:
+```
+vAddr ← offset + GPR[base]
+byte ← vAddr[1:0] XOR 0112  (XOR with 3 for LE)
+```
+
+So for LE, the byte value is XORed with 3. So:
+- addr&3=0 → byte=3 (load just the MS byte)
+- addr&3=1 → byte=2
+- addr&3=2 → byte=1
+- addr&3=3 → byte=0 (load all 4 bytes)
+
+Then the operation uses this modified byte value.
+
+So for LE lwl:
+- addr&3=0: RT[31:24] = mem[31:24] (just byte at
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  addr)
+- addr&3=1: RT[31:16] = mem[31:16] (bytes at addr, addr+1)
+- addr&3=2: RT[31:8] = mem[31:8] (bytes at addr, addr+1, addr+2)
+- addr&3=3: RT = mem (all 4 bytes)
+
+And for LE lwr:
+- addr&3=0: RT = mem (all 4 bytes)
+- addr&3=1: RT[7:0] = mem[7:0] (just byte at addr)
+- addr&3=2: RT[15:0] = mem[15:0] (bytes at addr, addr+
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 1)
+- addr&3=3: RT[23:0] = mem[23:0] (bytes at addr, addr+1, addr+2)
+
+Wait, that doesn't seem right either. Let me think again.
+
+OK, I think the standard reference for LE MIPS lwl is:
+
+For little-endian, memory at address A stores the byte that in the register corresponds to bits (A&3)*8+7 : (A&3)*8.
+
+lwl loads the LEFT part of a register. In big-endian, "left" means most significant. In little-endian, "left" means LEAST significant.
+
+Actually no, in LE
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  MIPS:
+- lwl at addr: loads bytes from memory starting at addr, filling from the least significant byte upward, until the aligned word boundary is reached.
+
+So for LE lwl:
+- addr&3=3: load all 4 bytes (aligned on the right)
+- addr&3=2: load 3 bytes (addr, addr+1, addr+2 → register bytes 0,1,2)
+- addr&3=1: load 2 bytes (addr, addr+1 → register bytes 0,1)
+- addr&3=0: load 1 byte (addr → register byte 
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 0)
+
+And for LE lwr:
+- addr&3=0: load all 4 bytes
+- addr&3=1: load 3 bytes (addr, addr+1, addr+2 → register bytes 1,2,3)
+- addr&3=2: load 2 bytes (addr, addr+1 → register bytes 2,3)
+- addr&3=3: load 1 byte (addr → register byte 3)
+
+Hmm, this is getting confusing. Let me just use the formal spec.
+
+From MIPS32 Architecture Vol II, Table 111 (lwl for LE):
+
+``
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed] `
+Effective Address = vAddr = offset + GPR[base]
+byte = vAddr[1:0] XOR 0b11  (XOR with 3)
+pAddr = vAddr[31:2] || 0b00  (aligned address)
+
+memword = Memory[pAddr]
+
+switch (byte):
+  case 0: GPR[rt] = GPR[rt] & 0x00FFFFFF | memword << 24
+  case 1: GPR[rt] = GPR[rt] & 0x0000FFFF | memword <<
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  16
+  case 2: GPR[rt] = GPR[rt] & 0x000000FF | memword << 8
+  case 3: GPR[rt] = memword
+```
+
+Wait, that's still for big-endian interpretation. Let me try a different approach.
+
+Let me use the pseudocode from the MIPS32 ISA reference manual (Volume II), specifically for little-endian:
+
+lwl for LE:
+```
+vAddr ← offset + GPR[base]
+byte ← vAddr[1:0] XOR 112
+pAddr ← vAddr[31:2] || 02
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 
+memword ← Memory[pAddr, 4]
+switch (byte)
+  when 0:
+    GPR[rt] ← GPR[rt] MERGE memword
+      where GPR[rt] = memword[7:0] @ GPR[rt][23:0]
+  when 1:
+    GPR[rt] ← GPR[rt] MERGE memword
+      where GPR[rt] = memword[15:0] @ GPR[rt][15:0]
+  when 2:
+    GPR[rt] ← GPR[rt] MERGE memword
+      where GPR[rt] = memword[23:0] @ GPR[rt][7:0]
+  when 3:
+    GPR[rt] ←
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  memword
+```
+
+OK so for LE, lwl XORs the byte offset with 3, then:
+- byte=0 (after XOR, so addr&3=3): RT[7:0] = mem[7:0], keep RT[31:8]
+- byte=1 (addr&3=2): RT[15:0] = mem[15:0], keep RT[31:16]  
+- byte=2 (addr&3=1): RT[23:0] = mem[23:0], keep RT[31:24]
+- byte=3 (addr&3=0): RT = mem
+
+
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed] Wait, I wrote "byte=0 after XOR so addr&3=3" because byte = addr&3 XOR 3.
+
+So the original code I had was WRONG. The original code did:
+- addr&3=0: R[rt]=mv (all 4 bytes) → This is correct for LE lwl!
+- addr&3=1: R[rt]=(R[rt]&0xFF000000|mv>>>8) → This extracts bytes 1,2,3 from mem and puts in bits 0-23
+- addr&3=2: R[rt]=(R[rt]&0xFFFF0000|mv>>>16) → This extracts bytes 2,3 from mem and puts in bits 0-15
+- addr&3=3: R[rt]=(R[rt]&0xFFFFFF00|
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed] mv>>>24) → This extracts byte 3 from mem and puts in bits 0-7
+
+But according to the spec for LE:
+- addr&3=0 (byte after XOR = 3): RT = mem (all 4 bytes) ✓
+- addr&3=1 (byte after XOR = 2): RT[23:0] = mem[23:0], keep RT[31:24]
+- addr&3=2 (byte after XOR = 1): RT[15:0] = mem[15:0], keep RT[31:16]
+- addr&3=3 (byte after XOR = 
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 0): RT[7:0] = mem[7:0], keep RT[31:8]
+
+Hmm wait, but what does "mem[23:0]" mean in terms of register bits? In a little-endian register, byte 0 (bits 7:0) is the least significant. So:
+- RT[7:0] = mem[7:0] means: RT's byte 0 = mem's byte 0
+- RT[15:8] = mem[15:8] means: RT's byte 1 = mem's byte 1
+- etc.
+
+So for LE lwl at addr&3=1:
+RT[23:0] = mem[23:0] means:
+
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed] - RT byte 0 = mem byte 0 (memval & 0xFF)
+- RT byte 1 = mem byte 1 (memval & 0xFF00) >> 8
+- RT byte 2 = mem byte 2 (memval & 0xFF0000) >> 16
+Keep RT byte 3 unchanged.
+
+In JavaScript: `R[rt] = (R[rt] & 0xFF000000) | (memval & 0x00FFFFFF)`
+
+And my "fix" was: `((mv & 0xFFFFFF00) | (R[rt] & 0xFF)) >>> 0`
+Which is
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed] : R[rt] byte 0 unchanged, memval bytes 1,2,3 → R[rt] bytes 1,2,3
+
+Hmm, that's different! Let me compare:
+
+Correct (from spec): R[rt] = (R[rt] & 0xFF000000) | (memval & 0x00FFFFFF)
+My "fix": R[rt] = (memval & 0xFFFFFF00) | (R[rt] & 0x000000FF)
+
+These are the same! (R[rt] & 0xFF000000) keeps byte
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  3 of R[rt]. (memval & 0x00FFFFFF) copies bytes 0,1,2 of memval. And (memval & 0xFFFFFF00) copies bytes 1,2,3 of memval, while (R[rt] & 0x000000FF) keeps byte 0 of R[rt].
+
+Wait, these are NOT the same!
+
+Version 1: (R[rt] & 0xFF000000) | (memval & 0x00FFFFFF) = R[rt].byte3, memval.byte2, memval.byte1, memval.byte0
+Version 2: (
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed] memval & 0xFFFFFF00) | (R[rt] & 0x000000FF) = memval.byte3, memval.byte2, memval.byte1, R[rt].byte0
+
+Version 1 keeps R[rt] byte 3 and copies memval bytes 0,1,2.
+Version 2 keeps R[rt] byte 0 and copies memval bytes 1,2,3.
+
+Which one does the spec say? For LE lwl at addr&3=1 (byte after XOR = 2):
+"RT[23:0] =
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  mem[23:0], keep RT[31:24]"
+
+This means: keep RT bits 31-24 (byte 3), replace bits 23-0 (bytes 0,1,2) with mem bits 23-0 (memval bytes 0,1,2).
+
+So: R[rt] = (R[rt] & 0xFF000000) | (memval & 0x00FFFFFF)
+
+This is Version 1, which is what the ORIGINAL code had! My "fix" was WRONG!
+
+So the original lwl implementation was:
+- case 0: mv (
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed] correct for LE)
+- case 1: (R[rt] & 0xFF000000) | (mv >>> 8) ... hmm, this is NOT the same as (R[rt] & 0xFF000000) | (mv & 0x00FFFFFF)
+
+Wait, `mv >>> 8` shifts mv right by 8: byte3 goes to byte2 position, byte2 to byte1, byte1 to byte0.
+So (R[rt] & 0xFF000000) | (mv >>> 8) = R[rt].byte3,
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  mv.byte3, mv.byte2, mv.byte1
+
+That's ALSO wrong! The correct result should be R[rt].byte3, mv.byte2, mv.byte1, mv.byte0.
+
+Let me check the original code again:
+```javascript
+case 1: R[rt]=(R[rt]&0xFF000000|mv>>>8)>>>0; break;
+```
+
+This gives: R[rt].byte3 | mv.byte3 | mv.byte2 | mv.byte1 (the rightmost byte is mv.byte1, not mv.byte0)
+
+But we want: R[rt].byte3 | mv.byte2 | mv.byte1
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  | mv.byte0
+
+So the original code was also wrong! 
+
+And my "fix":
+```javascript
+case 1: ((mv & 0xFFFFFF00) | (R[rt] & 0xFF)) >>> 0
+```
+Gives: mv.byte3 | mv.byte2 | mv.byte1 | R[rt].byte0
+
+This keeps R[rt].byte0 unchanged and copies mv.bytes 1,2,3. That's also wrong!
+
+The correct implementation for LE lwl at addr&3=1:
+R[rt] = (R[rt] & 0xFF000000) | (mem
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed] val & 0x00FFFFFF)
+
+Let me verify: memval = r32(aligned_addr). For a LE system, memval's byte0 = memory byte at aligned_addr, memval.byte1 = memory byte at aligned+1, etc.
+
+For lwl at addr&3=1, we want to load bytes at addr, addr+1, addr+2. In the aligned word, these are bytes 1, 2, 3 (since addr = aligned + 1).
+
+We want to put these into register bytes 0, 1, 2 (bits 0-23).
+
+memval & 0x00FFFFFF = bytes 0,1,2 of memval.
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  But we want bytes 1,2,3!
+
+Hmm, wait. In a LE system, memval = r32(aligned) = memory[aligned] | memory[aligned+1]<<8 | memory[aligned+2]<<16 | memory[aligned+3]<<24.
+
+memval.byte0 = memory[aligned] (bits 0-7)
+memval.byte1 = memory[aligned+1] (bits 8-15)
+memval.byte2 = memory[aligned+2] (bits 16-23)
+memval.byte3 = memory[aligned+3] (bits 24-31)
+
+For lwl at addr=aligned+1 (addr&3=1):
+We want to
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  load memory[aligned+1], memory[aligned+2], memory[aligned+3] into register bytes 0, 1, 2.
+
+That means:
+RT.byte0 = memory[aligned+1] = memval.byte1
+RT.byte1 = memory[aligned+2] = memval.byte2
+RT.byte2 = memory[aligned+3] = memval.byte3
+RT.byte3 = unchanged
+
+So: RT = (RT & 0xFF000000) | (memval >>> 8)
+
+Because memval >>> 8 shifts byte1→byte0, byte2→byte1,
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  byte3→byte2, and zeros byte3.
+
+Wait, that's what the ORIGINAL code had! `(R[rt] & 0xFF000000) | (mv >>> 8)`!
+
+Let me re-check: `mv >>> 8` on a 32-bit value:
+- byte3 becomes byte2 position (bits 16-23)
+- byte2 becomes byte1 position (bits 8-15)
+- byte1 becomes byte0 position (bits 0-7)
+- byte0 is lost, byte3 position is 0
+
+So `(R[rt] & 0xFF000000) | (mv >>> 8)` = R[rt].byte3, mv.byte3, mv.byte2, mv.byte1
+
+But I
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  want: R[rt].byte3, mv.byte3, mv.byte2, mv.byte1
+
+Wait, that IS correct! The result has:
+- Byte 3 (bits 24-31): R[rt] original byte 3 ✓
+- Byte 2 (bits 16-23): mv.byte3 = memory[aligned+3] ✓
+- Byte 1 (bits 8-15): mv.byte2 = memory[aligned+2] ✓
+- Byte 0 (bits 0-7): mv.byte1 = memory[aligned+1] ✓
+
+YES! The original code WAS correct!
+
+For addr&3=2:
+We
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  want to load memory[aligned+2], memory[aligned+3] into register bytes 0, 1.
+
+RT.byte0 = memory[aligned+2] = memval.byte2
+RT.byte1 = memory[aligned+3] = memval.byte3
+RT.byte2 = unchanged
+RT.byte3 = unchanged
+
+`(R[rt] & 0xFFFF0000) | (mv >>> 16)` = R[rt].byte3, R[rt].byte2, mv.byte3, mv.byte2
+
+mv.byte3 = memory[aligned+3] → RT.byte1 ✓
+mv.byte2 = memory[aligned+2] → RT.byte0 ✓
+
+
+
+For addr&3=3:
+We want to load memory[aligned+3] into register byte 0.
+
+RT
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed] .byte0 = memory[aligned+3] = memval.byte3
+RT.byte1-3 = unchanged
+
+`(R[rt] & 0xFFFFFF00) | (mv >>> 24)` = R[rt].byte3, R[rt].byte2, R[rt].byte1, mv.byte3
+
+mv.byte3 = memory[aligned+3] → RT.byte0 ✓
+
+So the ORIGINAL lwl code was correct! My "fix" broke it!
+
+And the original lwr code:
+```javascript
+case 38: { // lwr
+  const a=(R[rs]+si)>>>0, al=a&~3, bo=a&3, mv=r32(al);
+  switch(bo) {
+    case 0: R[rt]=(R
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed] [rt]&0x00FFFFFF|mv<<24)>>>0; break;
+    case 1: R[rt]=(R[rt]&0x0000FFFF|mv<<16)>>>0; break;
+    case 2: R[rt]=(R[rt]&0x000000FF|mv<<8)>>>0; break;
+    case 3: R[rt]=mv; break;
+  }
+  break;
+}
+```
+
+For LE lwr at addr&3=3 (byte after XOR = 0):
+RT = mem (all 4 bytes) ✓
+
+For LE lwr at addr&3=2:
+We want to load memory[aligned],
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  memory[aligned+1] into register bytes 2, 3.
+
+RT.byte2 = memory[aligned] = memval.byte0
+RT.byte3 = memory[aligned+1] = memval.byte1
+RT.byte0 = unchanged
+RT.byte1 = unchanged
+
+`(R[rt] & 0x0000FFFF) | (mv << 16)` = mv.byte1, mv.byte0, R[rt].byte1, R[rt].byte0
+
+mv.byte0 = memory[aligned] → RT.byte2 ✓
+mv.byte1 = memory[aligned+1] → RT.byte3 ✓
+
+Wait, `
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed] mv << 16` shifts byte0→byte2 position, byte1→byte3 position. Yes, that's correct!
+
+For addr&3=1:
+We want to load memory[aligned] into register byte 3.
+
+`(R[rt] & 0x0000FFFF) | (mv << 16)` = mv.byte1, mv.byte0, R[rt].byte1, R[rt].byte0
+
+But we only want memory[aligned] = mv.byte0 in byte3 position! This also puts mv.byte1 in byte3+1 position... wait, let me recalculate.
+
+`mv << 16`: byte0→byte2, byte1→byte3.
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  So bits 16-23 = byte0, bits 24-31 = byte1.
+
+But we want only memory[aligned] = mv.byte0 in RT.byte3 (bits 24-31).
+
+`(R[rt] & 0x0000FFFF) | (mv << 16)` gives: mv.byte1 at bits 24-31, mv.byte0 at bits 16-23, R[rt].byte1 at bits 8-15, R[rt].byte0 at bits 0-7.
+
+So for addr&3=1 (lwr), the original code writes mv.byte1 into byte3 and mv.byte0 into byte2.
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  But we want ONLY byte3 = mv.byte0.
+
+Hmm, this doesn't seem right. Let me reconsider.
+
+For LE lwr at addr&3=1 (byte after XOR=2 from the spec):
+"RT[23:0] = mem[23:0], keep RT[31:24]"
+
+Hmm, but that's the same as lwl at addr&3=1. That can't be right.
+
+Let me look at the MIPS spec again more carefully. The spec for LE lwr:
+
+```
+vAddr ← offset + GPR[base]
+byte ← vAddr[1:0] XOR 0b11
+pAddr ← vAddr[31:2] || 0b00
+memword ← Memory[pAddr, 
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 4]
+
+switch (byte)
+  when 0: GPR[rt] ← memword
+  when 1: GPR[rt] ← GPR[rt][31:24] @ memword[23:0]
+  when 2: GPR[rt] ← GPR[rt][31:16] @ memword[15:0]
+  when 3: GPR[rt] ← GPR[rt][31:8] @ memword[7:0]
+```
+
+But byte = addr&3 XOR 3. So:
+- addr&3=3, byte=0: GPR[rt] =
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  memword ✓
+- addr&3=2, byte=1: GPR[rt] = GPR[rt][31:24] @ memword[23:0]
+- addr&3=1, byte=2: GPR[rt] = GPR[rt][31:16] @ memword[15:0]
+- addr&3=0, byte=3: GPR[rt] = GPR[rt][31:8] @ memword[7:0]
+
+For addr&3=2, byte=1:
+GPR[rt][31:24] keeps byte 3 of RT
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 
+memword[23:0] puts memval bytes 0,1,2 into RT bytes 0,1,2
+
+JavaScript: (R[rt] & 0xFF000000) | (memval & 0x00FFFFFF)
+
+For addr&3=1, byte=2:
+GPR[rt][31:16] keeps bytes 2,3 of RT
+memword[15:0] puts memval bytes 0,1 into RT bytes 0,1
+
+JavaScript: (R[rt] & 0xFFFF0000) | (memval & 0x
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 0000FFFF)
+
+For addr&3=0, byte=3:
+GPR[rt][31:8] keeps bytes 1,2,3 of RT
+memword[7:0] puts memval byte 0 into RT byte 0
+
+JavaScript: (R[rt] & 0xFFFFFF00) | (memval & 0x000000FF)
+
+Now let me check the original lwr code:
+```javascript
+case 0: R[rt]=(R[rt]&0x00FFFFFF|mv<<24)>>>0; break;
+case 1: R[rt]=(R[rt]&0x0000FFFF|mv<<16)>>>0; break;
+case 2
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed] : R[rt]=(R[rt]&0x000000FF|mv<<8)>>>0; break;
+case 3: R[rt]=mv; break;
+```
+
+Original addr&3=0: (R[rt] & 0x00FFFFFF) | (mv << 24)
+This gives: mv.byte0 at bits 24-31, R[rt] bytes 0,1,2
+
+But the correct answer is: (R[rt] & 0xFFFFFF00) | (memval & 0x000000FF)
+Which
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  gives: R[rt] bytes 1,2,3, memval.byte0 at bits 0-7
+
+These are completely different! The original puts mv.byte0 in byte 3 and keeps R[rt] bytes 0-2. The correct answer puts memval.byte0 in byte 0 and keeps R[rt] bytes 1-3.
+
+So the ORIGINAL lwr was also wrong! And my "fix" was:
+```javascript
+case 3: mv; // all 4 bytes
+case 2: (R[rt] & 0xFF000000) |
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  (mv & 0x00FFFFFF)
+case 1: (R[rt] & 0xFFFF0000) | (mv & 0x0000FFFF)
+case 0: (R[rt] & 0xFFFFFF00) | (mv & 0x000000FF)
+```
+
+My fix for addr&3=0: (R[rt] & 0xFFFFFF00) | (mv & 0x000000FF) ✓ CORRECT!
+My fix for addr&3=1: (R[rt] & 0xFFFF0000) | (mv & 0x0000FFFF) ✓ CORRECT!
+My fix for addr&3=2
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed] : (R[rt] & 0xFF000000) | (mv & 0x00FFFFFF) ✓ CORRECT!
+My fix for addr&3=3: mv ✓ CORRECT!
+
+And for lwl, my fix was:
+```javascript
+case 0: mv
+case 1: ((mv & 0xFFFFFF00) | (R[rt] & 0xFF)) >>> 0
+case 2: ((mv & 0xFFFF0000) | (R[rt] & 0xFFFF)) >>> 0
+case 3: ((mv & 0xFF000000) | (R[rt] & 0x00FFFFFF)) >>> 0
+```
+
+The correct l
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed] wl (for LE):
+- addr&3=0: mv ✓ CORRECT!
+- addr&3=1: (R[rt] & 0xFF000000) | (mv & 0x00FFFFFF) → keeps R[rt] byte 3, copies mv bytes 0,1,2
+
+But my fix gives: (mv & 0xFFFFFF00) | (R[rt] & 0xFF) → copies mv bytes 1,2,3, keeps R[rt] byte 0
+
+These are DIFFERENT! My lwl fix is wrong!
+
+The correct lwl for addr&3=1:
+(R
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed] [rt] & 0xFF000000) | (memval & 0x00FFFFFF)
+
+But wait, earlier I derived that for LE lwl at addr&3=1 (byte after XOR = 2):
+"RT[23:0] = mem[23:0], keep RT[31:24]"
+
+Which in JavaScript is: (R[rt] & 0xFF000000) | (memval & 0x00FFFFFF)
+
+But memval[23:0] = memval bytes 0,1,2. And we want memory bytes at addr,
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  addr+1, addr+2 which are aligned+1, aligned+2, aligned+3.
+
+In the memval: memval.byte0 = memory[aligned], memval.byte1 = memory[aligned+1], memval.byte2 = memory[aligned+2], memval.byte3 = memory[aligned+3].
+
+So memval[23:0] = bytes 0,1,2 of memval = memory[aligned], memory[aligned+1], memory[aligned+2].
+
+But we want memory[aligned+1], memory[aligned+2], memory[aligned+3].
+
+These are different! The spec says memval[23:0], but that's the
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  low 3 bytes of the aligned word, which correspond to memory bytes 0,1,2 of the aligned word.
+
+Hmm, but the spec XORs the byte offset with 3. Let me re-derive:
+
+For LE lwl:
+byte = addr[1:0] XOR 3
+
+When addr&3=1: byte = 1 XOR 3 = 2
+
+The spec says:
+case 2: GPR[rt] ← GPR[rt] MERGE memword
+  where GPR[rt] = memword[23:0] @ GPR[rt][7:0]
+
+Wait,
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  the @ notation. Is it concatenation? And what endianness are the bits numbered?
+
+In MIPS, bits are always numbered MSB=31, LSB=0 regardless of data endianness. So memword[23:0] means bits 23 down to 0 of memword.
+
+For a LE system, memword = Memory[aligned, 4]. This reads 4 bytes. Byte 0 (at aligned+0) goes to bits 7:0, byte 1 to bits 15:8, etc.
+
+So memword[23:0] = {byte2
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed] , byte1, byte0} = {memory[aligned+2], memory[aligned+1], memory[aligned+0]}.
+
+The result is: GPR[rt][31:24] @ memword[23:0] = GPR[rt].byte3, mem.byte2, mem.byte1, mem.byte0
+
+Which in JavaScript: (R[rt] & 0xFF000000) | (memval & 0x00FFFFFF)
+
+This puts memory[aligned], memory[aligned+1], memory[aligned+2] into the register bytes 0,1,2.
+
+But wait, for an
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  unaligned load at addr=aligned+1, we should be loading memory[aligned+1], memory[aligned+2], memory[aligned+3], NOT memory[aligned], memory[aligned+1], memory[aligned+2].
+
+Unless the lwl/lwr pair together loads the complete word. The idea is:
+- lwl loads the "left" part (some bytes from one aligned word)
+- lwr loads the "right" part (remaining bytes from the adjacent aligned word)
+
+For LE, lwl at addr=aligned+1 with byte=2:
+Result = RT.byte3, memval.byte2, memval.byte1, memval.byte0
+
+This puts memval.byte0 (=memory[aligned]) in RT.byte
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 0. But addr=aligned+1, so we'd want memory[aligned+1] in some position...
+
+Actually, I think the semantics are:
+- lwl at addr=aligned+1: fills the register starting from byte 0 with bytes from aligned+1 downward
+  - byte0 = memory[aligned+1] = memval.byte1 ← Wait, that doesn't match
+
+Hmm, I'm going in circles. Let me just look at what QEMU does for reference, or look at a test program.
+
+Actually, let me take a different approach. The MIPS ISA manual is the authoritative source. Let me re-read it very carefully.
+
+From MIPS32 Architecture for Programmers Volume II, Table A
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed] .9:
+
+For lwl in little-endian mode:
+```
+vAddr <- offset + GPR[base]
+byte <- vAddr[1:0] XOR 11b
+pAddr <- vAddr[31:2] || 00b
+memword <- Memory[pAddr, 4]
+
+switch (byte)
+  when 0:
+    GPR[rt] <- memword
+  when 1:
+    GPR[rt] <- memword[31:8] || GPR[rt][7:0]  // BUT WAIT
+  when 2:
+    GPR[
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed] rt] <- memword[31:16] || GPR[rt][15:0]
+  when 3:
+    GPR[rt] <- memword[31:24] || GPR[rt][23:0]
+```
+
+Actually, I need to look at the real MIPS spec, not a paraphrased version. Let me check the official MIPS32 ISA.
+
+From the official MIPS32® Instruction Set Quick Reference Card:
+
+lwl rt, offset(base) — Load Word Left (MIPS32)
+```
+Temp ← GPR[base] + sign_extend(offset)
+byte ← Temp[1:0] XOR (depends
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  on endianness)
+pAddr ← Temp[31:2] || 0^2
+mem ← Memory[pAddr]
+Register ← ?
+```
+
+For big-endian:
+byte = Temp[1:0]
+when 0: GPR[rt] ← mem[31:0] (full word)
+when 1: GPR[rt][31:8] ← mem[31:8]
+when 2: GPR[rt][31:16] ← mem[31:16]
+when 3: GPR[rt][31:24] ← mem[31:24]
+
+For little-endian:
+byte = Temp[1:0] XOR 11b
+
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed] when 0: GPR[rt] ← mem[31:0]
+when 1: GPR[rt] ← mem[31:8] || GPR[rt][7:0]
+when 2: GPR[rt] ← mem[31:16] || GPR[rt][15:0]
+when 3: GPR[rt] ← mem[31:24] || GPR[rt][23:0]
+
+OK so for LE lwl, byte = addr&3 XOR 3.
+
+When addr&3=0: byte=3: GPR[rt]
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  ← mem[31:24] || GPR[rt][23:0]
+When addr&3=1: byte=2: GPR[rt] ← mem[31:16] || GPR[rt][15:0]
+When addr&3=2: byte=1: GPR[rt] ← mem[31:8] || GPR[rt][7:0]
+When addr&3=3: byte=0: GPR[rt] ← mem[31:0]
+
+So:
+- addr&3=3: GPR[rt] = mem (all 4 bytes)
+- addr&3=2: GPR[rt] = mem[3
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 1:8] || GPR[rt][7:0]
+  = (mem & 0xFFFFFF00) | (GPR[rt] & 0x000000FF)
+  NO WAIT. mem[31:8] means bits 31 down to 8 of mem. That's the upper 3 bytes.
+  In JavaScript: (memval & 0xFFFFFF00) | (R[rt] & 0xFF)
+
+But wait, what does this load? memval.byte3 = memory[aligned+3], memval.byte2 = memory[aligned+2], memval.byte1 = memory[aligned+1].
+
+So mem[31:8] = {memval.byte3, memval.byte2, memval.byte1} =
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  {memory[aligned+3], memory[aligned+2], memory[aligned+1]}
+
+And GPR[rt][7:0] = R[rt] byte 0.
+
+Result for addr&3=2: R[rt].byte0 unchanged, memval.byte1 in byte1, memval.byte2 in byte2, memval.byte3 in byte3.
+
+Wait, that doesn't make sense for "load word LEFT at addr=aligned+2". We're loading memory bytes aligned+1, aligned+2, aligned+3 into register bytes 1,2,3, keeping byte 0.
+
+But the "left" bytes
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  are the ones at higher addresses... Actually in LE, higher addresses correspond to MORE significant bytes. So "load word left" loads the bytes at the higher addresses.
+
+For addr=aligned+2 (byte 2 of the word):
+- Higher addresses: aligned+2, aligned+3
+- But we're loading 3 bytes: aligned+1, aligned+2, aligned+3 into register bytes 1,2,3
+
+Hmm, this seems to load the byte at the lower address (aligned+1) as well. Maybe "left" in LE means "left" as in "the left part of the register" (lower bits)?
+
+Actually, I think the naming convention is
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed] : in big-endian, "left" means most significant. The instruction semantics are then adjusted for LE by the XOR. The key thing is to just implement the spec correctly.
+
+Let me re-derive everything clearly:
+
+LE lwl (opcode 0x22):
+
+byte = (addr & 3) ^ 3
+pAddr = addr & ~3
+mem = r32(pAddr)
+
+byte=0 (addr&3=3): GPR[rt] = mem  // all 4 bytes
+byte=1 (addr&3=2): GPR[rt] = (mem & 0xFFFFFF00) | (GPR[rt] & 0xFF)
+byte=2 (addr&3=
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 1): GPR[rt] = (mem & 0xFFFF0000) | (GPR[rt] & 0xFFFF)
+byte=3 (addr&3=0): GPR[rt] = (mem & 0xFF000000) | (GPR[rt] & 0x00FFFFFF)
+
+Wait, this is what my "fix" has! Let me check:
+```
+case 34 (lwl): 
+  bo=0: mv
+  bo=1: ((mv & 0xFFFFFF00) | (R[rt] & 0xFF))
+  bo=2: ((
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed] mv & 0xFFFF0000) | (R[rt] & 0xFFFF))
+  bo=3: ((mv & 0xFF000000) | (R[rt] & 0x00FFFFFF))
+```
+
+Where bo = addr & 3. So:
+- bo=0 (addr&3=0): mv ← but byte=3 for this case, should be (mem & 0xFF000000) | (GPR[rt] & 0x00FFFFFF)
+- bo=1 (addr&3=1): byte=2, should be (mem & 0xFFFF
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 0000) | (GPR[rt] & 0xFFFF)
+- bo=2 (addr&3=2): byte=1, should be (mem & 0xFFFFFF00) | (GPR[rt] & 0xFF)
+- bo=3 (addr&3=3): byte=0, should be mem (all 4 bytes)
+
+So my fix has bo=0 and bo=3 SWAPPED!
+
+My fix:
+- bo=0: mv (should be byte=3 case: (mem & 0xFF000000) | (R[rt] & 0x00FFFFFF))
+- bo=3: (
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed] mv & 0xFF000000) | (R[rt] & 0x00FFFFFF) (should be byte=0 case: mv)
+
+These are swapped! So my "fix" is still wrong.
+
+Let me write the CORRECT implementation:
+
+LE lwl:
+```
+bo = addr & 3
+switch(bo):
+  case 0: GPR[rt] = (mem & 0xFF000000) | (GPR[rt] & 0x00FFFFFF)
+  case 1: GPR[rt] = (mem & 0
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed] xFFFF0000) | (GPR[rt] & 0x0000FFFF)
+  case 2: GPR[rt] = (mem & 0xFFFFFF00) | (GPR[rt] & 0x000000FF)
+  case 3: GPR[rt] = mem
+```
+
+LE lwr:
+From the spec, byte = (addr & 3) ^ 3
+byte=0 (addr&3=3): GPR[rt] = mem
+byte=1 (addr&3=2): GPR[rt] = (GPR[rt] & 0xFF000000)
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  | (mem & 0x00FFFFFF)
+byte=2 (addr&3=1): GPR[rt] = (GPR[rt] & 0xFFFF0000) | (mem & 0x0000FFFF)
+byte=3 (addr&3=0): GPR[rt] = (GPR[rt] & 0xFFFFFF00) | (mem & 0x000000FF)
+
+So:
+```
+bo = addr & 3
+switch(bo):
+  case 0: GPR[rt] = (GPR[rt] & 0xFFFFFF00) | (mem & 0x000000FF)
+  case 1: GPR[rt] = (GPR[rt] & 0xFFFF0000) | (mem & 0x0000
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed] FFFF)
+  case 2: GPR[rt] = (GPR[rt] & 0xFF000000) | (mem & 0x00FFFFFF)
+  case 3: GPR[rt] = mem
+```
+
+Similarly for LE swl and swr:
+
+LE swl:
+byte = (addr & 3) ^ 3
+byte=0 (addr&3=3): mem = GPR[rt] (all 4 bytes)
+byte=1 (addr&3=2): mem = old_mem[31:24] @ GPR[rt][23:0]
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  = (old & 0xFF000000) | (GPR[rt] & 0x00FFFFFF)
+byte=2 (addr&3=1): mem = old_mem[31:16] @ GPR[rt][15:0] = (old & 0xFFFF0000) | (GPR[rt] & 0x0000FFFF)
+byte=3 (addr&3=0): mem = old_mem[31:8] @ GPR[rt][7:0] = (old & 0xFFFFFF00) | (GPR[rt] & 0x000000FF)
+
+So:
+```
+bo = addr & 3
+switch(bo):
+  case
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  0: w32(aligned, (old & 0xFFFFFF00) | (GPR[rt] & 0x000000FF))
+  case 1: w32(aligned, (old & 0xFFFF0000) | (GPR[rt] & 0x0000FFFF))
+  case 2: w32(aligned, (old & 0xFF000000) | (GPR[rt] & 0x00FFFFFF))
+  case 3: w32(aligned, GPR[rt])
+```
+
+LE swr:
+byte = (addr & 3) ^ 3
+byte=0 (addr&3=3): mem = GPR[rt] (all 4 bytes)
+byte=1 (addr&3=2): mem = G
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed] PR[rt][31:8] @ old_mem[7:0] = (GPR[rt] & 0xFFFFFF00) | (old & 0x000000FF)
+byte=2 (addr&3=1): mem = GPR[rt][31:16] @ old_mem[15:0] = (GPR[rt] & 0xFFFF0000) | (old & 0x0000FFFF)
+byte=3 (addr&3=0): mem = GPR[rt][31:24] @ old_mem[23:0] = (GPR[rt] & 0xFF000000) | (old & 0x00FFFFFF)
+
+So:
+```
+bo = addr & 3
+switch(bo):
+
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed]   case 0: w32(aligned, (GPR[rt] & 0xFF000000) | (old & 0x00FFFFFF))
+  case 1: w32(aligned, (GPR[rt] & 0xFFFF0000) | (old & 0x0000FFFF))
+  case 2: w32(aligned, (GPR[rt] & 0xFFFFFF00) | (old & 0x000000FF))
+  case 3: w32(aligned, GPR[rt])
+```
+
+OK so now I have the correct implementations for all 4 instructions. Both
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  my "original" and "fix" were wrong! Let me now figure out what was actually in the vm.js file right now and fix it.
+
+Let me check what the current code has:
+
+My current lwl (from the "fix"):
+```javascript
+case 34: bo=0: mv, bo=1: (mv & 0xFFFFFF00) | (R[rt] & 0xFF), bo=2: (mv & 0xFFFF0000) | (R[rt] & 0xFFFF), bo=3: (mv & 0xFF000000) | (R[rt] & 0x00FFFFFF)
+```
+
+Correct lwl:
+```javascript
+case 34: bo=0: (mv & 0xFF0000
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 00) | (R[rt] & 0x00FFFFFF), bo=1: (mv & 0xFFFF0000) | (R[rt] & 0xFFFF), bo=2: (mv & 0xFFFFFF00) | (R[rt] & 0xFF), bo=3: mv
+```
+
+My current lwr (from the "fix"):
+```javascript
+case 38: bo=3: mv, bo=2: (R[rt] & 0xFF000000) | (mv & 0x00FFFFFF), bo=1: (R[rt] & 0xFFFF0000) | (mv & 0x0000FFFF), bo=0: (R[rt] & 0xFFFFFF00
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed] ) | (mv & 0x000000FF)
+```
+
+Correct lwr:
+```javascript
+case 38: bo=0: (R[rt] & 0xFFFFFF00) | (mv & 0x000000FF), bo=1: (R[rt] & 0xFFFF0000) | (mv & 0x0000FFFF), bo=2: (R[rt] & 0xFF000000) | (mv & 0x00FFFFFF), bo=3: mv
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 
+```
+
+My current lwr is actually correct! (bo=0,1,2,3 map to the right values)
+
+My current swl (from the "fix"):
+```javascript
+case 42: bo=0: v, bo=1: (v & 0xFFFFFF00) | (old & 0xFF), bo=2: (v & 0xFFFF0000) | (old & 0xFFFF), bo=3: (v & 0xFF000000) | (old & 0x00FFFFFF)
+```
+
+Correct swl:
+```javascript
+case 42: bo=0: (old & 0xFFFFFF00) | (v & 0x000000FF), bo=1: (old & 
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 0xFFFF0000) | (v & 0x0000FFFF), bo=2: (old & 0xFF000000) | (v & 0x00FFFFFF), bo=3: v
+```
+
+My current swr (from the "fix"):
+```javascript
+case 46: bo=3: v, bo=2: (old & 0xFF000000) | (v & 0x00FFFFFF), bo=1: (old & 0xFFFF0000) | (v & 0x0000FFFF), bo=0: (old & 0xFFFFFF00) | (v & 0x000000FF)
+```
+
+Correct swr:
+```javascript
+case 46: bo=0: (v &
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  0xFF000000) | (old & 0x00FFFFFF), bo=1: (v & 0xFFFF0000) | (old & 0x0000FFFF), bo=2: (v & 0xFFFFFF00) | (old & 0x000000FF), bo=3: v
+```
+
+So to summarize what needs fixing in the current code:
+1. lwl: all 4 cases are wrong (need complete rewrite)
+2. lwr: correct! (no change needed)
+3. swl: all 
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 4 cases are wrong (need complete rewrite)
+4. swr: all 4 cases are wrong (need complete rewrite)
+
+OK so I need to fix lwl, swl, and swr. Let me apply the correct implementations."
+
+The "fix" I applied was wrong for lwl/swl/swr but correct for lwr. Let me apply the correct implementations now.
+
+Wait, actually, let me re-verify my current lwr more carefully.
+
+My current lwr code:
+```javascript
+case 38: bo === 3 ? mv : bo === 2 ? ((R[rt] & 0xFF000000) | (mv & 0
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed] x00FFFFFF)) >>> 0 
+       : bo === 1 ? ((R[rt] & 0xFFFF0000) | (mv & 0x0000FFFF)) >>> 0 
+       : ((R[rt] & 0xFFFFFF00) | (mv & 0x000000FF)) >>> 0
+```
+
+Correct lwr:
+- bo=0: (R[rt] & 0xFFFFFF00) | (mv & 0x000000FF)
+- bo=1: (R[rt] & 0xFFFF0000) | (mv & 0x0000FFFF)
+- bo=2: (R[rt] & 0xFF00
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 0000) | (mv & 0x00FFFFFF)
+- bo=3: mv
+
+My code: bo=3→mv, bo=2→keep byte3|use bytes0-2, bo=1→keep bytes2-3|use bytes0-1, bo=0→keep byte3|use byte0
+
+That maps to:
+- bo=3: mv ✓
+- bo=2: (R[rt] & 0xFF000000) | (mv & 0x00FFFFFF) ← correct
+- bo=1: (R[rt] & 0xFFFF0000) | (mv & 
+[tr-thinking call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 0x0000FFFF) ← correct
+- bo=0 (default): (R[rt] & 0xFFFFFF00) | (mv & 0x000000FF) ← correct
+
+Great, lwr is correct!
+
+Now I need to fix lwl, swl, and swr. Let me write the python replacement.
+[tr-stream call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed] Let me apply the correct implementations:
+
+{
+  "analysis": "My 'fix' was wrong. I need to implement LE MIPS lwl/lwr/swl/swr correctly according to the MIPS32 spec.",
+  "plan": "Fix all
+[tr-stream call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  four unaligned load/store instructions with correct LE MIPS semantics.",
+  "commands": [
+    {
+      "keystrokes": "python3 << 'PYEOF'\nwith open('/app/vm.js', 'r') as f:\n    c = f.read()\n\n# Fix lwl (case 34)\nold_lwl = 'case 34: { const a = (R[rs] + si) >>> 0, al = a & ~3, bo = a & 3, mv = r32(al); R[rt] = bo === 0 ? mv : bo === 1 ? ((mv & 0xFFFFFF00) | (R[rt
+[tr-stream call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed] ] & 0xFF)) >>> 0 : bo === 2 ? ((mv & 0xFFFF0000) | (R[rt] & 0xFFFF)) >>> 0 : ((mv & 0xFF000000) | (R[rt] & 0x00FFFFFF)) >>> 0; break; }'\nnew_lwl = 'case 34: { const a = (R[rs] + si) >>> 0, al = a & ~3, bo = a & 3, mv = r32(al); R[rt]
+[tr-stream call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  = bo === 3 ? mv : bo === 2 ? ((mv & 0xFFFFFF00) | (R[rt] & 0x000000FF)) >>> 0 : bo === 1 ? ((mv & 0xFFFF0000) | (R[rt] & 0x0000FFFF)) >>> 0 : ((mv & 0xFF000000) | (R[rt] & 0x00FFFFFF)) >>> 0; break; }'\n\n# Fix swl (case 42) \nold_swl = 'case 42: { const a = (R[rs] + si) >>> 0, al = a & ~3, bo = a & 3, old = r32(al
+[tr-stream call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed] ), v = R[rt]; w32(al, bo === 0 ? v : bo === 1 ? ((v & 0xFFFFFF00) | (old & 0xFF)) >>> 0 : bo === 2 ? ((v & 0xFFFF0000) | (old & 0xFFFF)) >>> 0 : ((v & 0xFF000000) | (old & 0x00FFFFFF)) >>> 0); break; }'\nnew_swl = 'case 42: { const a = (R[rs] + si) >>> 0, al = a & ~3, bo = a & 3, old = r32(al), v = R[rt]; w32(al, bo === 3 ? v : bo === 2 ? ((old & 0xFF000000)
+[tr-stream call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  | (v & 0x00FFFFFF)) >>> 0 : bo === 1 ? ((old & 0xFFFF0000) | (v & 0x0000FFFF)) >>> 0 : ((old & 0xFFFFFF00) | (v & 0x000000FF)) >>> 0); break; }'\n\n# Fix swr (case 46)\nold_swr = 'case 46: { const a = (R[rs] + si) >>> 0, al = a & ~3, bo =
+[tr-stream call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  a & 3, old = r32(al), v = R[rt]; w32(al, bo === 3 ? v : bo === 2 ? ((old & 0xFF000000) | (v & 0x00FFFFFF)) >>> 0 : bo === 1 ? ((old & 0xFFFF0000) | (v & 0x0000FFFF)) >>> 0 : ((old & 0xFFFFFF00) | (v & 0x000000FF)) >>> 0); break; }'\
+[tr-stream call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed] nnew_swr = 'case 46: { const a = (R[rs] + si) >>> 0, al = a & ~3, bo = a & 3, old = r32(al), v = R[rt]; w32(al, bo === 0 ? ((v & 0xFF000000) | (old & 0x00FFFFFF)) >>> 0 : bo === 1 ? ((v & 0xFFFF0000) | (old & 0x0000FFFF)) >>> 0 : bo === 
+[tr-stream call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 2 ? ((v & 0xFFFFFF00) | (old & 0x000000FF)) >>> 0 : v); break; }'\n\nfor label, old, new in [('lwl', old_lwl, new_lwl), ('swl', old_swl, new_swl), ('swr', old_swr, new_swr)]:\n    if old in c:\n        c = c.replace(old, new)\n        print(f'Fixed {label}')\n    else:\n        print(f'NOT FOUND: {label}')\n\nwith open('/app/vm.js', 'w') as f:\n    f.write(c)\nprint('Done')\nPYEOF\n",
+      "duration": 0.5
+    },
+    {
+      "ke
+[tr-stream call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed] ystrokes": "node -c /app/vm.js && echo 'Syntax OK'\n",
+      "duration": 0.5
+    }
+  ]
+}
+
+[tr-stream call-0126:worker:xiaomi/mimo-v2.5-pro-ultraspeed] worker.done finish=stop cost_microdollars=346843
+[tr-stream call-0126:xiaomi/mimo-v2.5-pro-ultraspeed] Let me apply the correct implementations:
+
+{
+  "analysis": "My 'fix' was wrong. I need to implement LE MIPS lwl/lwr/swl/swr correctly according to the MIPS32 spec.",
+  "plan": "Fix all four unaligned load/store instructions with correct LE MIPS semantics.",
+  "commands": [
+    {
+      "keystrokes": "python3 << 'PYEOF'\nwith open('/app/vm.js', 'r') as f:\n    c = f.read()\n\n# Fix lwl (case 34)\nold_lwl = 'case 34: { const a = (R[rs] + si) >>> 0, al = a & ~3, bo = a & 3, mv = r32(al); R[rt] = bo === 0 ? mv : bo === 1 ? ((mv & 0xFFFFFF00) | (R[rt] & 0xFF)) >>> 0 : bo === 2 ? ((mv & 0xFFFF0000) | (R[rt] & 0xFFFF)) >>> 0 : ((mv & 0xFF000000) | (R[rt] & 0x00FFFFFF)) >>> 0; break; }'\nnew_lwl = 'case 34: { const a = (R[rs] + si) >>> 0, al = a & ~3, bo = a & 3, mv = r32(al); R[rt] = bo === 3 ? mv : bo === 2 ? ((mv & 0xFFFFFF00) | (R[rt] & 0x000000FF)) >>> 0 : bo === 1 ? ((mv & 0xFFFF0000) | (R[rt] & 0x0000FFFF)) >>> 0 : ((mv & 0xFF000000) | (R[rt] & 0x00FFFFFF)) >>> 0; break; }'\n\n# Fix swl (case 42) \nold_swl = 'case 42: { const a = (R[rs] + si) >>> 0, al = a & ~3, bo = a & 3, old = r32(al), v = R[rt]; w32(al, bo === 0 ? v : bo === 1 ? ((v & 0xFFFFFF00) | (old & 0xFF)) >>> 0 : bo === 2 ? ((v & 0xFFFF0000) | (old & 0xFFFF)) >>> 0 : ((v & 0xFF000000) | (old & 0x00FFFFFF)) >>> 0); break; }'\nnew_swl = 'case 42: { const a = (R[rs] + si) >>> 0, al = a & ~3, bo = a & 3, old = r32(al), v = R[rt]; w32(al, bo === 3 ? v : bo === 2 ? ((old & 0xFF000000) | (v & 0x00FFFFFF)) >>> 0 : bo === 1 ? ((old & 0xFFFF0000) | (v & 0x0000FFFF)) >>> 0 : ((old & 0xFFFFFF00) | (v & 0x000000FF)) >>> 0); break; }'\n\n# Fix swr (case 46)\nold_swr = 'case 46: { const a = (R[rs] + si) >>> 0, al = a & ~3, bo = a & 3, old = r32(al), v = R[rt]; w32(al, bo === 3 ? v : bo === 2 ? ((old & 0xFF000000) | (v & 0x00FFFFFF)) >>> 0 : bo === 1 ? ((old & 0xFFFF0000) | (v & 0x0000FFFF)) >>> 0 : ((old & 0xFFFFFF00) | (v & 0x000000FF)) >>> 0); break; }'\nnew_swr = 'case 46: { const a = (R[rs] + si) >>> 0, al = a & ~3, bo = a & 3, old = r32(al), v = R[rt]; w32(al, bo === 0 ? ((v & 0xFF000000) | (old & 0x00FFFFFF)) >>> 0 : bo === 1 ? ((v & 0xFFFF0000) | (old & 0x0000FFFF)) >>> 0 : bo === 2 ? ((v & 0xFFFFFF00) | (old & 0x000000FF)) >>> 0 : v); break; }'\n\nfor label, old, new in [('lwl', old_lwl, new_lwl), ('swl', old_swl, new_swl), ('swr', old_swr, new_swr)]:\n    if old in c:\n        c = c.replace(old, new)\n        print(f'Fixed {label}')\n    else:\n        print(f'NOT FOUND: {label}')\n\nwith open('/app/vm.js', 'w') as f:\n    f.write(c)\nprint('Done')\nPYEOF\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "node -c /app/vm.js && echo 'Syntax OK'\n",
+      "duration": 0.5
+    }
+  ]
+}

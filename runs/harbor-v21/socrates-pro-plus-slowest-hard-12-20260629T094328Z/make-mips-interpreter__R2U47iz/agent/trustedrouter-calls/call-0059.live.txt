@@ -1,0 +1,1820 @@
+
+[tr-stream call-0059:socrates:trustedrouter/socrates-pro-plus-1.0] socrates.started
+
+[tr-stream call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] worker.started
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] There's an error - SPECIAL fn=1 at 0x400004. This is in the .MIPS.abiflags section at the very start of the file, not at the entry point. The issue is that the pc is starting at 0x400004 instead of 0x400110. Wait, the entry is at 0x400110, let me check...
+
+Actually wait - SPECIAL fn=1 is `movn` (or `bgez`? no, it's in the SPECIAL encoding). fn=1 is actually...
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  let me check the MIPS encoding. 
+
+In MIPS SPECIAL encoding, fn=1 is... hmm, looking at my code:
+- case 10: movz
+- case 11: movn
+
+But fn=1 is not handled. Let me check what 0x400004 contains.
+
+Actually wait, 0x400004 is the second instruction in the file. The entry point is 0x400110, so the CPU shouldn't be executing at 0x400004. But I see the error says "at 0x400004". Let me check if
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  there's an issue with the `pc` variable.
+
+Wait, looking at my code more carefully:
+```javascript
+pc = (pc+4)>>>0;
+```
+This happens BEFORE the instruction executes. So the first instruction should be at _entry = 0x400110. But the error shows 0x400004. 
+
+Hmm, but the error message says "at 0x400004". That's weird. Let me re-read the code:
+
+```javascript
+const I = r32(pc);
+pc = (pc+4)>>>0;
+```
+
+So if pc starts at 0x400110, the first I is r
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 32(0x400110) and pc becomes 0x400114. The error message uses `(pc-4>>>0).toString(16)` which should give 0x400110 for the first error.
+
+Wait, the error says "SPECIAL fn=1 at 0x400004". That means pc-4 = 0x400004, so pc = 0x400008. That's definitely not starting from the entry point.
+
+Oh wait, I see the issue. The `pc` variable declaration: `let pc = _entry>>>0;
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] `. But then it enters the while loop. Let me check if _entry is correct.
+
+`const _entry = er32(0x18);` - This reads the entry point from the ELF header at offset 0x18. The readelf output shows "Entry point address: 0x400110".
+
+But wait, the error is at 0x400004, which is very early. That would mean it started executing at 0x400000 (the beginning of the LOAD segment) instead of the entry point.
+
+Hmm, actually 0x400004
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  is offset 4 in the LOAD segment. But the entry point should be 0x400110...
+
+Let me check if my er32 function is correct:
+```javascript
+function er32(o){return(ELF[o]|(ELF[o+1]<<8)|(ELF[o+2]<<16)|(ELF[o+3]<<24))>>>0}
+```
+
+This is little-endian 32-bit read. The ELF header says the entry is at 0x400110. Let me verify:
+
+From readelf output: "Entry point address: 0x400110"
+
+So
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  _entry should be 0x400110. But somehow the program starts executing at 0x400004...
+
+Wait, actually let me re-read the error more carefully: "SPECIAL fn=1 at 0x400004". The `__start` function is at 0x400110, and it's:
+```
+400110: 27bdffe8  addiu sp,sp,-24
+400114: afbf0014  sw    ra,20(sp)
+4
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 00118: 24040000  li    a0,0
+40011c: 0c10e558  jal   439560 <doomgeneric_Create>
+```
+
+That first instruction 0x27bdffe8 has op=0x09 (addiu), not 0x00 (SPECIAL). So the error can't be from the entry point.
+
+Hmm, let me check what instruction is at 0x400004. That's in the LOAD segment at offset 0x4. The segment starts at file
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  offset 0x0 with vaddr 0x400000. So 0x400004 corresponds to file offset 0x4.
+
+File offset 0x4 is in the ELF header area. The first LOAD segment starts at file offset 0x0 and loads to 0x400000. But the ELF header and program headers are in the first few bytes. At file offset 0x4, we have the magic number continuation "45 4c 46 01 01 01..." which is "ELF" + class + encoding + version
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] .
+
+So 0x46_4C_45_7F would be... hmm, that's part of the ELF magic. The first 16 bytes of the ELF are:
+7f 45 4c 46 01 01 01 00 00 00 00 00 00 00 00 00
+
+At file offset 0 (vaddr 0x400000): 7f 45 4c 46
+At file offset 4 (vaddr 0x400004): 01 01 01 00
+
+So
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  r32(0x400004) = 0x00010101
+
+That's op = 0x00, which is SPECIAL. And fn = 0x01, which is unhandled.
+
+So somehow the CPU is starting at 0x400004 instead of 0x400110. Let me think about why...
+
+Oh! I think I see it. The `pc` is correctly set to _entry at the start. But there's a bug in the jal instruction:
+
+```javascript
+case 3:{R[31]=pc>>>
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 0;pc=((pc-4+4)&0xF0000000)|((I&0x3FFFFFF)<<2);break}
+```
+
+Wait, `pc-4+4` is just `pc`. But at the point jal is executed, `pc` has already been incremented to point to the next instruction. So `pc-4` would be the address of the jal instruction itself, and `pc-4+4` would be the instruction after jal, which is correct for the high bits.
+
+Actually wait, `pc` at that point is the address AFTER the current instruction (since we did
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  `pc = (pc+4)>>>0`). So for a jal at address X, pc = X+4. The target should be `((X+4) & 0xF0000000) | (imm26 << 2)`.
+
+But in my code: `((pc-4+4)&0xF0000000) = (pc & 0xF0000000)`. That's wrong! It should be `((pc-4+4)&0xF0000000)` = `((pc)&0xF0000000)`. But actually, the
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  MIPS spec says the region is determined by the address of the instruction in the delay slot, which is `pc` (the address of the next instruction to execute, which is the instruction after the jump). So `pc & 0xF0000000` is the right region bits. The target is `pc & 0xF0000000 | imm26 << 2`.
+
+Wait no. Let me re-read. In MIPS:
+- The j/jal instruction at address A sets PC = (A+4) & 0xF0000000 | (imm26 << 2)
+
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] - Since in my code, by the time we execute the case, pc = A + 4 already.
+- So `pc & 0xF0000000 | (imm26 << 2)` should be correct.
+
+But my code does: `((pc-4+4)&0xF0000000)` which is `(pc & 0xF0000000)`. That's the same thing. So that should be fine.
+
+Hmm, but the issue is that we're executing at 0x400004, which means somehow the execution flow reached there. Let me think...
+
+Oh wait,
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  I think I made a typo in my code. Let me re-read:
+
+```javascript
+case 2:{pc=((pc-4+4)&0xF0000000)|((I&0x3FFFFFF)<<2);break}  // j
+case 3:{R[31]=pc>>>0;pc=((pc-4+4)&0xF0000000)|((I&0x3FFFFFF)<<2);break}  // jal
+```
+
+Wait, `pc-4+4` = `pc`. That's just `pc & 0xF0000000 | (I
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  & 0x3FFFFFF) << 2`. And `pc` at this point is the address of the instruction AFTER the j/jal (since we already incremented). For a j/jal at the entry point area, this should be fine.
+
+Actually, I bet the problem is much simpler. Let me look at the first instruction at 0x400110:
+```
+27bdffe8  addiu sp,sp,-24
+```
+That's op = 0x09 (addiu). In my code:
+```javascript
+case 8:case 9:R[rt]=(R[rs]+si)>>>0;break;
+```
+
+That should work fine for addiu. Let
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  me trace through more carefully...
+
+Actually wait, I wonder if `_entry` is not being read correctly. Let me check. The ELF header:
+```
+Magic:   7f 45 4c 46 01 01 01 00 01 00 00 00 00 00 00 00
+```
+Bytes 0x10-0x13: 00 00 00 00 (type - EXEC)
+Bytes 0x14-0x15: 00 01 (machine - MIPS)
+Bytes 0x16-0
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] x17: 00 00 (version)
+Bytes 0x18-0x1b: Entry point address
+
+Wait, let me re-check the ELF header layout:
+- 0x00-0x03: Magic (7f 45 4c 46)
+- 0x04: Class (01 = ELF32)
+- 0x05: Data (01 = little-endian)
+- 0x06: Version (01)
+- 0x07: OS/ABI (00)
+- 0x08-0x0f: padding (8
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  bytes of zeros)
+- 0x10-0x11: Type (02 00 = EXEC in LE)
+- 0x12-0x13: Machine (08 00 = MIPS in LE)
+- 0x14-0x17: Version
+- 0x18-0x1b: Entry point address
+
+So the entry point is at file offset 0x18. In little-endian, from the raw bytes at that position.
+
+Actually, I read from the readelf output:
+```
+Entry point address:               0x400110
+```
+
+And from the hex
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] :
+```
+Magic:   7f 45 4c 46 01 01 01 00 01 00 00 00 00 00 00 00
+```
+
+This is 16 bytes (0x00-0x0f). The next bytes starting at 0x10:
+- 0x10-0x11: 02 00 (EXEC, LE)
+- 0x12-0x13: 08 00 (MIPS, LE)
+- 0x14-0x1
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 7: 01 00 00 00 (Version 1)
+- 0x18-0x1b: Entry point
+
+But wait, the header format from readelf says the first line of magic is:
+7f 45 4c 46 01 01 01 00 01 00 00 00 00 00 00 00
+
+This is actually:
+- 7f 45 4c 46 = magic
+- 01 = class (ELF32)
+- 01 = data (LE
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] )
+- 01 = version
+- 00 = OS/ABI
+- 01 00 00 00 00 00 00 00 = padding (but wait, that's 01 followed by 7 zeros for 8 bytes of ABI version + padding)
+
+Actually no, the ABI version is 1 byte, padding is 7 bytes:
+- 0x00-0x03: 7f 45 4c 46 (magic)
+- 0x04: 01 (class ELF32)
+- 0x0
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 5: 01 (data LE)
+- 0x06: 01 (version)
+- 0x07: 00 (OS/ABI)
+- 0x08: 01 (ABI version)
+- 0x09-0x0f: 00 00 00 00 00 00 00 (padding)
+
+So the Magic line shows 16 bytes: 7f 45 4c 46 01 01 01 00 01 00 00 00 00 00 00 00
+
+
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] Then:
+- 0x10-0x11: e0 00? No...
+
+Hmm, I'm confusing myself. Let me just check if my er32 function at offset 0x18 returns 0x400110.
+
+Actually, looking at the readelf output again:
+```
+  Magic:   7f 45 4c 46 01 01 01 00 01 00 00 00 00 00 00 00
+  Class:                             ELF32
+ 
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  Data:                              2's complement, little endian
+  Version:                           1 (current)
+  OS/ABI:                            UNIX - System V
+  ABI Version:                       1
+  Type:                              EXEC (Executable file)
+  Machine:                           MIPS R3000
+  Version:                           0x1
+  Entry point address:               0x400110
+```
+
+The Magic is the first 16 bytes. Then:
+- Bytes 16-17 (0x10-0x11): Type = EXEC = 0x0002 in big endian, 0x0200 in LE
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] . From the readelf, it's "2's complement, little endian" so type bytes are 02 00.
+- Bytes 18-19 (0x12-0x13): Machine = 0x0008 (MIPS) in LE = 08 00.
+- Bytes 20-23 (0x14-0x17): Version = 0x00000001 in LE = 01 00 00 00.
+- Bytes 24-27 (0x18-0x1b): Entry point = 0x00400110 in LE =
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  10 01 40 00.
+
+So er32(0x18) should read bytes at positions 0x18, 0x19, 0x1a, 0x1b which are 10, 01, 40, 00.
+
+er32(0x18) = 0x10 | (0x01 << 8) | (0x40 << 16) | (0x00 << 24) = 0x00400110 = 0x400110. ✓
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 
+
+So _entry should be correct. Let me check if there's a bug in the jal handling.
+
+Actually, let me re-check the `__start` function:
+```
+00400110 <__start>:
+  400110:       27bdffe8        addiu   sp,sp,-24
+  400114:       afbf0014        sw      ra,20(sp)
+  400118:       24040000        li      a0,0
+  40011c:       0c10e
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 558        jal     439560 <doomgeneric_Create>
+  400120:       24050000        li      a1,0
+  400124:       0c100fbc        jal     403ef0 <doomgeneric_Tick>
+  400128:       00000000        nop
+  40012c:       08100049        j       400124
+  400130:       00000000        nop
+```
+
+Wait, 0x0c10e558 is
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  `jal 0x439560`. Let me decode:
+op = 0x03 (jal), imm26 = 0x0c10e558 >> 2 = ... 
+
+Actually, let me just decode 0x0c10e558:
+- Bits 31-26: 000011 = 3 (jal) ✓
+- Bits 25-0: 00 0011 0001 0000 1110 0101 0101 1000 = 0x010e556 >>
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  ... 
+
+Hmm let me compute: 0x0c10e558 & 0x03FFFFFF = 0x0010e556. 
+Wait: 0x0c10e558 in binary is:
+0000 1100 0001 0000 1110 0101 0101 1000
+
+Bits 31-26: 000011 = 3 (jal)
+Bits 25-0: 00 0001 0000 1110 0101 0101 1000 = 0x00
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 4_3956... wait
+
+Let me be more careful:
+0x0c10e558 = 0000 1100 0001 0000 1110 0101 0101 1000
+
+bits 31-26 (op): 000011 = 0x03 = jal ✓
+bits 25-0 (target): 00 0001 0000 1110 0101 0101 1000
+= 0000 0001 0000 1110 0
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 101 0101 1000
+= 0x0010E558... hmm that doesn't look right.
+
+Actually: target in the instruction encoding for j/jal is:
+target_address = (PC_upper_4_bits | (target << 2))
+
+The raw instruction 0x0c10e558:
+imm26 = 0x0c10e558 & 0x03FFFFFF = 0x0010E556
+
+No wait: 0x0c10e558 = 00001100_00010000_11100101_01
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 011000
+op (bits 31-26): 000011 = 3
+target (bits 25-0): 00_00010000_11100101_01011000 = 0x0010E556
+
+Hmm, 0x0010E556 << 2 = 0x00439558... but the expected target is 0x439560.
+
+Wait, I think I made a mistake. Let me re
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] -decode:
+
+0x0c10e558 in binary:
+0000 1100 0001 0000 1110 0101 0101 1000
+
+Bits 25-0: 00 0001 0000 1110 0101 0101 1000
+That's 26 bits: 00_0000_0100_0011_1001_0101_0
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 110_00
+
+Wait I need to be more careful. The instruction is 32 bits wide:
+
+Bit 31: 0
+Bit 30: 0
+Bit 29: 0
+Bit 28: 0
+Bit 27: 1
+Bit 26: 1
+Bit 25: 0
+Bit 24: 0
+Bit 23: 0
+Bit 22: 0
+Bit 21: 0
+Bit 20: 1
+Bit 19: 0
+Bit 18: 0
+Bit 17: 0
+Bit 16: 0
+Bit 15: 1
+Bit 14: 1
+Bit 13: 1
+Bit 12: 0
+Bit 11: 
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 0
+Bit 10: 1
+Bit 9: 0
+Bit 8: 1
+Bit 7: 0
+Bit 6: 1
+Bit 5: 0
+Bit 4: 1
+Bit 3: 1
+Bit 2: 0
+Bit 1: 0
+Bit 0: 0
+
+op (bits 31-26): 000011 = 3 (jal)
+target (bits 25-0): 00_0001_0000_1110_0101_0101_1000
+
+In hex: 00 01
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 00 0011 1001 0101 0110 00
+That's: 0x00_10E5_56
+
+Hmm, 0x0010E556 << 2 = 0x00439558
+
+But the disassembly says target is 0x439560. Let me check:
+0x439560 >> 2 = 0x10E558
+
+So the target field should be 0x0010E558, not 0x0010E556.
+
+Let
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  me re-decode 0x0c10e558:
+0x0c = 0000 1100
+0x10 = 0001 0000
+0xe5 = 1110 0101
+0x58 = 0101 1000
+
+As 32 bits: 0000 1100 0001 0000 1110 0101 0101 1000
+
+Bits 25-0: taking
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  bits from position 25 down to 0:
+Bit 25: 0
+Bit 24: 0
+Bit 23: 0
+Bit 22: 0
+Bit 21: 1
+Bit 20: 0
+Bit 19: 0
+Bit 18: 0
+Bit 17: 0
+Bit 16: 1
+Bit 15: 1
+Bit 14: 1
+Bit 13: 1
+Bit 12: 0
+Bit 11: 0
+Bit 10: 1
+Bit 9: 0
+Bit 8: 1
+Bit 7: 0
+Bit 6: 1
+Bit 5
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] : 0
+Bit 4: 1
+Bit 3: 1
+Bit 2: 0
+Bit 1: 0
+Bit 0: 0
+
+So: 00_0001_0000_1111_0010_1010_1100_0
+
+Hmm wait, 0xe5 = 1110 0101. Let me redo this carefully.
+
+The instruction as bytes (big-endian representation in memory for little-endian MIPS... actually MIPS is always stored big-endian for the instruction format, but the file might be little-endian.
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  Let me reconsider.)
+
+Actually, for MIPS little-endian ELF, the instruction bytes are stored in little-endian order. So for address 0x40011c, the bytes in the file would be: 58 e5 10 0c. So r32 reads them as 0x0c10e558.
+
+Now, the MIPS instruction encoding is always big-endian in terms of bit fields. So the instruction 0x0c10e558 means:
+
+Bits [31:26] = 000011 = 0x03 = J
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] AL
+Bits [25:0] = ?
+
+0x0c10e558:
+In hex: 0c 10 e5 58
+In binary: 0000 1100 | 0001 0000 | 1110 0101 | 0101 1000
+
+Bits [31:26] = 000011 = 3 (JAL)
+Bits [25:0] = 00 | 0001 0000 | 1110 0101 | 0101 1000
+            = 00_0001
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] _0000_1110_0101_0101_1000
+
+Wait, that's 26 bits: 00 0001 0000 1110 0101 0101 1000
+Let me group: 00_0001_00_0011_1001_0101_0110_00
+
+In hex: 0x0010E558... hmm, let me compute.
+
+Actually:
+
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 0000 1100 0001 0000 1110 0101 0101 1000
+Remove top 6 bits (op):
+00 0001 0000 1110 0101 0101 1000
+
+Group as 4-bit nibbles from the left:
+0000 0100 0011 1001 0101 0110 00
+
+That's: 
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 0x00439558... wait
+
+Let me just compute it directly:
+The 26-bit target = 0x0c10e558 & 0x03FFFFFF = ?
+
+0x0c10e558 in binary is:
+0000 1100 0001 0000 1110 0101 0101 1000
+
+0x03FFFFFF:
+0000 0011 1111 1111 1111 1111 1111 1111
+
+AND:
+0
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 000 0000 0001 0000 1110 0101 0101 1000
+
+= 0x0010E558
+
+Then target address = (PC & 0xF0000000) | (imm26 << 2)
+= (0x400120 & 0xF0000000) | (0x0010E558 << 2)
+= 0x40000000 | (0x00439560)
+= 0x44
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 39560... that's wrong! The expected target is 0x439560.
+
+Wait, 0x0010E558 << 2:
+0x0010E558 * 4 = 0x00439560. ✓
+
+0x40000000 | 0x00439560 = 0x4439560? No, that can't be right. The issue is that the upper 4 bits of PC should match. Since the entry is in the 
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 0x004xxxxx range...
+
+Actually wait, in MIPS, the jump target region is determined by the 4 most significant bits of the PC. For 32-bit MIPS, the PC is 0x004xxxxx, so the upper 4 bits are 0x0. So:
+
+target = (0x00000000) | (0x0010E558 << 2) = 0x00439560 = 0x439560 ✓
+
+OK so the `& 0xF0000000` gives 0 for the
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  0x004xxxxx address space. Good.
+
+But in my code: `((pc-4+4)&0xF0000000)`. Since pc at the point of executing jal at 0x40011c is 0x400120 (already incremented), `(0x400120 & 0xF0000000) = 0x40000000`. That gives:
+
+`0x40000000 | (0x0010E558 << 2) = 0x404
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 39560`
+
+That's WRONG! It should be 0x00439560 = 0x439560!
+
+The bug is that the address space for this binary is 0x004xxxxx, not 0x40xxxxxx. When I do `& 0xF0000000`, I get 0x40000000 from 0x400120, but the correct upper 4 bits should be 0x00000000.
+
+Wait, that's the wrong address. The
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  instruction at 0x40011c - when we execute it, pc was 0x40011c, then we did `pc = (pc+4)>>>0` making pc = 0x400120. Then `(pc-4+4) & 0xF0000000 = 0x400120 & 0xF0000000 = 0x40000000`.
+
+But the correct behavior for MIPS j/jal is: the target address region is determined by bits [31:28] of the address of the instruction in the branch
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  delay slot (i.e., the instruction AFTER the j/jal). Since the instruction after j/jal is at 0x400120, the upper 4 bits are 0x4, so the target is 0x40000000 | (0x0010E558 << 2) = 0x4439560.
+
+But the expected target is 0x439560, not 0x4439560. This means... the binary is linked to run at 0x004xxxxx, not 0x40xxxxxx?
+
+Wait, the readelf output
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  says:
+```
+  Entry point address:               0x400110
+```
+
+But that's a MIPS address, and with the standard MIPS memory map, 0x400110 is in kuseg (user segment) which maps to physical 0x00400110. In a flat 32-bit model, 0x00400110 is the address.
+
+But the section headers show:
+```
+  [ 3] .text             PROGBITS        00400110
+```
+
+0x00400
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 110, not 0x40000110 or 0x400110. Wait, 00400110 is 0x00400110.
+
+OK so the addresses are:
+- __start: 0x00400110
+- j target for jal at 0x0040011c: 0x00439560
+
+For the j/jal instruction at 0x0040011c:
+- PC of delay slot = 0x00400120
+-
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  Upper 4 bits of delay slot PC = 0x0
+- So target = 0x0_00000 | (0x0010E558 << 2) = 0x00439560 ✓
+
+In my code, at the time of the jal:
+- pc has been incremented to 0x00400120 (assuming pc started at _entry = 0x00400110)
+- `((pc-4+4) & 0xF0000000)` = `(0x00400120 & 0xF0000000)` = `0x00000000` ✓
+
+So the
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  target would be 0x00000000 | (0x0010E558 << 2) = 0x00439560 ✓
+
+So actually the jal should work correctly. Let me reconsider why we're getting the error at 0x400004.
+
+Hmm wait, actually the `pc` variable in my code... Let me re-read more carefully. After `pc = (pc+4)>>>0`, pc becomes the address of the NEXT instruction. Then when we hit a jal:
+
+```javascript
+case 3:{R[31]=pc>>>0;pc=((pc-4+4)&0xF0000000)|((I&0x3FFFFFF)<<2);break}
+```
+
+R
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] [31] gets the return address (address of instruction after the delay slot, which is pc, the instruction after jal). Then pc is set to the jump target.
+
+`pc-4+4` is just `pc`. So it's `(pc & 0xF0000000) | ((I & 0x03FFFFFF) << 2)`.
+
+If pc = 0x00400120, then:
+- `0x00400120 & 0xF0000000 = 0x00000000`
+- `(0x0c10e558 & 0x03FFFFFF) << 2 = 0x0010E558 << 2 = 0x00439560`
+-
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  Target = 0x00439560 ✓
+
+OK so that seems fine. But then where does 0x400004 come from?
+
+Actually, wait. I bet the issue is different. Let me check my `_entry` value again.
+
+`const _entry = er32(0x18);`
+
+The ELF header is at the beginning of the file. The LOAD segment starts at file offset 0x0 and maps to vaddr 0x400000. So when I load the segment, I'm copying the ELF header itself into memory at address 0x400000
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] .
+
+At offset 0x18 in the file, we have the entry point field of the ELF header. Let me verify this is correct by reading the raw bytes:
+
+From the readelf output: `Entry point address: 0x400110`
+
+So er32(0x18) should return 0x400110. That seems correct.
+
+But wait, actually the LOAD segment includes the ELF header and program headers:
+```
+LOAD           0x000000 0x00400000 0x00400000 0x56514 0x56514 R E 0x10000
+```
+
+This
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  loads 0x56514 bytes from file offset 0 to vaddr 0x400000. The .text section starts at 0x400110 and the ELF header occupies the first 0xD8 bytes or so.
+
+So when I load the segments, I copy the ELF header to address 0x400000-0x4000D7, then the .MIPS.abiflags, .reginfo, etc. and then .text starts at 0x400110.
+
+This is all fine. The CPU starts at pc =
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  _entry = 0x400110.
+
+Hmm, let me actually trace through what happens step by step:
+
+1. pc = 0x400110
+2. Read instruction at 0x400110: 0x27bdffe8 (addiu sp,sp,-24)
+3. op = 0x27bdffe8 >>> 26 = 9
+4. case 8: case 9: R[rt]=(R[rs]+si)>>>0
+5. rs = (0x27bdffe8 >>>
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  21) & 31 = 0x13 & 31 = 29 (sp)
+6. rt = (0x27bdffe8 >>> 16) & 31 = 0x1D & 31 = 29 (sp)
+7. si = (0x27bdffe8 << 16) >> 16 = (0xffe8 << 16) >> 16 = -24
+8. R[29] = (R[29] + (-24)) >>> 0 = (0x7FFF0000 - 24) >>> 
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 0 = 0x7FFEFFF8
+9. pc = 0x400114
+
+Next instruction:
+10. Read instruction at 0x400114: 0xafbf0014 (sw ra,20(sp))
+11. op = 0xafbf0014 >>> 26 = 43 (0x2b)
+12. case 43: w32((R[rs]+si)>>>0, R[rt])
+13. rs = (0xafbf0014 >>> 21) & 31 = 29 (sp)
+14. rt = (0xafbf0014 >>> 16) & 31 = 31 (ra)
+15
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] . si = (0xafbf0014 << 16) >> 16 = 20
+16. w32(0x7FFEFFF8 + 20, R[31])
+17. pc = 0x400118
+
+Next:
+18. Read instruction at 0x400118: 0x24040000 (li a0, 0)
+19. op = 0x24040000 >>> 26 = 9 (addiu)
+20. R[4] = (R[0] + 0) >>> 0 = 0
+21. pc = 0x40011c
+
+Next
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] :
+22. Read instruction at 0x40011c: 0x0c10e558 (jal 439560)
+23. op = 0x0c10e558 >>> 26 = 3 (jal)
+24. R[31] = 0x400120 (pc after increment)
+
+Wait, pc is already 0x400120 at this point because we did pc = (pc + 4)>>>0 = (0x40011c + 4) >>> 0 = 0x400120.
+
+2
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 5. target = ((0x400120 - 4 + 4) & 0xF0000000) | ((0x0c10e558 & 0x03FFFFFF) << 2)
+         = (0x400120 & 0xF0000000) | (0x0010E558 << 2)
+         = 0x40000000 | 0x00439560
+         = 0x40439560
+
+THAT'S THE BUG! 0x40439560 instead
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  of 0x00439560!
+
+The problem is that addresses like 0x00400120 have the form 0x004xxxxx. When we AND with 0xF0000000, we get 0x00000000, not 0x40000000.
+
+BUT WAIT: the readelf shows the entry as 0x400110. In hex, that's:
+- 0x400110 = 4,194,576
+
+And
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  0x400120 & 0xF0000000 = 0x00000000 (since 0x400120 = 0x00400120).
+
+Hmm, let me recalculate. 0x400120 in binary:
+0000 0000 0100 0000 0000 0001 0010 0000
+
+& 0xF0000000 = 1111 0000 0000 0000 0000 0000 0000 0000
+
+Result: 0000 0
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 000 0000 0000 0000 0000 0000 0000 = 0x00000000
+
+So `(0x400120 & 0xF0000000) | (0x0010E558 << 2)` = `0x00000000 | 0x00439560` = `0x00439560` ✓
+
+Oh! I was wrong
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  earlier. 0x400120 & 0xF0000000 is 0, not 0x40000000. Because 0x400120 is really 0x00400120 in a 32-bit value. Let me verify: 0x400120 in 32 bits is 0x00400120. 0x00400120 & 0xF0000000 = 0x00000000.
+
+So the jal target computation is correct:
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  0x00439560 = 0x439560.
+
+OK so the jal should be fine. Then why is the program hitting 0x400004?
+
+Hmm, let me think about this differently. Maybe the doomgeneric_Create function eventually calls something that jumps to 0x400004.
+
+Actually, the error says "SPECIAL fn=1 at 0x400004". This is the very beginning of the loaded binary. The instruction at 0x400004 would be bytes from the ELF header (since
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  the LOAD segment starts at file offset 0, vaddr 0x400000).
+
+At file offset 4, the bytes are part of the ELF magic: 01 01 01 00 (class, data encoding, version, OS/ABI).
+
+As a little-endian 32-bit word: 0x00010101
+
+Decoding: op = 0x00010101 >>> 26 = 0, fn = 0x00010101 & 63 = 1
+
+
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] SPECIAL fn=1 is not a standard MIPS instruction (it's undefined/reserved in MIPS I/II).
+
+So somehow the program is jumping to 0x400004. This could be a bug in:
+1. The brk/syscall handler returning wrong addresses
+2. Memory corruption from incorrect writes
+3. A bug in some instruction that corrupts a register
+
+Actually, let me reconsider. The error message is:
+```
+SPECIAL fn=1 at 0x400004
+```
+
+But `pc-4>>>0` in the error message: if pc = 0x40000
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 8, then pc-4 = 0x400004. That means the instruction at 0x400004 caused the error.
+
+Hmm, maybe there's a bug in one of the instructions I haven't handled. Let me check what 0x400004 contains in the loaded binary. It's the ELF header area. The bytes at file offset 4-7 are: 01 01 01 00, which as a LE 32-bit word is 0x00010101.
+
+That has op=0 (SPECIAL) and fn=1,
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  which is unhandled. So somehow execution reached 0x400004.
+
+This could happen if:
+1. A function pointer or return address got corrupted to be 0x400004
+2. The malloc/heap area overlaps with the code/data area
+
+Wait, let me check the heap start. I set heapEnd = 0x404b2000. But the `_end` symbol is at 0x404b1790. And the BSS section is at 0x4750c0 with size 0x4003c6d0, making
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  the end 0x4750c0 + 0x4003c6d0 = 0x4047EC90 + ... wait that doesn't look right.
+
+0x4750c0 + 0x4003c6d0:
+0x04750c0 + 0x4003c6d0 = 0x404b1790. That matches _end!
+
+So _end = 0x404b1790, and my heapEnd = 0x404b2000 is after _end.
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  Good.
+
+Hmm, let me look at what the basic_malloc function at 0x439ae8 does. It has a static buddy allocator that uses memory at 0x4b0b40 + 2708 = 0x4b0b40 + 0xAB4 = ... wait.
+
+Looking at the disassembly:
+```
+439b30:       3c02004b        lui     v0,0x4b
+...
+439b40:       244b0a94        addiu   t3,v0,2708
+```
+
+So t3 = 0x004b0000 + 0x0a94 = 0x4
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] b0a94. That's the free list array in BSS.
+
+And:
+```
+439c34:       3c05004b        lui     a1,0x4b
+439c38:       3c014000        lui     at,0x4000
+439c3c:       8ca40b14        lw      a0,2836(a1)
+```
+
+a0 = *(0x4b0000 + 0x0b14) = *(0x4b0b14) - this is the "water
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] mark" or current high-water mark of the buddy allocator.
+
+```
+439c44:       0026082b        sltu    at,at,a2
+```
+
+This checks if `0x40000000 < a2`. Since a2 = a0 + v1 (watermark + requested size), and the buddy allocator is in the BSS area (0x404xxxxx area), a2 would be in the 0x4xxxxxxx range, which is less than 0x40000000. Wait, that can't be right.
+
+Actually: `lui at, 0x4000` sets
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  at = 0x40000000. Then `sltu at, at, a2` checks if 0x40000000 < a2. If a2 (new watermark) is less than 0x40000000 (which it is, since BSS ends at ~0x404b1790), then 0x40000000 < 0x404bxxxx is true, so at = 1, and `bnez at, 439c68` would branch to return 0 (failure).
+
+Wait
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] , that means if the buddy allocator's watermark goes above 0x40000000, the allocation fails? That seems like a very low limit. Actually, wait, 0x404b1790 is > 0x40000000, so this check would always be true and allocation would always fail!
+
+Hmm, but the program prints "zone memory: 0x5e6b50, 600000 allocated for zone" successfully, so the initial allocation works. Let me re-read.
+
+Actually, the 0x40000000 check is `
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] sltu at, at, a2` where at = 0x40000000 and a2 = new watermark. This checks if 0x40000000 < new_watermark. If true, it means the watermark exceeds 1GB, which is a reasonable sanity check. The watermark starts at _end (0x404b1790) and the buddy allocator gives memory from that area. So after the initial zone allocation of 600000 (0x927C0) bytes, the watermark would be around 0x404b1790 + 0x927C0 = 
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 0x40543F50. That's still less than 0x40000000... wait, 0x40543F50 > 0x40000000. So this check would fail!
+
+Actually, 0x40543F50 is 0x40543F50 which is definitely > 0x40000000. So the sltu check `0x40000000 < 0x40543F50` would be true, meaning
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  the function would return 0 (failure).
+
+But wait, the zone allocation succeeds and prints "zone memory: 0x5e6b50, 600000 allocated for zone". Let me look at the code path more carefully.
+
+Actually, I realize I was confused. Let me re-read the basic_malloc code at 0x439c34:
+
+```
+439c34:       3c05004b        lui     a1,0x4b        # a1 = 0x4b0000
+439c38:       3c
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 014000        lui     at,0x4000      # at = 0x40000000
+439c3c:       8ca40b14        lw      a0,2836(a1)    # a0 = *(0x4b0000 + 0x0b14) = *(0x4b0b14)
+439c40:       00c53021        addu    a2,a0,v1       # a2 = a0 + v1 (current_size + requested_size
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] )
+439c44:       0021082b        sltu    at,at,a2       # at = (0x40000000 < a2) ? 1 : 0
+439c48:       14200007        bnez    at,439c68      # if overflow, return 0
+```
+
+Wait, `lui at, 0x4000` sets at to 0x40000000. But in MIPS o32, the registers are 32 bits. 0x400000
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 00 is a valid 32-bit unsigned value. The BSS end is at 0x404b1790, so the watermark `a0` (at `*(0x4b0b14)`) would be in the range of 0x404b1790 or higher (after previous allocations).
+
+So `a2 = a0 + v1` would be 0x404b1790 + size. For the zone allocation, size = 600000 ≈ 0x927C0. So a2 ≈ 0x404b1790 + 0x92
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 7C0 = 0x40543F50.
+
+`sltu at, 0x40000000, 0x40543F50` → 0x40000000 < 0x40543F50 → true (1).
+`bnez at, 439c68` → branches to return 0.
+
+So the buddy allocator DOES fail! But then how does the zone get allocated?
+
+Looking at the original I_ZoneBase function:
+```
+40e30c:       00112500        sll     a0,s1,0x14     
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  # a0 = default_ram << 20
+40e310:       3c14fff0        lui     s4,0xfff0        # s4 = 0xfff00000 (mask)
+40e314:       0251082a        slt     at,s2,s1         # s2 < s1?
+40e318:       14200017        bnez    at,40e378        # error if s2 < s1
+40e320:       ae040000        sw      a0,0(s0)         # *size = a0
+40e
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 324:       0c10e65c        jal     439970 <malloc>
+40e328:       0094a821        addu    s5,a0,s4         # s5 = a0 + 0xfff00000 = (default_ram << 20) + 0xfff00000
+```
+
+So it calls malloc(default_ram << 20) = malloc(6 * 1024 * 1024) = malloc(6291456).
+
+And 6291456 = 0x600000.
+
+Then
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  s5 = 0x600000 + 0xfff00000 = 0xfff60000 (wraps to 0xfff60000 in 32-bit unsigned).
+
+If malloc fails (returns 0):
+```
+40e32c:       2652ffff        addiu   s2,s2,-1         # s2--
+40e330:       1040fff8        beqz    v0,40e314        # retry with smaller size
+```
+
+So it decrements s
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 2 (which started at s1 = default_ram = 6) and retries. So it tries 6MB, then 5MB, then 4MB, etc. until malloc succeeds or s2 < s1.
+
+The buddy allocator has a limit at 0x40000000. The BSS ends at 0x404b1790. The buddy allocator starts allocating from there. So:
+
+- For 6MB (0x600000): need watermark up to 0x404b1790 + 0x600000 = 0x404AB790. Since 0x40000000 < 0x4
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 04AB790, this fails.
+- For 5MB, 4MB, etc.: all fail for the same reason.
+- For 0MB: malloc(0) returns 0.
+
+Wait, actually let me re-read. The loop goes from 6 down to... it checks `slt at, s2, s1` where s2 starts equal to s1. After the first decrement, s2 = 5 < 6 = s1, so it would stop. Actually that can't be right because the zone does get allocated.
+
+Hmm wait, maybe I'm wrong about the `lui at, 0x4000` check. Let me re-examine:
+
+```
+439c34:       3c05004b
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed]         lui     a1,0x4b
+439c38:       3c014000        lui     at,0x4000
+```
+
+`lui at, 0x4000` sets at = 0x40000000. But this is in the basic_malloc function. Maybe the check isn't about 0x40000000 but about 1GB? Since 0x40000000 = 1073741824 = 1GB. And the buddy allocator is checking if
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  the total allocation would exceed 1GB.
+
+Hmm, but BSS ends at ~0x404b1790 ≈ 1078 million, which is just over 1GB. So the buddy allocator's "watermark + size > 1GB" check would indeed fail.
+
+But the zone DOES get allocated! The output says "zone memory: 0x5e6b50, 600000 allocated for zone". And 0x5e6b50 is in the BSS area (0x4750c0 to 0x404b17
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 90).
+
+Wait, 0x5e6b50 is between 0x4750c0 and 0x404b1790? Let me check: 0x5e6b50 is about 6.2 million. 0x4750c0 is about 4.67 million. 0x404b1790 is about 1078 million.
+
+0x5e6b50 = 6,187,600
+0x4750c0 = 4,673,728
+
+0x5
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] e6b50 > 0x4750c0, so it's within the BSS section (which starts at 0x4750c0 and extends to 0x404b1790).
+
+But wait, 0x5e6b50 is only about 6MB. And the BSS section extends from 0x4750c0 to 0x404b1790, which is about 1078MB. So the buddy allocator starts at 0x404b1790 (after BSS) and allocates from
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  there.
+
+But the zone memory is at 0x5e6b50, which is INSIDE the BSS section, not after it. So it must be that the buddy allocator's memory pool starts at 0x404b1790, and when it allocates 600000 bytes, it returns a pointer within that pool.
+
+Wait, 0x5e6b50 is about 6.18 million. And the buddy allocator pool starts at _end = 0x404b1790. But 0x5e6b50 is way below 0x404b17
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 90. So 0x5e6b50 can't be from the buddy allocator's post-BSS pool.
+
+Hmm, I think I'm confusing virtual addresses. Let me reconsider.
+
+Actually, looking at the section headers:
+```
+  [ 6] .bss              NOBITS          004750c0 0650a0 4003c6d0 00  WA  0   0 64
+```
+
+.bss starts at 0x004750c0 with size 0x4003c6d0.
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  So .bss ends at 0x004750c0 + 0x4003c6d0 = 0x404b1790.
+
+The _end symbol is at 0x404b1790, which is the end of .bss. The buddy allocator pool would start there.
+
+Zone memory at 0x5e6b50 is within .bss (0x4750c0 to 0x404b1790). But how? The buddy allocator is supposed to start allocating from _end.
+
+OH WAIT. I think I misunderstand the buddy allocator. Let
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  me re-read basic_malloc:
+
+```
+439c34:       3c05004b        lui     a1,0x4b
+439c38:       3c014000        lui     at,0x4000
+439c3c:       8ca40b14        lw      a0,2836(a1)    # a0 = *0x4b0b14
+439c40:       00c53021        addu    a2,a0,v1       # a2 = a0 + size
+
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 439c44:       0021082b        sltu    at,at,a2       # check overflow
+439c48:       14200007        bnez    at,439c68      # if overflow, fail
+439c4c:       24020000        li      v0,0
+439c50:       3c01004b        lui     at,0x4b
+439c54:       aca60b14        sw     
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  a2,2836(a1)    # update watermark
+439c58:       24210b40        addiu   at,at,2880     # at = 0x4b0000 + 0x0b40 = 0x4b0b40
+439c5c:       00240821        addu    at,at,a0       # at = 0x4b0b40 + old_watermark
+439c60:       24220008        addiu   v0,at,8        # v0 = at + 8
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 
+439c64:       ac230000        sw      v1,0(at)       # store size at beginning of block
+```
+
+So the buddy allocator uses memory starting at 0x4b0b40 as its base. The watermark at *0x4b0b14 starts at 0 (or _end - 0x4b0b40).
+
+Wait, the base address is 0x4b0b40. And _end is at 0x404b1790. But 0x4b0b40 is within BSS.
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  So the buddy allocator uses the last 300KB or so of BSS as its allocation pool.
+
+Hmm, but 0x4b0b40 to 0x404b1790 is... wait, 0x4b0b40 is 4,918,080 and 0x404b1790 is 1,078,241,168. So there's over 1GB of space there.
+
+Wait no, 0x4b0b40 = 0x004B0B40. And 0x404b1790 = 0x404B1790. These are very different!
+
+
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 0x004B0B40 = 4,918,080
+0x404B1790 = 1,078,241,168
+
+The BSS section goes from 0x004750c0 to 0x404B1790. The buddy allocator uses memory starting at 0x004B0B40, which is within BSS. The watermark at *0x4b0b14 is initially 0, and it grows from there. The allocated memory is at 0x4b0b40 + watermark.
+
+For the zone allocation of
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  600000 (0x927C0) bytes:
+- Old watermark: 0
+- New watermark: 0x927C0
+- Check: 0x40000000 < 0x927C0? No (0x40000000 = 1073741824 > 599999). So the check passes!
+- Return address: 0x4b0b40 + 0 + 8 = 0x4b0b48
+
+But the output says zone memory is at 0x5e6
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] b50. Let me compute: 0x4b0b40 + 0 + 8 = 0x4b0b48. That's not 0x5e6b50.
+
+Hmm, maybe the watermark is already non-zero before the zone allocation. Let me think about what gets allocated before the zone...
+
+Actually, let me reconsider. The zone allocation happens very early. Let me check if maybe malloc is being called before zone allocation for other things.
+
+The initial startup is:
+1. __start → main(0, 0)
+2. main → doomgeneric_Create(0, 0)
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed]   
+3. doomgeneric_Create → malloc(640*400*4) for DG_ScreenBuffer
+4. doomgeneric_Create → DG_Init()
+5. doomgeneric_Create → D_DoomMain()
+6. D_DoomMain → I_ZoneBase (allocates zone memory)
+
+So before the zone, malloc(640*400*4) = malloc(1024000) = malloc(0xFA000) is called for DG_ScreenBuffer.
+
+After that allocation, watermark = 0xFA000.
+Returned pointer = 0x4b0b40 + 0 + 8 = 0x4b0b48.
+
+Then zone allocation of 0
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] x600000 bytes:
+Old watermark = 0xFA000
+New watermark = 0xFA000 + 0x600000 = 0x6FA000
+Check: 0x40000000 < 0x6FA000? No (0x6FA000 is only ~7MB, much less than 1GB). Pass!
+Return address = 0x4b0b40 + 0xFA000 + 8 = 0x5eab48
+
+Hmm, that's close to 0x5e6b50 but not exact. Let
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  me reconsider. Actually, the watermark might not be 0xFA000 exactly because the buddy allocator rounds up to the next power of 2 or something.
+
+Wait, let me re-read the basic_malloc code. Looking at the beginning:
+
+```
+439ae8:       1080005f        beqz    a0,439c68      # if size==0, return null
+439af0:       2481000f        addiu   at,a0,15       # at = size + 15
+439af4:       2402fff8        li      v0,-8          # v0 = 0xFFFFFFF8
+439af8:
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed]        24030010        li      v1,16
+439afc:       2408ffff        li      t0,-1
+439b00:       00220824        and     at,at,v0       # at = (size+15) & ~7 → round up to 8-byte boundary
+439b04:       2c220011        sltiu   v0,at,17       # if rounded_size < 17
+439b08:       0022180a        movz    v1,at,v0       # v1 = (rounded_size < 17)
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  ? 16 : rounded_size
+```
+
+So the minimum allocation size is 16 bytes, and sizes are rounded up to 8-byte boundary (at minimum 16).
+
+Then it calculates the bucket:
+```
+439b0c:       00031102        srl     v0,v1,0x4      # v0 = size >> 4
+439b10:       00020842        srl     at,v0,0x1      # at = v0 >> 1
+439b14:       2
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] c440002        sltiu   a0,v0,2        # if v0 < 2
+439b18:       25080001        addiu   t0,t0,1        # t0++
+439b1c:       1080fffc        beqz    a0,439b10      # loop
+439b20:       00201025        move    v0,at
+```
+
+This is finding the log2 of (size >> 4). It shifts right until the value is < 2,
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  counting the number of shifts.
+
+For size 1024000 (0xFA000):
+- Round up: (0xFA000 + 15) & ~7 = 0xFA000 (already aligned)
+- v1 = max(0xFA000, 16) = 0xFA000
+- v0 = 0xFA000 >> 4 = 0xFA00 = 64000
+- Loop iterations:
+  - t0=0, v0=64000 → at=32000, a0=0 (
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] continue)
+  - t0=1, v0=32000 → at=16000, a0=0 (continue)
+  - t0=2, v0=16000 → at=8000, a0=0 (continue)
+  - t0=3, v0=8000 → at=4000, a0=0 (continue)
+  - t0=4, v0=4000 → at=2000, a0=0 (continue)
+  - t0=5, v0=2000 → at=1000, a0=0 (continue)
+  - t0=6, v0=1000 → at=500, a0=0 (continue)
+  - t0=7,
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  v0=500 → at=250, a0=0 (continue)
+  - t0=8, v0=250 → at=125, a0=0 (continue)
+  - t0=9, v0=125 → at=62, a0=0 (continue)
+  - t0=10, v0=62 → at=31, a0=0 (continue)
+  - t0=11, v0=31 → at=15, a0=0 (continue)
+  - t
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 0=12, v0=15 → at=7, a0=0 (continue)
+  - t0=13, v0=7 → at=3, a0=0 (continue)
+  - t0=14, v0=3 → at=1, a0=1 (stop, since 1 < 2)
+
+So t0 = 14. Then:
+```
+439b24:       2d0a001e        sltiu   t2,t0,30       # t2 = (t0 < 30) ? 1 : 0
+439b28:      
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  25010001        addiu   at,t0,1        # at = t0 + 1 = 15
+439b2c:       2405001f        li      a1,31
+439b30:       3c02004b        lui     v0,0x4b
+439b34:       2406001f        li      a2,31
+439b38:       24040001        li      a0,1
+439b3c:       002a280b        movn    a1,at
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] ,t2       # a1 = (t0 < 30) ? t0+1 : 31 = 15
+439b40:       244b0a94        addiu   t3,v0,2708     # t3 = 0x4b0a94
+439b44:       00050880        sll     at,a1,0x2       # at = 15 * 4 = 60
+439b48:       01614821
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed]         addu    t1,t3,at       # t1 = 0x4b0a94 + 60 = 0x4b0ad0
+439b4c:       8d220000        lw      v0,0(t1)       # v0 = free_list[15]
+```
+
+So it looks for a free block of size 2^15 = 32768 << 4 = 524288 bytes from the buddy free list.
+
+Since this is the first allocation, free_list[15] is 0 (empty). Then it searches higher buckets:
+
+```
+439b50:       14400010        bnez    v
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 0,439b94      # if found, use it
+439b54:       00a03825        move    a3,a1
+439b58:       2401001e        li      at,30
+439b5c:       00a03825        move    a3,a1          # a3 = 15
+439b60:       010a080b        movn    at,t0,t2       # at = 30 (if
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  t0 >= 30) or t0 (if t0 < 30)
+439b64:       00010880        sll     at,at,0x2       # at = 30 * 4 = 120 (or t0*4)
+439b68:       01610821        addu    at,t3,at       # at = free_list[max_bucket]
+439b6c:       24240004        addiu   a0,at,4        # a0 = &free_list[max_bucket] + 4
+439b70:       10e60030        beq     a3,a
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 2,439c34   # if a3 == 31, go to fallback (allocate from pool)
+```
+
+Since all free lists are empty on first call, it walks up to the max bucket (31) and finds nothing, then falls through to 0x439c34 which is the "allocate from pool" code.
+
+Actually wait, looking more carefully, the loop at 439b70-439b8c:
+```
+439b70:       10e60030        beq     a3,a2,439c34   # if bucket==31, go to pool alloc
+439b74:       0
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 0000000        nop
+439b78:       24890004        addiu   t1,a0,4
+439b7c:       8c820004        lw      v0,4(a0)
+439b80:       24e70001        addiu   a3,a3,1        # bucket++
+439b84:       1040fffa        beqz    v0,439b70      # if empty, try next bucket
+439b88:       01202025        move    a0
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] ,t1
+```
+
+This walks through free_list[15], free_list[16], ..., free_list[30], and if all are empty (which they are on first call), it reaches a3==31 (a2) and jumps to 439c34.
+
+At 439c34:
+```
+439c34:       3c05004b        lui     a1,0x4b
+439c38:       3c014000        lui     at,0x4000
+439c3c
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] :       8ca40b14        lw      a0,2836(a1)    # a0 = *0x4b0b14 (watermark)
+439c40:       00c33021        addu    a2,a0,v1       # a2 = watermark + allocation_size
+```
+
+Wait, I need to recalculate. The allocation size (v1) was 0xFA000. And a2 = a0 + v1.
+
+The watermark at *0x4b0b14 starts at 0. After this allocation, watermark = 0xFA000.
+
+Check: `sltu at, 0x40
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 000000, 0xFA000` → 0x40000000 (1073741824) < 0xFA000 (1024000)? No (0xFA000 < 0x40000000). So at = 0, and `bnez at` doesn't branch. Good!
+
+Return value: 0x4b0b40 + 0 + 8 = 0x4b0b48.
+
+Then for the zone allocation of 0x600000:
+watermark was
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  0xFA000.
+a2 = 0xFA000 + 0x600000 = 0x6FA000.
+Check: 0x40000000 < 0x6FA000? 0x6FA000 = 7,315,456 < 1,073,741,824. No! So at = 0, no branch.
+Return: 0x4b0b40 + 0xFA000 + 8 = 0x4b0b40 + 0xFA000 + 8 = 0x5AAB48.
+
+
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] But the output says 0x5e6b50. So there must be more allocations happening before the zone alloc.
+
+Actually, maybe I miscounted. Let me just try running the VM and see what happens. The main issue right now is the SPECIAL fn=1 error at 0x400004. Let me think about what could cause this.
+
+Actually, I think the issue might be in my instruction decoding for `pc`. In my code, when I compute the jalr address, I do:
+
+```javascript
+case 9:{const t=R[rs];R[rd||31]=pc>>>0;pc=t
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] ;break}
+```
+
+But `pc` at this point is the address of the instruction AFTER the jalr (since I already did `pc = (pc+4)>>>0`). The MIPS spec says the return address for jalr is the address of the instruction two after jalr (i.e., the instruction after the delay slot). But since I'm not implementing delay slots (I'm treating the branch/jump as immediately taking effect), this should be pc (which is instruction after jalr) + 4? No, actually for jalr, the return address should be the address of the instruction after the delay slot. In my implementation without delay slots, the delay slot instruction
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  gets executed next (as part of the sequential flow), so the return address should be pc + 4? Or pc?
+
+Actually, in my implementation, I increment pc at the start of each iteration:
+```javascript
+const I = r32(pc);
+pc = (pc+4)>>>0;
+```
+
+So when we execute the instruction at address X, pc is X+4. The "next sequential instruction" is at X+4 = pc.
+
+For `jalr`, the return address is PC + 8 (address after the delay slot). But since I'm not implementing delay slots, the delay slot instruction at
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  X+4 will be executed as the next instruction. So the return address should be pc (X+4, the instruction after jalr, which becomes the return address since the delay slot is effectively consumed).
+
+Wait, but MIPS has delay slots. The instruction at X+4 (the delay slot) is always executed before the jump takes effect. In my implementation, after processing the jalr, the next iteration starts at the new pc value. So if jalr sets pc = target, the instruction at target is executed next, and the delay slot at X+4 is SKIPPED.
+
+To handle this correctly without delay slots, I need to:
+
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 1. When processing a branch/jump at address X, the instruction at X+4 is the delay slot
+2. I should execute the delay slot instruction and THEN jump to the target
+
+But that's complex. A simpler approach used by many interpreters is to just not use delay slots and set the return address to pc (X+4). This means the program counter semantics differ slightly from real MIPS, but for statically compiled code, it usually works because the compiler puts useful (or NOP) instructions in delay slots.
+
+Actually, for the __start function:
+```
+400110:       27bdffe8        addiu   sp,sp,-24
+400114:       afbf00
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 14        sw      ra,20(sp)
+400118:       24040000        li      a0,0
+40011c:       0c10e558        jal     439560 <doomgeneric_Create>
+400120:       24050000        li      a1,0          ← delay slot
+400124:       0c100fbc        jal     403ef0 <doomgeneric_Tick>
+400128:       00000000        nop                  
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  ← delay slot
+40012c:       08100049        j       400124
+400130:       00000000        nop                   ← delay slot
+```
+
+The delay slot of the first jal (at 0x40011c) is `li a1, 0` at 0x400120. This is important - it sets up the second argument before doomgeneric_Create is called.
+
+In my implementation without delay slots, when jal at 0x40011c is processed
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] :
+- R[31] = 0x400120 (pc, which is the instruction after jal)
+- pc = 0x439560
+
+The delay slot instruction at 0x400120 (`li a1, 0`) is SKIPPED. So a1 would retain whatever value it had before, which might not be 0.
+
+Similarly, at 0x400118, `li a0, 0` sets a0=0. But a1 might still be whatever was in register 5 initially.
+
+Actually,
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  since __start calls main(0, 0), and a0 and a1 are already being set to 0 by the `li` instructions before the jal, maybe it doesn't matter that the delay slot is skipped? Let me check more carefully.
+
+The function at 0x439560 is doomgeneric_Create. Let me look at the source:
+```c
+void doomgeneric_Create(int argc, char **argv)
+{
+    myargc = argc;
+    myargv = argv;
+    M_FindResponseFile();
+    DG_ScreenBuffer = malloc(DOOMGENERIC_RESX * DOOMGENERIC_RESY * 4);
+    DG_Init();
+    D_Doom
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] Main ();
+}
+```
+
+And __start calls main(0, 0) which calls doomgeneric_Create(0, 0).
+
+Wait, actually __start doesn't call main directly. Let me re-read:
+```
+00400110 <__start>:
+  400110:       27bdffe8        addiu   sp,sp,-24
+  400114:       afbf0014        sw      ra,20(sp)
+  400118:       24040000        li      a0,0
+  40011c:       0c10e558        jal     439560 <doomgeneric_Create>
+  400120:       24050000
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed]         li      a1,0
+```
+
+Oh wait, this is NOT calling main! It's calling doomgeneric_Create directly! And passing a0=0, a1=0 (with a1 set in the delay slot).
+
+But in my implementation, the delay slot at 0x400120 (`li a1, 0`) is skipped when the jal is processed. So when doomgeneric_Create is called, a1 might not be 0.
+
+However, in the __start function, a1 was never set before the jal. Since registers start at 0, a1 should be 0 at this point. So skipping the delay slot doesn
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 't matter in this specific case.
+
+But wait, the next instruction after the jal return is:
+```
+400124:       0c100fbc        jal     403ef0 <doomgeneric_Tick>
+400128:       00000000        nop
+```
+
+The return address stored for the first jal should be the address AFTER the delay slot, which is 0x400124. In my code, I set R[31] = pc = 0x400120 (the instruction after jal, not after the delay slot). So when doomgeneric_Create returns, it would return to 0x400120,
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  which is `li a1, 0`. That's not ideal but it just sets a1 to 0 and falls through to 0x400124.
+
+Actually, `li a1, 0` is `addiu a1, zero, 0` which does a1 = 0. That's harmless. Then it continues to 0x400124 which is the second jal.
+
+So the return address being off by one instruction shouldn't cause a crash here because the delay slot instruction is harmless.
+
+Hmm, but for other jal/jalr calls throughout the program, the return address being off could cause problems. Let me think about this
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] ...
+
+Actually, for MIPS binaries compiled with `noreorder` (which this binary is, based on the flags), the compiler explicitly manages delay slots. The instruction in the delay slot is supposed to be executed before the branch target. Without delay slot emulation:
+
+1. The delay slot instruction is NOT executed
+2. The return address is off by one instruction
+
+This means when a function returns (via `jr ra`), it returns to the wrong address (one instruction before where it should). This would cause the delay slot of the original call to be re-executed as a normal instruction.
+
+For `jal`, the return address should be `call_site + 8` (address after delay slot). In my code, I set
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  `R[31] = pc` where `pc = call_site + 4` (the address after jal, not after the delay slot). So the return address is `call_site + 4` instead of `call_site + 8`.
+
+When the callee returns to `call_site + 4`, it will execute the delay slot instruction again. For NOP delay slots, this is harmless. For other delay slots, this means the instruction is executed twice.
+
+In the __start function, the delay slot of the first jal is `li a1, 0`. Executing this twice is harmless (sets a1 to 0 twice).
+
+But throughout the program, there could be non
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] -NOP delay slots that cause issues. This is a fundamental problem with not emulating delay slots.
+
+To fix this properly, I need to implement delay slots. When a branch/jump is taken, instead of immediately changing pc, I should:
+1. Execute the instruction at pc (the delay slot)
+2. Then change pc to the target
+
+Let me implement this. I'll modify the interpreter to use a "pending branch" mechanism.
+
+Actually, the simplest correct approach is: when we encounter a branch/jump, execute the NEXT instruction (delay slot) first, then take the branch. I can do this by:
+
+1. Save the current pc (before the branch)
+2. Execute the next instruction normally (
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] this is the delay slot)
+3. After the delay slot, apply the branch
+
+Let me restructure the interpreter.
+
+Actually, a simpler approach: when we hit a branch/jump, we DON'T immediately change pc. Instead, we remember that a branch is pending with a target. Then on the next iteration, we execute the instruction at pc (the delay slot), and then set pc to the pending target.
+
+Let me implement this:
+
+```javascript
+let pendingBranch = 0;
+let branchPending = false;
+
+while (...) {
+  const I = r32(pc);
+  const curPC = pc;
+  pc = (pc + 4) >>> 0;  // Default next PC
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 
+  
+  if (branchPending) {
+    // The previous instruction was a branch/jump
+    // After executing this delay slot instruction, take the branch
+    pc = pendingBranch;
+    branchPending = false;
+  }
+  
+  // Execute instruction I
+  // If it's a branch/jump:
+  //   pendingBranch = target;
+  //   branchPending = true;
+  //   // Don't change pc yet - let the delay slot execute first
+}
+```
+
+Wait, but there's a subtlety. If the delay slot instruction is ALSO a branch, we have a "branch in delay slot" situation, which is generally
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  not allowed in MIPS. But let me not worry about that edge case.
+
+Actually, a cleaner approach:
+
+```javascript
+let nextPC = entry;
+
+while (...) {
+  const I = r32(nextPC);
+  pc = nextPC;
+  nextPC = (pc + 4) >>> 0;  // Default
+  
+  // Execute instruction at pc
+  // For branches/jumps, set nextPC = target
+  // The delay slot instruction at pc+4 will be executed in the next iteration
+  // before the branch takes effect
+  
+  // Wait, this doesn't work either because the branch is immediate
+
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] }
+```
+
+OK, the standard approach for MIPS delay slots:
+
+```javascript
+let nextPC = (entry + 4) >>> 0;  // Default next PC
+let branchTarget = 0;
+let branchTaken = false;
+
+while (...) {
+  const delaySlotPC = branchTaken ? branchTarget : nextPC;
+  branchTaken = false;
+  
+  const I = r32(nextPC);
+  const pc = nextPC;
+  nextPC = (pc + 4) >>> 0;
+  
+  // Execute instruction
+  // If branch/jump:
+  //   branchTaken = true;
+  //   branchTarget
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  = target;
+  //   // nextPC stays as pc+4, so delay slot executes next
+  
+  // After delay slot executes, branchTarget is applied
+  if (branchTaken) {
+    nextPC = branchTarget;
+    branchTaken = false;
+  }
+}
+```
+
+Hmm, this is getting complicated. Let me think more carefully.
+
+The MIPS pipeline is: fetch, decode, execute, memory, writeback. The branch/jump is resolved in the execute stage, but the instruction after it (delay slot) has already been fetched and is in the pipeline. So the delay slot instruction always executes.
+
+In an interpreter, the simplest correct approach is:
+
+```javascript
+let pc = entry;
+
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] let branchTarget = null;
+
+while (exitCode === null) {
+  const I = r32(pc);
+  const curPC = pc;
+  
+  if (branchTarget !== null) {
+    // The previous instruction was a branch/jump
+    // Execute the current instruction (delay slot)
+    // Then take the branch
+    pc = branchTarget;
+    branchTarget = null;
+  } else {
+    pc = (pc + 4) >>> 0;
+  }
+  
+  // Execute instruction I at address curPC
+  // ...
+  
+  // If this instruction is a branch/jump:
+  //   branchTarget = target;
+  //   // pc is already set to cur
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] PC + 4 (the delay slot)
+  //   // On the next iteration, the delay slot will execute, then we take the branch
+}
+```
+
+Wait, there's an issue. If I set pc = branchTarget at the start of the iteration, and then the instruction I'm executing (the delay slot) also modifies pc... the instruction's effect on pc would be overwritten.
+
+Let me restructure:
+
+```javascript
+let pc = entry;
+let branchTarget = null;
+
+while (exitCode === null) {
+  const curPC = pc;
+  const I = r32(curPC);
+  
+  // Advance PC
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 
+  if (branchTarget !== null) {
+    // This instruction IS the delay slot
+    pc = branchTarget;
+    branchTarget = null;
+  } else {
+    pc = (curPC + 4) >>> 0;
+  }
+  
+  // Execute instruction I
+  // For branches/jumps, set:
+  //   branchTarget = target;
+  //   // pc is already curPC + 4 (will be overwritten if needed, but this is the delay slot target)
+}
+```
+
+Hmm, let me trace through a specific example:
+
+__start:
+```
+400110: addiu sp,sp,-24    ;
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  not a branch
+400114: sw ra,20(sp)       ; not a branch
+400118: li a0,0             ; not a branch
+40011c: jal 439560          ; branch/jump
+400120: li a1,0             ; delay slot
+400124: jal 403ef0          ; branch/jump
+400128: nop                 ; delay slot
+```
+
+Iteration 1:
+- curPC = 0x400110, I
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  = addiu sp,sp,-24
+- branchTarget is null → pc = 0x400114
+- Execute addiu: R[29] = R[29] - 24
+- Not a branch
+
+Iteration 2:
+- curPC = 0x400114, I = sw ra,20(sp)
+- branchTarget is null → pc = 0x400118
+- Execute sw: mem[R[29]+20] = R[31]
+- Not a branch
+
+Iteration 3:
+- curPC = 0
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] x400118, I = li a0,0 (addiu a0,zero,0)
+- branchTarget is null → pc = 0x40011c
+- Execute: R[4] = 0
+- Not a branch
+
+Iteration 4:
+- curPC = 0x40011c, I = jal 439560
+- branchTarget is null → pc = 0x400120
+- Execute jal: R[31] = 0x400120 (or 0x400124? Need to decide)
+ 
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  - Actually, for jal, the return address should be the address after the delay slot = curPC + 8 = 0x400124
+  - Set branchTarget = 0x439560
+
+Iteration 5:
+- curPC = 0x400120 (delay slot), I = li a1,0
+- branchTarget is NOT null → pc = 0x439560
+- branchTarget = null
+- Execute li a1,0: R[5] = 0
+- Note: even though the delay slot instruction sets pc to 0x43956
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 0 via branchTarget, the delay slot itself is executed
+
+Iteration 6:
+- curPC = 0x439560 (start of doomgeneric_Create)
+- Correct! We executed the delay slot and then jumped to the target.
+
+And the return address R[31] = 0x400124, which is correct (address after the delay slot).
+
+This works! The key is that R[31] should be set to `curPC + 8` for jal, not to `pc`.
+
+Let me also handle jalr:
+- For jalr, the return address is also curPC + 8
+
+And for the return:
+
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] ```
+jr ra
+```
+- This sets branchTarget = R[31]
+- The delay slot after jr ra is executed
+- Then pc jumps to R[31]
+
+OK, I think this approach is correct. Let me implement it.
+
+Actually wait, there's one more issue. When the delay slot instruction is itself a branch... In MIPS, having a branch in a delay slot is undefined behavior (the result depends on the implementation). In practice, it shouldn't happen in well-compiled code. I'll just handle it as: if a branch instruction is in a delay slot, it sets a new branchTarget, over
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] writing the previous one. This is probably wrong but should be rare.
+
+Also, what about the case where the delay slot instruction modifies the branch target register? For example:
+```
+addiu ra, ra, 4   ; delay slot modifying ra
+jr ra             ; wait, this is wrong, the delay slot comes AFTER jr
+```
+
+Actually, the scenario is:
+```
+jr ra              ; branch target is R[31]
+nop                ; delay slot (does not modify ra)
+```
+
+Or:
+```
+jr ra              ; branch target is R[31]  
+lw ra, 0(sp)      ; delay slot modifies
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  ra
+```
+
+In this case, the branch target was already computed (R[31] at the time jr was decoded), and the delay slot modification of ra doesn't affect the jump. My implementation handles this correctly because I compute branchTarget before executing the delay slot.
+
+Actually wait, in my implementation, I compute branchTarget in the branch instruction's execution, and the delay slot executes after. So:
+
+```
+Iteration N: jr ra
+  - branchTarget = R[31]  (current value of ra)
+  - pc = curPC + 4  (will be overwritten by branchTarget on next iteration)
+  
+Iteration N+1: lw ra, 0(sp)  (delay slot)
+  - pc = branchTarget (old R[31])
+  - branchTarget = null
+  - Execute lw
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  ra, 0(sp) → R[31] = new value
+  - But pc is already set to the old branch target, so the new ra value is NOT used for this jump
+```
+
+This is correct! The delay slot can modify ra, but the jump has already been determined.
+
+OK great, I'm confident this approach works. Let me implement it.
+
+Now, for my code, I need to handle the following cases:
+1. jal: R[31] = curPC + 8; branchTarget = target
+2. jalr: R[rd||31] = curPC + 8; branchTarget = R[rs]
+3. j: branchTarget = target
+4. jr: branchTarget = R[rs]
+5. beq
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] /bne/blez/bgtz/bltz/bgez/bltzal/bgezal: branchTarget = target (if condition met); for *al variants, R[31] = curPC + 8
+
+For the condition check, I use the CURRENT values of registers at the time of the branch instruction, which is correct.
+
+Let me also note that for conditional branches, if the condition is NOT met, branchTarget should NOT be set, and the delay slot instruction should execute normally (with pc advancing to curPC + 4 + 4 = curPC + 8).
+
+Let me rewrite the interpreter with this
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  approach.
+
+Actually, I realize there's another subtlety. The `__start` function also has this pattern:
+```
+40012c:       08100049        j       400124
+400130:       00000000        nop
+```
+
+This is a loop:
+```
+400124: jal doomgeneric_Tick  ; branchTarget = 0x403ef0
+400128: nop                   ; delay slot
+40012c: j 400124              ; branchTarget = 0x400124
+400130: nop                   ; delay slot
+```
+
+With my implementation:
+1
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] . At 0x400124: jal → branchTarget = 0x403ef0, R[31] = 0x40012c
+2. At 0x400128: nop (delay slot of jal) → pc = 0x403ef0, branchTarget = null
+3. Execute at 0x403ef0 (doomgeneric_Tick)
+4. Eventually returns via jr ra → branchTarget = 0x40012c
+5. Delay slot executes → pc = 0x40012c
+6. At 0x40012c: j 0x400124 → branchTarget = 0x400124
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 
+7. At 0x400130: nop (delay slot) → pc = 0x400124
+8. Back to step 1
+
+This is correct!
+
+OK, let me now write the corrected interpreter. I'll also need to handle the case where the conditional branch is NOT taken - in that case, no branchTarget is set, and pc advances normally.
+
+Let me also simplify the code a bit. The main change is:
+1. Add a `branchTarget` variable (null means no pending branch)
+2. When processing a branch/jump, set branchTarget
+3. At the start of each iteration, if branchTarget is set, use it as pc and clear
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  it
+4. For jal/jalr/bltzal/bgezal, set R[31] = curPC + 8
+
+Wait, actually there's a problem with my approach. In the current implementation, I set pc at the beginning:
+```javascript
+if (branchTarget !== null) {
+    pc = branchTarget;
+    branchTarget = null;
+} else {
+    pc = (pc + 4) >>> 0;
+}
+```
+
+But this happens BEFORE executing the instruction. And the instruction might set branchTarget. So:
+
+Iteration N: branch instruction
+- branchTarget = null → pc = curPC + 4
+- Execute branch → branchTarget = target
+
+Iteration N+1: delay slot
+- branchTarget is not null → pc = target
+
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] - branchTarget = null
+- Execute delay slot (at curPC which is curPC_of_branch + 4)
+
+But what if the delay slot instruction ALSO modifies pc (e.g., another branch)? In that case, the delay slot's branch sets branchTarget, which would be applied in the NEXT iteration. This could lead to nested delays, which shouldn't happen in practice.
+
+I think the approach is:
+- After executing any instruction, check if branchTarget is set
+- If so, and this was a delay slot, the branchTarget has already been consumed
+
+Actually, let me just track this with a flag:
+
+```javascript
+let branchTarget = null;
+let in
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] DelaySlot = false;
+
+while (...) {
+  let nextAddr;
+  if (inDelaySlot) {
+    nextAddr = branchTarget; // After delay slot, go to branch target
+    branchTarget = null;
+    inDelaySlot = false;
+  } else {
+    nextAddr = (pc + 4) >>> 0;
+  }
+  
+  const I = r32(pc);
+  const curPC = pc;
+  pc = nextAddr;
+  
+  // Execute instruction I
+  // If branch/jump:
+  //   branchTarget = target;
+  //   inDelaySlot = true;
+  //   // pc is already set to curPC + 4
+}
+```
+
+Wait, this still
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  has the same issue. Let me think again...
+
+Actually, I think the approach I described first is correct. Let me re-implement it cleanly:
+
+```javascript
+let pendingBranch = -1; // -1 means no pending branch
+
+while (...) {
+  const curPC = pc;
+  const I = r32(curPC);
+  
+  // Determine next PC
+  if (pendingBranch >= 0) {
+    pc = pendingBranch >>> 0;
+    pendingBranch = -1;
+  } else {
+    pc = (curPC + 4) >>> 0;
+  }
+  
+  // Execute instruction
+  // For branches
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] /jumps:
+  //   pendingBranch = target;
+  //   // Note: pc is already curPC+4, which is where the delay slot is
+  //   // On the next iteration, the delay slot will execute, and THEN pc will be set to pendingBranch
+}
+```
+
+Wait, there's still an issue. When we process the branch:
+1. pc = curPC + 4 (already set)
+2. pendingBranch = target
+3. On the next iteration: curPC = pc = curPC+4 (delay slot), I = delay slot instruction
+4. At the start of next iteration: pc = pendingBranch,
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  pendingBranch = -1
+5. Execute delay slot instruction
+
+But the delay slot instruction at step 5 might want to set pc (e.g., if it's a store to some control register, or if it's another branch). Since pc was already set to pendingBranch at step 4, the delay slot's effect on pc would be overwritten.
+
+Actually, in my implementation, the delay slot instruction can set branchTarget (= pendingBranch), which would be applied AFTER the delay slot. But the delay slot IS the last instruction before the branch takes effect. So if the delay slot is also a branch, it would set pendingBranch again, and
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  the ORIGINAL branch target would be lost.
+
+In MIPS, having a branch in a delay slot is UNDEFINED BEHAVIOR. So I don't need to handle it correctly. If it happens, I'll just let the last branch win.
+
+Let me also handle the issue where the delay slot instruction doesn't modify pc directly (pc is managed by the loop, not by instructions). Instructions only set branchTarget (or in my new naming, pendingBranch).
+
+Actually, I think the simplest correct approach is:
+
+```javascript
+let branchDelay = null; // { target: number } when a branch is pending
+
+while (...) {
+  const curPC = pc;
+  const I = r32(curPC);
+  
+  // Default: advance to next instruction
+  pc = (cur
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] PC + 4) >>> 0;
+  
+  // If there was a pending branch from the previous instruction, 
+  // this instruction is the delay slot. After executing it, 
+  // apply the branch.
+  let takeBranch = null;
+  if (branchDelay !== null) {
+    takeBranch = branchDelay.target;
+    branchDelay = null;
+  }
+  
+  // Execute instruction I
+  // ...
+  
+  // If this instruction is a branch/jump:
+  //   branchDelay = { target: targetAddress };
+  
+  // Apply pending branch (from BEFORE this instruction)
+  if (takeBranch !== null) {
+    pc = takeBranch;
+  }
+}
+```
+
+Wait, this has the
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  right order:
+1. Fetch and decode
+2. Save any pending branch from before
+3. Execute the instruction (which may set a NEW pending branch)
+4. Apply the saved pending branch (from before this instruction)
+
+So:
+- If instruction N is a branch, it sets branchDelay
+- Instruction N+1 is the delay slot. It saves takeBranch = branchDelay.target, clears branchDelay, then executes (possibly setting a new branchDelay for the NEXT instruction). After execution, applies takeBranch.
+- If instruction N+1 is NOT a branch, branchDelay remains null, and pc advances normally to instruction N+2.
+
+Wait, this still has issues
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] . Let me trace through:
+
+__start:
+```
+400110: addiu sp,sp,-24    ; not a branch
+400114: sw ra,20(sp)       ; not a branch
+400118: li a0,0             ; not a branch
+40011c: jal 439560          ; sets branchDelay = { target: 0x439560, link: 0x400124 }
+400120: li a1,0             ; delay slot
+
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 400124: jal 403ef0          ; sets branchDelay = { target: 0x403ef0, link: 0x40012c }
+400128: nop                 ; delay slot
+40012c: j 400124            ; sets branchDelay = { target: 0x400124 }
+400130: nop                 ; delay slot
+```
+
+Iteration 1 (curPC=0x400110, addiu):
+- takeBranch = null (no branchDelay)
+- Execute: R[29] -=
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  24
+- Not a branch → branchDelay remains null
+- takeBranch is null → pc = 0x400114
+
+Iteration 2 (curPC=0x400114, sw):
+- takeBranch = null
+- Execute: mem[R[29]+20] = R[31]
+- Not a branch
+- pc = 0x400118
+
+Iteration 3 (curPC=0x400118, li a0,0):
+- takeBranch = null
+- Execute: R[4] = 0
+- Not a branch
+- pc = 0x40
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 011c
+
+Iteration 4 (curPC=0x40011c, jal 439560):
+- takeBranch = null
+- Execute: R[31] = 0x400124; branchDelay = { target: 0x439560 }
+- takeBranch is null → pc = 0x400120
+
+Iteration 5 (curPC=0x400120, li a1,0 = delay slot):
+- takeBranch = branchDelay.target = 0x439560; branchDelay = null
+- Execute: R[5] = 0
+- Not a branch → branchDelay remains null
+- takeBranch = 0x43956
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 0 → pc = 0x439560
+
+✓ The delay slot instruction (li a1,0) is executed, and then we jump to 0x439560.
+
+... doomgeneric_Create executes and returns to 0x400124 ...
+
+Iteration N (curPC=0x400124, jal 403ef0):
+- takeBranch = null
+- Execute: R[31] = 0x40012c; branchDelay = { target: 0x403ef0 }
+- pc = 0x400128
+
+Iteration N+1 (curPC=0x400
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 128, nop = delay slot):
+- takeBranch = 0x403ef0; branchDelay = null
+- Execute: nop
+- pc = 0x403ef0
+
+✓ doomgeneric_Tick executes and returns to 0x40012c
+
+Iteration M (curPC=0x40012c, j 400124):
+- takeBranch = null
+- Execute: branchDelay = { target: 0x400124 }
+- pc = 0x400130
+
+Iteration M+1 (curPC=0x400130, nop = delay slot):
+- takeBranch = 0x400124
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] ; branchDelay = null
+- Execute: nop
+- pc = 0x400124
+
+✓ Loop continues correctly!
+
+This approach works. Let me implement it.
+
+Now, for the return address:
+- jal: R[31] = curPC + 8 (two instructions ahead, past the delay slot)
+- jalr: R[rd||31] = curPC + 8
+- bltzal/bgezal: R[31] = curPC + 8
+
+This is because the function expects the return address to point PAST the delay slot.
+
+Let me now write the complete corrected VM.
+
+Actually, to
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  make this manageable, let me write a cleaner version using this approach.
+
+Hmm, but this is going to be very long. Let me focus on the key changes:
+1. Add `branchDelay` variable
+2. Handle delay slot mechanism in the main loop
+3. Fix return addresses to be curPC + 8
+
+Let me rewrite the whole thing one more time. This time I'll make it work correctly.
+
+Also, I need to think about the SPECIAL fn=1 error. The program was executing at 0x400004, which is in the ELF header. This means some function jumped to an invalid address. This could be due to:
+1. Incorrect return address (
+[tr-thinking call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] off by one instruction → function returns to wrong place)
+2. Memory corruption from incorrect load/store
+3. Incorrect branch target
+
+With the delay slot fix, #1 should be resolved. Let me also make sure load/store (lwl/lwr/swl/swr) are correct.
+
+Let me write the corrected VM now. I'll keep it as an interpreter (not JIT) for simplicity.
+[tr-stream call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] Let me take a step back and write a properly working VM. I found a critical bug - MIPS delay slots aren't being handled, causing incorrect return addresses.
+
+{
+  "analysis": "The error at 0x400004 (ELF header area) is likely caused by MIPS delay slots not being implemented.
+[tr-stream call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  When `jal` is called, the return address should be `PC+8` (past the delay slot), not `PC+4`. Without delay slot handling, functions return to wrong addresses causing crashes. I need to rewrite with proper delay slot support.",
+  "plan": "Rewrite vm.js with proper MIPS delay slot handling using a pending-branch mechanism.",
+  "commands": [
+    {
+      "keystrokes": "cat > /app/vm.js << 'EOFVM'\n'use strict';\nconst fs = require('fs');\nconst ELF = fs.readFileSync('/app/doomgeneric_mips');\nconst er32 =
+[tr-stream call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  o => (ELF[o]|(ELF[o+1]<<8)|(ELF[o+2]<<16)|(ELF[o+3]<<24))>>>0;\nconst er16 = o => (ELF[o]|(ELF[o+1]<<8));\nconst entry = er32(0x18);\nconst phoff=er32(0x1c),phnum=er16(0x2c),phesz=er16(0x2a);\nconst PSH=16,PSZ=1<<PSH,PM=PSZ-1,pages=[];\nfunction _gp(a){const i=a
+[tr-stream call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] >>>PSH;let p=pages[i];if(!p){p=new Uint8Array(PSZ);pages[i]=p}return p}\nfunction r8(a){a>>>=0;const p=pages[a>>>PSH];return p?p[a&PM]:0}\nfunction w8(a,v){a>>>=0;_gp(a)[a&PM]=v}\nfunction r32(a){a>>>=0;const o=a&PM,p=pages[a>>>PSH];if(!p)return 0;return o<PM-2?(p[o]|(p[o+1]<<8)|(p[o+2]<<16)|(p[o+3]<<24))>>>0:(r8(a)|(r8(a+1)<<8)|(r8(a+2)<<
+[tr-stream call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 16)|(r8(a+3)<<24))>>>0}\nfunction w32(a,v){a>>>=0;const o=a&PM,p=_gp(a);if(o<PM-2){p[o]=v;p[o+1]=v>>>8;p[o+2]=v>>>16;p[o+3]=v>>>24;return}w8(a,v);w8(a+1,v>>>8);w8(a+2,v>>>16);w8(a+3,v>>>24)}\nfunction r16(a){return r8(a)|(r8(a
+[tr-stream call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] +1)<<8)}\nfunction w16(a,v){w8(a,v);w8(a+1,v>>>8)}\nfor(let i=0;i<phnum;i++){const o=phoff+i*phesz;if(er32(o)===1){const va=er32(o+8),fsz=er32(o+16),off=er32(o+4);for(let j=0;j<fsz;j++)w8(va+j,ELF[off+j])}}\nconst fds=new Map;let nfd=3;fds.set(0,{t:'s'});fds.set(1,{t:'s'});fds.set(2,{t:'s'});\nlet heapEnd=0x404b2000,exitCode=null;\nfunction m
+[tr-stream call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] str(a){a>>>=0;const b=[];for(let c;(c=r8(a))!==0;a++){b.push(c);if(b.length>4096)break}return String.fromCharCode(...b)}\nfunction xlf(f){const ac=f&7;let s=ac===0?'r':ac===1?'w':'r+';if(f&64&&s==='r')s='r+';if(f&512)s=s.includes('+')?'w+':'w';if(f&1024)s=s.includes('+')?'a+':'a';return s}\ntry{fs.mkdirSync('/tmp',{recursive:true})}catch(e){}\nconsole.error('Running...');\nconst R=new Uint
+[tr-stream call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 32Array(32);R[29]=0x7FFF0000;\nlet pc=entry>>>0,hi=0,lo=0,branchDelay=-1,t0=Date.now(),ic=0;\n\nwhile(exitCode===null){\n  const curPC=pc,I=r32(curPC);\n  let takeBranch=-1;\n  if(branchDelay>=0){takeBranch=branchDelay;branchDelay=-1}\n  pc=(curPC+4)>>>0;\n  ic++;\n  const op=I>>>26,rs=(I>>>21)&31,rt=(
+[tr-stream call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] I>>>16)&31,rd=(I>>>11)&31;\n  if(op===0){\n    const fn=I&63,sh=(I>>>6)&31;\n    switch(fn){\n      case 0:R[rd]=(R[rt]<<sh)>>>0;break;\n      case 2:R[rd]=R[rt]>>>sh;break;\n      case 3:R[rd]=(R[rt]|0)>>sh>>>0;break;\n      case 4:R[rd]=(R[rt]<<(R[rs]&31))>>>0;break;\n      case 6:R[rd]=R[rt]>>>(R[rs]&31);break;\n      case
+[tr-stream call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  7:R[rd]=((R[rt]|0)>>(R[rs]&31))>>>0;break;\n      case 8:{branchDelay=R[rs];break}\n      case 9:{const t=R[rs];R[rd||31]=(curPC+8)>>>0;branchDelay=t;break}\n      case 10:if(R[rt]===0)R[rd]=R[rs];break;\n      case 11:if(R[rt]!==0)R[rd]=R[rs];break;\n      case 12:{\n        const num=R[2],a0=R[4],a1=R[5],a2=R[6];\n        switch(num){\n          case 0:{const e=fds.get(a0);if(!e
+[tr-stream call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] ||e.t==='s'){R[2]=e?0:(-1>>>0);break}const t=Buffer.alloc(a2);const n=fs.readSync(e.h,t,0,a2,e.p);for(let i=0;i<n;i++)w8(a1+i,t[i]);e.p+=n;R[2]=n;break}\n          case 1:{const e=fds.get(a0);if(!e){R[2]=-1>>>0;break}const t=Buffer.alloc(a2);for(let i=0;i<a2;i++)t[i]=r8(a1+i);if(e.t==='s'){try{R[2]=fs.writeSync(a0,t)}catch(er){R[2]=a2}break}const n=fs.writeSync(e.h,t,0,a2,e.p);e.p+=n;if(e
+[tr-stream call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] .p>e.sz)e.sz=e.p;R[2]=n;break}\n          case 2:{const p=mstr(a0);let hp=p;if(p==='doom.wad'||p==='./doom.wad')hp='/app/doom.wad';try{const h=fs.openSync(hp,xlf(a1),a2||0o644);const fd=nfd++;let sz=0;try{sz=fs.fstatSync(h).size}catch(er){}fds.set(fd,{t:'f',h,p:0,sz});R[2]=fd}catch(er){R[2]=-1>>>0}break}\n          case 3:{const e=fds.get(a0);if(!e){R[2]=-1>>>0;break}if(e.t==='
+[tr-stream call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] f')try{fs.closeSync(e.h)}catch(er){}fds.delete(a0);R[2]=0;break}\n          case 8:{const e=fds.get(a0);if(!e||e.t!=='f'){R[2]=-1>>>0;break}const off=(a1<<0)>>0;let np;a2===0?np=off:a2===1?np=e.p+off:np=e.sz+off;if(np<0)R[2]=-1>>>0;else{e.p=np;R[2]=np>>>0}break}\n          case 12:{if(a0===0||a0<=heapEnd)R[2]=heapEnd;else{heapEnd=a0;R[2]=a0}break}\n          case 6
+[tr-stream call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 0:exitCode=a0;break;\n          case 74:R[2]=0;break;\n          case 82:{const o=mstr(a0),n=mstr(a1);try{fs.renameSync(o,n);R[2]=0}catch(e){R[2]=-1>>>0}break}\n          case 83:{const p=mstr(a0);try{fs.mkdirSync(p,{recursive:true});R[2]=0}catch(e){R[2]=-1>>>0}break}\n          case 87:{const p=mstr(a0);try{fs.unlinkSync(p);R[2]=0}catch(e){R[2]=-1>>>0}break}\n          case 201:{const now=Math.floor(Date.now()/1000);if(a0)w32(a0,now);R[2]=
+[tr-stream call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] now;break}\n          default:console.error('Syscall '+num+' at 0x'+(curPC>>>0).toString(16));process.exit(1)}\n        break}\n      case 15:break;\n      case 16:R[rd]=hi>>>0;break;\n      case 17:hi=R[rs];break;\n      case 18:R[rd]=lo>>>0;break;\n      case 19:lo=R[rs];break;\n      case 24:{const r=BigInt(R[rs]|0)*BigInt(R[rt]|0);lo=Number(r&0xFFFFFFFFn)>>>0;hi=Number((r>>32n)&0xFFFFFFFFn)>>>0;break}\n      case 25:{const r=BigInt(R[rs]
+[tr-stream call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] >>>0)*BigInt(R[rt]>>>0);lo=Number(r&0xFFFFFFFFn)>>>0;hi=Number((r>>32n)&0xFFFFFFFFn)>>>0;break}\n      case 26:{const a=R[rs]|0,b=R[rt]|0;if(b){lo=Math.trunc(a/b)>>>0;hi=(a%b)>>>0}break}\n      case 27:{const a=R[rs]>>>0,b=R[rt]>>>0;if(b){lo=(a/b)>>>0;hi=(a%b)>>>0}break}\n      case 32:case 33:R[rd]=(R[rs]+R[rt])>>>0;break;\n      case 34:case 35:R[rd]=(R[rs]-R[rt])>>>0;break;\n     
+[tr-stream call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  case 36:R[rd]=R[rs]&R[rt];break;\n      case 37:R[rd]=R[rs]|R[rt];break;\n      case 38:R[rd]=R[rs]^R[rt];break;\n      case 39:R[rd]=~(R[rs]|R[rt])>>>0;break;\n      case 42:R[rd]=(R[rs]|0)<(R[rt]|0)?1:0;break;\n      case 43:R[rd]=(R[
+[tr-stream call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] rs]>>>0)<(R[rt]>>>0)?1:0;break;\n      case 48:case 50:case 52:case 54:break;\n      default:console.error('SPECIAL fn='+fn+' at 0x'+(curPC>>>0).toString(16));process.exit(1)}\n  }else{\n    const si=(I<<16)>>16,ui=I&0xFFFF;\n    switch(op){\n      case 1:{const sub=rt,tgt=(curPC+8+(si<<2))>>>0;\n        if(sub===0){if((R[rs]|0)<0)branchDelay=tgt}\n        else if(sub===1){
+[tr-stream call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] if((R[rs]|0)>=0)branchDelay=tgt}\n        else if(sub===16){R[31]=(curPC+8)>>>0;if((R[rs]|0)<0)branchDelay=tgt}\n        else if(sub===17){R[31]=(curPC+8)>>>0;if((R[rs]|0)>=0)branchDelay=tgt}\n        else{console.error('REGIMM '+sub+' at 0x'+(curPC>>>0).toString(16));process.exit(1)}\n        break}\n      case 2:{branchDelay=((curPC+8)&0xF0000000)|((I&0x3FFFFFF)<<2);break}\n      case 3:{R[31]=(curPC+8)>>>0;branch
+[tr-stream call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] Delay=((curPC+8)&0xF0000000)|((I&0x3FFFFFF)<<2);break}\n      case 4:{if(R[rs]===R[rt])branchDelay=(curPC+8+(si<<2))>>>0;break}\n      case 5:{if(R[rs]!==R[rt])branchDelay=(curPC+8+(si<<2))>>>0;break}\n      case 6:{if((R[rs]|0)<=0)branchDelay=(curPC+8+(si<<2))>>>0;break}\n      case
+[tr-stream call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  7:{if((R[rs]|0)>0)branchDelay=(curPC+8+(si<<2))>>>0;break}\n      case 8:case 9:R[rt]=(R[rs]+si)>>>0;break;\n      case 10:R[rt]=(R[rs]|0)<si?1:0;break;\n      case 11:R[rt]=(R[rs]>>>0)<(si>>>0)?1:0;break;\n      case 12:R[rt]=R[rs]&ui;break;\n      case 13:R[rt]=R[rs]|ui;break;\n      case 14:R[rt]=R[rs]^ui;break;\n      case 15:R[rt]=(ui<<16)>>>0;break;\n      case 16:case 1
+[tr-stream call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 7:case 18:case 19:case 20:case 21:case 22:case 23:break;\n      case 28:{const fn2=I&63;switch(fn2){\n        case 0:{const r=BigInt(R[rs]|0)*BigInt(R[rt]|0);let a=(BigInt(hi>>>0)<<32n)|BigInt(lo>>>0);a=(a+r)&0xFFFFFFFFFFFFFFFFn;lo=Number(a&0xFFFFFFFFn)>>>0;hi=Number(a>>32n)>>>0;break}\n        case 1:{const r=BigInt(R[rs]>>>0)*BigInt(R[rt]>>>0);let a=(BigInt(hi>>>0)<<32n)|BigInt(lo>>>0);a=(a
+[tr-stream call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] +r)&0xFFFFFFFFFFFFFFFFn;lo=Number(a&0xFFFFFFFFn)>>>0;hi=Number(a>>32n)>>>0;break}\n        case 2:R[rd]=Math.imul(R[rs],R[rt])>>>0;break;\n        case 32:R[rd]=R[rs]===0?32:Math.clz32(R[rs]);break;\n        case 33:R[rd]=~R[rs]===0?32:Math.clz32(~R[rs]>>>0);break;\n        default:console.error('SPEC2 fn='+fn2+' at 0x'+(curPC>>>0).toString(16));process.exit(1)}\n        break}\n      case 31:{const fn3=I&63,sh=(I>>>
+[tr-stream call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 6)&31;switch(fn3){\n        case 0:R[rt]=(R[rs]>>>sh)&((1<<(rd+1))-1);break;\n        case 4:{const m2=((1<<(rd+1-sh))-1)<<sh;R[rt]=(R[rt]&(~m2>>>0)|((R[rs]<<sh)&m2))>>>0;break}\n        case 32:{if(sh===0){let v=R[rt],r=0;for(let i=0;i<4;i++){let b=(v>>>(i*8))&0xff;b=((b&1)<<7)|((b&2)<<5)|((b&4)<<3)|((b&8)<<1)|((b&16)>>1)|((b&32)>>3
+[tr-stream call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] )|((b&64)>>5)|((b&128)>>7);r|=(b<<(i*8))}R[rd]=r>>>0}\n          else if(sh===2)R[rd]=(((R[rt]&0x00FF00FF)<<8)|((R[rt]&0xFF00FF00)>>>8))>>>0;\n          else if(sh===16)R[rd]=((R[rt]&0xFF)<<24)>>24;\n          else if(sh===24)R[rd]=((R[rt]&0xFFFF)<<16)>>16;\n          else{console.error('BSHFL '+sh+' at 0x'+(curPC>>>0).toString(16));process.exit(1)}\n          break}\n       
+[tr-stream call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  case 59:R[rt]=0;break;\n        default:console.error('SPEC3 fn='+fn3+' at 0x'+(curPC>>>0).toString(16));process.exit(1)}\n        break}\n      case 32:{R[rt]=((r8((R[rs]+si)>>>0))<<24)>>24;break}\n      case 33:{R[rt]=((r16((R[rs]+si)>>>0))<<16)>>16;break}\n      case 34:{const a=(R[rs]+si)>>>0,al=a&~3,bo=a&3,mv=r32(al);R[rt]=(bo===0?mv:bo===1?(R[rt]&
+[tr-stream call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 0xFF000000|mv>>>8)>>>0:bo===2?(R[rt]&0xFFFF0000|mv>>>16)>>>0:(R[rt]&0xFFFFFF00|mv>>>24)>>>0);break}\n      case 35:R[rt]=r32((R[rs]+si)>>>0);break;\n      case 36:R[rt]=r8((R[rs]+si)>>>0);break;\n      case 37:R[rt]=r16((R[rs]+si)>>>0);break;\n      case 38:{const a=(R[rs]+si)>>>0,al=a&~3,bo=a&3,mv=r32(al);R[rt]=(bo===0?(R[rt]&0x
+[tr-stream call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 00FFFFFF|mv<<24)>>>0:bo===1?(R[rt]&0x0000FFFF|mv<<16)>>>0:bo===2?(R[rt]&0x000000FF|mv<<8)>>>0:mv);break}\n      case 40:w8((R[rs]+si)>>>0,R[rt]);break;\n      case 41:w16((R[rs]+si)>>>0,R[rt]);break;\n      case 42:{const a=(R[rs]+si)>>>0,al=a&~3,bo=a&3,old=r32(al),v=R[rt];w32(al,bo===0?v:bo===1?(old&0xFF000000|v&0x00FFFFFF
+[tr-stream call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] )>>>0:bo===2?(old&0xFFFF0000|v&0x0000FFFF)>>>0:(old&0xFFFFFF00|v&0x000000FF)>>>0);break}\n      case 43:w32((R[rs]+si)>>>0,R[rt]);break;\n      case 46:{const a=(R[rs]+si)>>>0,al=a&~3,bo=a&3,old=r32(al),v=R[rt];w32(al,bo===0?(
+[tr-stream call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] old&0x00FFFFFF|v<<24)>>>0:bo===1?(old&0x0000FFFF|v<<16)>>>0:bo===2?(old&0x000000FF|v<<8)>>>0:v);break}\n      case 48:case 49:case 50:case 51:case 52:case 53:case 54:case 55:\n      case 56:case 57:case 58:case 59:case 60:case 61:case 62:case 63:break;\n      default:console.error('OP='+op+' at 0x'+(curPC>>>0).toString(16));process.exit(1)}\n  }\n  if
+[tr-stream call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] (takeBranch>=0)pc=takeBranch>>>0;\n  R[0]=0;\n}\nconst dt=(Date.now()-t0)/1000;\nconsole.error('Exit: '+exitCode+', '+ic+' insns in '+dt.toFixed(1)+'s ('+Math.floor(ic/dt)+' ips)');\nEOFVM\n",
+      "duration": 0.5
+    }
+  ]
+}
+
+[tr-stream call-0059:worker:xiaomi/mimo-v2.5-pro-ultraspeed] worker.done finish=stop cost_microdollars=225072
+[tr-stream call-0059:xiaomi/mimo-v2.5-pro-ultraspeed] Let me take a step back and write a properly working VM. I found a critical bug - MIPS delay slots aren't being handled, causing incorrect return addresses.
+
+{
+  "analysis": "The error at 0x400004 (ELF header area) is likely caused by MIPS delay slots not being implemented. When `jal` is called, the return address should be `PC+8` (past the delay slot), not `PC+4`. Without delay slot handling, functions return to wrong addresses causing crashes. I need to rewrite with proper delay slot support.",
+  "plan": "Rewrite vm.js with proper MIPS delay slot handling using a pending-branch mechanism.",
+  "commands": [
+    {
+      "keystrokes": "cat > /app/vm.js << 'EOFVM'\n'use strict';\nconst fs = require('fs');\nconst ELF = fs.readFileSync('/app/doomgeneric_mips');\nconst er32 = o => (ELF[o]|(ELF[o+1]<<8)|(ELF[o+2]<<16)|(ELF[o+3]<<24))>>>0;\nconst er16 = o => (ELF[o]|(ELF[o+1]<<8));\nconst entry = er32(0x18);\nconst phoff=er32(0x1c),phnum=er16(0x2c),phesz=er16(0x2a);\nconst PSH=16,PSZ=1<<PSH,PM=PSZ-1,pages=[];\nfunction _gp(a){const i=a>>>PSH;let p=pages[i];if(!p){p=new Uint8Array(PSZ);pages[i]=p}return p}\nfunction r8(a){a>>>=0;const p=pages[a>>>PSH];return p?p[a&PM]:0}\nfunction w8(a,v){a>>>=0;_gp(a)[a&PM]=v}\nfunction r32(a){a>>>=0;const o=a&PM,p=pages[a>>>PSH];if(!p)return 0;return o<PM-2?(p[o]|(p[o+1]<<8)|(p[o+2]<<16)|(p[o+3]<<24))>>>0:(r8(a)|(r8(a+1)<<8)|(r8(a+2)<<16)|(r8(a+3)<<24))>>>0}\nfunction w32(a,v){a>>>=0;const o=a&PM,p=_gp(a);if(o<PM-2){p[o]=v;p[o+1]=v>>>8;p[o+2]=v>>>16;p[o+3]=v>>>24;return}w8(a,v);w8(a+1,v>>>8);w8(a+2,v>>>16);w8(a+3,v>>>24)}\nfunction r16(a){return r8(a)|(r8(a+1)<<8)}\nfunction w16(a,v){w8(a,v);w8(a+1,v>>>8)}\nfor(let i=0;i<phnum;i++){const o=phoff+i*phesz;if(er32(o)===1){const va=er32(o+8),fsz=er32(o+16),off=er32(o+4);for(let j=0;j<fsz;j++)w8(va+j,ELF[off+j])}}\nconst fds=new Map;let nfd=3;fds.set(0,{t:'s'});fds.set(1,{t:'s'});fds.set(2,{t:'s'});\nlet heapEnd=0x404b2000,exitCode=null;\nfunction mstr(a){a>>>=0;const b=[];for(let c;(c=r8(a))!==0;a++){b.push(c);if(b.length>4096)break}return String.fromCharCode(...b)}\nfunction xlf(f){const ac=f&7;let s=ac===0?'r':ac===1?'w':'r+';if(f&64&&s==='r')s='r+';if(f&512)s=s.includes('+')?'w+':'w';if(f&1024)s=s.includes('+')?'a+':'a';return s}\ntry{fs.mkdirSync('/tmp',{recursive:true})}catch(e){}\nconsole.error('Running...');\nconst R=new Uint32Array(32);R[29]=0x7FFF0000;\nlet pc=entry>>>0,hi=0,lo=0,branchDelay=-1,t0=Date.now(),ic=0;\n\nwhile(exitCode===null){\n  const curPC=pc,I=r32(curPC);\n  let takeBranch=-1;\n  if(branchDelay>=0){takeBranch=branchDelay;branchDelay=-1}\n  pc=(curPC+4)>>>0;\n  ic++;\n  const op=I>>>26,rs=(I>>>21)&31,rt=(I>>>16)&31,rd=(I>>>11)&31;\n  if(op===0){\n    const fn=I&63,sh=(I>>>6)&31;\n    switch(fn){\n      case 0:R[rd]=(R[rt]<<sh)>>>0;break;\n      case 2:R[rd]=R[rt]>>>sh;break;\n      case 3:R[rd]=(R[rt]|0)>>sh>>>0;break;\n      case 4:R[rd]=(R[rt]<<(R[rs]&31))>>>0;break;\n      case 6:R[rd]=R[rt]>>>(R[rs]&31);break;\n      case 7:R[rd]=((R[rt]|0)>>(R[rs]&31))>>>0;break;\n      case 8:{branchDelay=R[rs];break}\n      case 9:{const t=R[rs];R[rd||31]=(curPC+8)>>>0;branchDelay=t;break}\n      case 10:if(R[rt]===0)R[rd]=R[rs];break;\n      case 11:if(R[rt]!==0)R[rd]=R[rs];break;\n      case 12:{\n        const num=R[2],a0=R[4],a1=R[5],a2=R[6];\n        switch(num){\n          case 0:{const e=fds.get(a0);if(!e||e.t==='s'){R[2]=e?0:(-1>>>0);break}const t=Buffer.alloc(a2);const n=fs.readSync(e.h,t,0,a2,e.p);for(let i=0;i<n;i++)w8(a1+i,t[i]);e.p+=n;R[2]=n;break}\n          case 1:{const e=fds.get(a0);if(!e){R[2]=-1>>>0;break}const t=Buffer.alloc(a2);for(let i=0;i<a2;i++)t[i]=r8(a1+i);if(e.t==='s'){try{R[2]=fs.writeSync(a0,t)}catch(er){R[2]=a2}break}const n=fs.writeSync(e.h,t,0,a2,e.p);e.p+=n;if(e.p>e.sz)e.sz=e.p;R[2]=n;break}\n          case 2:{const p=mstr(a0);let hp=p;if(p==='doom.wad'||p==='./doom.wad')hp='/app/doom.wad';try{const h=fs.openSync(hp,xlf(a1),a2||0o644);const fd=nfd++;let sz=0;try{sz=fs.fstatSync(h).size}catch(er){}fds.set(fd,{t:'f',h,p:0,sz});R[2]=fd}catch(er){R[2]=-1>>>0}break}\n          case 3:{const e=fds.get(a0);if(!e){R[2]=-1>>>0;break}if(e.t==='f')try{fs.closeSync(e.h)}catch(er){}fds.delete(a0);R[2]=0;break}\n          case 8:{const e=fds.get(a0);if(!e||e.t!=='f'){R[2]=-1>>>0;break}const off=(a1<<0)>>0;let np;a2===0?np=off:a2===1?np=e.p+off:np=e.sz+off;if(np<0)R[2]=-1>>>0;else{e.p=np;R[2]=np>>>0}break}\n          case 12:{if(a0===0||a0<=heapEnd)R[2]=heapEnd;else{heapEnd=a0;R[2]=a0}break}\n          case 60:exitCode=a0;break;\n          case 74:R[2]=0;break;\n          case 82:{const o=mstr(a0),n=mstr(a1);try{fs.renameSync(o,n);R[2]=0}catch(e){R[2]=-1>>>0}break}\n          case 83:{const p=mstr(a0);try{fs.mkdirSync(p,{recursive:true});R[2]=0}catch(e){R[2]=-1>>>0}break}\n          case 87:{const p=mstr(a0);try{fs.unlinkSync(p);R[2]=0}catch(e){R[2]=-1>>>0}break}\n          case 201:{const now=Math.floor(Date.now()/1000);if(a0)w32(a0,now);R[2]=now;break}\n          default:console.error('Syscall '+num+' at 0x'+(curPC>>>0).toString(16));process.exit(1)}\n        break}\n      case 15:break;\n      case 16:R[rd]=hi>>>0;break;\n      case 17:hi=R[rs];break;\n      case 18:R[rd]=lo>>>0;break;\n      case 19:lo=R[rs];break;\n      case 24:{const r=BigInt(R[rs]|0)*BigInt(R[rt]|0);lo=Number(r&0xFFFFFFFFn)>>>0;hi=Number((r>>32n)&0xFFFFFFFFn)>>>0;break}\n      case 25:{const r=BigInt(R[rs]>>>0)*BigInt(R[rt]>>>0);lo=Number(r&0xFFFFFFFFn)>>>0;hi=Number((r>>32n)&0xFFFFFFFFn)>>>0;break}\n      case 26:{const a=R[rs]|0,b=R[rt]|0;if(b){lo=Math.trunc(a/b)>>>0;hi=(a%b)>>>0}break}\n      case 27:{const a=R[rs]>>>0,b=R[rt]>>>0;if(b){lo=(a/b)>>>0;hi=(a%b)>>>0}break}\n      case 32:case 33:R[rd]=(R[rs]+R[rt])>>>0;break;\n      case 34:case 35:R[rd]=(R[rs]-R[rt])>>>0;break;\n      case 36:R[rd]=R[rs]&R[rt];break;\n      case 37:R[rd]=R[rs]|R[rt];break;\n      case 38:R[rd]=R[rs]^R[rt];break;\n      case 39:R[rd]=~(R[rs]|R[rt])>>>0;break;\n      case 42:R[rd]=(R[rs]|0)<(R[rt]|0)?1:0;break;\n      case 43:R[rd]=(R[rs]>>>0)<(R[rt]>>>0)?1:0;break;\n      case 48:case 50:case 52:case 54:break;\n      default:console.error('SPECIAL fn='+fn+' at 0x'+(curPC>>>0).toString(16));process.exit(1)}\n  }else{\n    const si=(I<<16)>>16,ui=I&0xFFFF;\n    switch(op){\n      case 1:{const sub=rt,tgt=(curPC+8+(si<<2))>>>0;\n        if(sub===0){if((R[rs]|0)<0)branchDelay=tgt}\n        else if(sub===1){if((R[rs]|0)>=0)branchDelay=tgt}\n        else if(sub===16){R[31]=(curPC+8)>>>0;if((R[rs]|0)<0)branchDelay=tgt}\n        else if(sub===17){R[31]=(curPC+8)>>>0;if((R[rs]|0)>=0)branchDelay=tgt}\n        else{console.error('REGIMM '+sub+' at 0x'+(curPC>>>0).toString(16));process.exit(1)}\n        break}\n      case 2:{branchDelay=((curPC+8)&0xF0000000)|((I&0x3FFFFFF)<<2);break}\n      case 3:{R[31]=(curPC+8)>>>0;branchDelay=((curPC+8)&0xF0000000)|((I&0x3FFFFFF)<<2);break}\n      case 4:{if(R[rs]===R[rt])branchDelay=(curPC+8+(si<<2))>>>0;break}\n      case 5:{if(R[rs]!==R[rt])branchDelay=(curPC+8+(si<<2))>>>0;break}\n      case 6:{if((R[rs]|0)<=0)branchDelay=(curPC+8+(si<<2))>>>0;break}\n      case 7:{if((R[rs]|0)>0)branchDelay=(curPC+8+(si<<2))>>>0;break}\n      case 8:case 9:R[rt]=(R[rs]+si)>>>0;break;\n      case 10:R[rt]=(R[rs]|0)<si?1:0;break;\n      case 11:R[rt]=(R[rs]>>>0)<(si>>>0)?1:0;break;\n      case 12:R[rt]=R[rs]&ui;break;\n      case 13:R[rt]=R[rs]|ui;break;\n      case 14:R[rt]=R[rs]^ui;break;\n      case 15:R[rt]=(ui<<16)>>>0;break;\n      case 16:case 17:case 18:case 19:case 20:case 21:case 22:case 23:break;\n      case 28:{const fn2=I&63;switch(fn2){\n        case 0:{const r=BigInt(R[rs]|0)*BigInt(R[rt]|0);let a=(BigInt(hi>>>0)<<32n)|BigInt(lo>>>0);a=(a+r)&0xFFFFFFFFFFFFFFFFn;lo=Number(a&0xFFFFFFFFn)>>>0;hi=Number(a>>32n)>>>0;break}\n        case 1:{const r=BigInt(R[rs]>>>0)*BigInt(R[rt]>>>0);let a=(BigInt(hi>>>0)<<32n)|BigInt(lo>>>0);a=(a+r)&0xFFFFFFFFFFFFFFFFn;lo=Number(a&0xFFFFFFFFn)>>>0;hi=Number(a>>32n)>>>0;break}\n        case 2:R[rd]=Math.imul(R[rs],R[rt])>>>0;break;\n        case 32:R[rd]=R[rs]===0?32:Math.clz32(R[rs]);break;\n        case 33:R[rd]=~R[rs]===0?32:Math.clz32(~R[rs]>>>0);break;\n        default:console.error('SPEC2 fn='+fn2+' at 0x'+(curPC>>>0).toString(16));process.exit(1)}\n        break}\n      case 31:{const fn3=I&63,sh=(I>>>6)&31;switch(fn3){\n        case 0:R[rt]=(R[rs]>>>sh)&((1<<(rd+1))-1);break;\n        case 4:{const m2=((1<<(rd+1-sh))-1)<<sh;R[rt]=(R[rt]&(~m2>>>0)|((R[rs]<<sh)&m2))>>>0;break}\n        case 32:{if(sh===0){let v=R[rt],r=0;for(let i=0;i<4;i++){let b=(v>>>(i*8))&0xff;b=((b&1)<<7)|((b&2)<<5)|((b&4)<<3)|((b&8)<<1)|((b&16)>>1)|((b&32)>>3)|((b&64)>>5)|((b&128)>>7);r|=(b<<(i*8))}R[rd]=r>>>0}\n          else if(sh===2)R[rd]=(((R[rt]&0x00FF00FF)<<8)|((R[rt]&0xFF00FF00)>>>8))>>>0;\n          else if(sh===16)R[rd]=((R[rt]&0xFF)<<24)>>24;\n          else if(sh===24)R[rd]=((R[rt]&0xFFFF)<<16)>>16;\n          else{console.error('BSHFL '+sh+' at 0x'+(curPC>>>0).toString(16));process.exit(1)}\n          break}\n        case 59:R[rt]=0;break;\n        default:console.error('SPEC3 fn='+fn3+' at 0x'+(curPC>>>0).toString(16));process.exit(1)}\n        break}\n      case 32:{R[rt]=((r8((R[rs]+si)>>>0))<<24)>>24;break}\n      case 33:{R[rt]=((r16((R[rs]+si)>>>0))<<16)>>16;break}\n      case 34:{const a=(R[rs]+si)>>>0,al=a&~3,bo=a&3,mv=r32(al);R[rt]=(bo===0?mv:bo===1?(R[rt]&0xFF000000|mv>>>8)>>>0:bo===2?(R[rt]&0xFFFF0000|mv>>>16)>>>0:(R[rt]&0xFFFFFF00|mv>>>24)>>>0);break}\n      case 35:R[rt]=r32((R[rs]+si)>>>0);break;\n      case 36:R[rt]=r8((R[rs]+si)>>>0);break;\n      case 37:R[rt]=r16((R[rs]+si)>>>0);break;\n      case 38:{const a=(R[rs]+si)>>>0,al=a&~3,bo=a&3,mv=r32(al);R[rt]=(bo===0?(R[rt]&0x00FFFFFF|mv<<24)>>>0:bo===1?(R[rt]&0x0000FFFF|mv<<16)>>>0:bo===2?(R[rt]&0x000000FF|mv<<8)>>>0:mv);break}\n      case 40:w8((R[rs]+si)>>>0,R[rt]);break;\n      case 41:w16((R[rs]+si)>>>0,R[rt]);break;\n      case 42:{const a=(R[rs]+si)>>>0,al=a&~3,bo=a&3,old=r32(al),v=R[rt];w32(al,bo===0?v:bo===1?(old&0xFF000000|v&0x00FFFFFF)>>>0:bo===2?(old&0xFFFF0000|v&0x0000FFFF)>>>0:(old&0xFFFFFF00|v&0x000000FF)>>>0);break}\n      case 43:w32((R[rs]+si)>>>0,R[rt]);break;\n      case 46:{const a=(R[rs]+si)>>>0,al=a&~3,bo=a&3,old=r32(al),v=R[rt];w32(al,bo===0?(old&0x00FFFFFF|v<<24)>>>0:bo===1?(old&0x0000FFFF|v<<16)>>>0:bo===2?(old&0x000000FF|v<<8)>>>0:v);break}\n      case 48:case 49:case 50:case 51:case 52:case 53:case 54:case 55:\n      case 56:case 57:case 58:case 59:case 60:case 61:case 62:case 63:break;\n      default:console.error('OP='+op+' at 0x'+(curPC>>>0).toString(16));process.exit(1)}\n  }\n  if(takeBranch>=0)pc=takeBranch>>>0;\n  R[0]=0;\n}\nconst dt=(Date.now()-t0)/1000;\nconsole.error('Exit: '+exitCode+', '+ic+' insns in '+dt.toFixed(1)+'s ('+Math.floor(ic/dt)+' ips)');\nEOFVM\n",
+      "duration": 0.5
+    }
+  ]
+}

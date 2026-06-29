@@ -1,0 +1,918 @@
+
+[tr-stream call-0052:socrates:trustedrouter/socrates-pro-plus-1.0] socrates.started
+
+[tr-stream call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed] worker.started
+[tr-thinking call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed] Let me look at AutoAllocMemory to understand the zone allocation:
+
+The I_ZoneBase function calls AutoAllocMemory(size, default_ram, min_ram). DEFAULT_RAM is 6, MIN_RAM is something smaller. It tries to allocate 6MB first and if that fails, it reduces by 1MB each time until malloc succeeds or falls below min_ram.
+
+Looking at the disassembly:
+- `sll a0,s1,0x14` - this is `default_ram << 20` = default_ram * 1MB
+- `lui s4,0xfff0` - this is 0xFFF00000 =
+[tr-thinking call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  -1MB = ~0xFFFFF
+- It tries `malloc(size)`, and if it fails, decrements s2 (a copy of default_ram)
+
+So the zone is allocating 6MB (0x600000) but we see "600000 allocated for zone" in the output. Wait, 600000 hex is about 6.3MB. Let me check - 0x600000 = 6291456 bytes = 6MB. But the output says "600000" which could
+[tr-thinking call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  be hex 0x600000.
+
+The output was: "zone memory: 0x5e6b50, 600000 allocated for zone"
+
+So 0x600000 = 6291456 bytes = 6MB is allocated. But then R_Init: Z_Malloc fails on allocation of 41:2:3204 bytes - this looks like corrupted output.
+
+Wait, looking again at the error:
+```
+R_Init: Init DOOM refresh daemon - Z_Malloc: failed on allocation of %i bytes
+[tr-thinking call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 
+Z_Malloc: failed on allocation of 41:2:3204 bytes
+```
+
+The format string uses `%i` but the output says "41:2:3204" which looks wrong. This could be a printf issue - maybe the format string isn't being handled correctly, or maybe the allocation size is large.
+
+Actually, looking at this more carefully, the output format "41:2:3204" is very suspicious. It looks like there's a printf formatting issue where the number is wrong, OR the allocation actually needs more than 6MB.
+
+But wait - the default
+[tr-thinking call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  is 6MB and the zone starts at 0x5e6b50. The malloc itself needs to work correctly. Let me think about whether my brk implementation is correct.
+
+Looking at basic_malloc:
+- At 0x439c34, it loads `0x4b` into `a1` (high half of address)
+- It reads from `2836(a1)` = 0x4b0000 + 2836 = 0x4b0b14 - this is the heap size/pointer
+- Then `a2 = a0 + v1` where a
+[tr-thinking call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 0 is the current heap position and v1 is the requested size (aligned to 16)
+- Checks if `at (0x4000) < a2` - checking if a2 would overflow past 1GB?
+- If ok, stores new heap size at 0x4b0b14
+- Then calculates address: `0x4b0b40 + a0` (base at 0x4b0b40) + 8
+
+So the heap starts at 0x4b0b40 in BSS, and 0x4b0b14 stores the current heap size. This
+[tr-thinking call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  is a simple bump allocator, NOT using brk at all!
+
+The heap limit check is `(a2 >> 20) >= 0x4000` which means the heap can grow up to ~1GB.
+
+So the allocator works like:
+1. Heap base at 0x4b0b40 (in BSS)  
+2. Current heap size at 0x4b0b14
+3. When allocating, it just bumps the size
+
+This means my brk handler is irrelevant - the malloc never calls brk. The issue is that the BSS section needs to be large enough to hold all the zone
+[tr-thinking call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  memory + other BSS data.
+
+Looking at BSS: 0x4750c0 to 0x4750c0 + 0x4003c6d0 = the end of BSS at 0x404b1790 (which matches `_end`).
+
+The heap data area at 0x4b0b40 is inside BSS. Since BSS ends at 0x404b1790, the maximum heap is 0x404b1790 - 0x4b0b40 = 0x
+[tr-thinking call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 3B9B40C50... wait, that doesn't seem right.
+
+Actually, let me recalculate:
+- BSS start: 0x4750c0
+- BSS size: 0x4003c6d0
+- BSS end: 0x4750c0 + 0x4003c6d0 = 0x404b1790
+
+So the heap base at 0x4b0b40 is within BSS (0x4750c0 < 0x4b0b40 < 0x404b1790). Wait, 
+[tr-thinking call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 0x4b0b40 - that's past BSS end at 0x404b1790? No:
+- 0x4750c0 + 0x4003c6d0 = let me compute this carefully
+- 0x04750c0 + 0x4003c6d0 = 0x4_04B_1790... 
+
+Hmm, 0x4750c0 + 0x4003c6d0:
+0x04750c0
++ 0x4003c6d0
+= 0x404b1790
+
+Wait that can
+[tr-thinking call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 't be right. Let me think about this differently:
+0x4003c6d0 is about 1GB. That's a huge BSS section.
+BSS start: 0x04750c0
+BSS end: 0x04750c0 + 0x4003c6d0 = 0x404B1790
+
+So the heap base at 0x4b0b40 is indeed within BSS. The allocator can use BSS from 0x4b0b40 up to 0x404B1790 (about 1GB of space).
+
+So
+[tr-thinking call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  the heap data starts at 0x4b0b40, and when I_ZoneBase allocates 6MB (0x600000), it asks malloc(0x600000). malloc calls basic_malloc, which uses the heap at 0x4b0b40.
+
+The heap counter at 0x4b0b14 starts at 0. The first malloc allocates from 0x4b0b40 + 0 + 8 = 0x4b0b48. After allocating 6MB, the counter would be at 0x600000 + some alignment.
+
+But
+[tr-thinking call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  wait - the BSS is not zeroed out in my implementation because I'm only loading the segments. The LOAD segment only covers up to 0x56520 offset (data), and BSS is NOBITS (no data in file). So when I load the segment, I need to zero BSS.
+
+Actually, I do initialize pages to zero when creating them (new Uint8Array(PAGE_SIZE) is zero-filled). So BSS should be zero.
+
+But the issue is that the `malloc` function first tries size classes and caches, and only falls back to basic_malloc when the cache is empty. The output says zone memory
+[tr-thinking call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  600000 hex = 6MB, which is correct.
+
+The error is "Z_Malloc: failed on allocation of %i bytes" followed by "41:2:3204". This looks like the printf format isn't working right, or there's a bug in the code that prints the format string with wrong arguments.
+
+Actually wait - "41:2:3204" could be a time representation or a format string issue. But more importantly, Z_Malloc failing means the zone isn't big enough or there's a corruption issue.
+
+Actually, the real problem might be more fundamental. Let me re-read the error:
+```
+R_Init: Init DO
+[tr-thinking call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed] OM refresh daemon - Z_Malloc: failed on allocation of %i bytes
+Z_Malloc: failed on allocation of 41:2:3204 bytes
+```
+
+The first line is from d_main.c which calls R_Init, and it catches the Z_Malloc failure. The second line is the actual error from Z_Malloc. The format `%i` should print an integer, but "41:2:3204" is not a valid integer.
+
+This suggests a bug in my printf implementation or in the way the arguments are passed. Actually, looking more carefully, Z_Malloc is being called with a
+[tr-thinking call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  very large size. Let me check what R_Init tries to allocate.
+
+Actually, maybe the issue is different. Let me think about what R_Init allocates. It allocates screen buffers, texture data, etc. The biggest allocation would be the screen buffers (640 * 400 * 4 * 2 = ~2MB).
+
+Wait, actually "41:2:3204" - this could be that the size is very large. Let me consider: 0x41023204 = 1090523652 bytes = ~1GB. That would exceed the 6MB zone!
+
+If
+[tr-thinking call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  the size being passed is 0x41023204, then something is wrong with the size calculation. Or maybe the printf format string isn't matching the arguments correctly.
+
+Actually, thinking about it more, the error "41:2:3204" could be that the printf format is not matching up. Perhaps there are multiple format arguments and they're being consumed incorrectly. Let me look at what Z_Malloc's error message looks like.
+
+Actually, let me just look at the source code for Z_Malloc:
+
+From z_zone.c in doomgeneric:
+```c
+void Z_Malloc(int size, int tag, void *user)
+```
+
+And the
+[tr-thinking call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  error message: "Z_Malloc: failed on allocation of %i bytes"
+
+So the %i should print a single integer (the size). The output "41:2:3204" suggests the integer is being printed as "41:2:3204" which doesn't make sense. 
+
+Wait, maybe I'm reading the output wrong. Let me re-read:
+```
+R_Init: Init DOOM refresh daemon - Z_Malloc: failed on allocation of %i bytes
+Z_Malloc: failed on allocation of 41:2:3204 bytes
+```
+
+The
+[tr-thinking call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  first line says "of %i bytes" literally - that means the format string wasn't processed. The second line says "of 41:2:3204 bytes" - the %i was processed but got a weird value.
+
+Actually, I think I see - the first line is from I_Error in d_main.c, which calls I_Error which itself may use printf. The format string for the first error may have different arguments.
+
+But regardless, the issue is that Z_Malloc is failing because it's trying to allocate a very large amount of memory (possibly due to a corrupt size value). This could be a CPU emulation bug.
+
+Let me look at R
+[tr-thinking call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed] _Init to see what it allocates. The biggest allocations are for screens (V_Init) and texture/sprite data.
+
+Actually, let me think about this differently. The error might be caused by a very early subtle CPU bug that corrupts data, which then causes R_Init to try to allocate a huge amount. Let me see if the VM produces correct results for basic operations.
+
+Actually, one thing I notice - my mul/mult implementation might be buggy. Let me check:
+
+For mult:
+```javascript
+const aNeg = a < 0, bNeg = b < 0;
+const absA = aNeg ? -a :
+[tr-thinking call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  a;
+const absB = bNeg ? -b : b;
+```
+
+But `a` and `b` are from `r[rs]` which is a signed Int32Array value. If `a = -2147483648` (most negative), then `-a` would be `2147483648` which overflows to `-2147483648` in Int32Array... Hmm, actually `absA` is just a regular JS number, not an Int32, so it should be fine.
+
+Wait,
+[tr-thinking call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  actually `const a = r[rs]` gets a signed 32-bit value from Int32Array. The abs computation happens on regular JS numbers. Let me trace through a simple case:
+
+a = -1 (0xFFFFFFFF as signed)
+absA = 1
+aLo = 1, aHi = 0
+b = -1
+absB = 1
+bLo = 1, bHi = 0
+
+p0 = 1, p1 = 0, p2 = 0, p3 = 0
+lo = 1 + 0 + 0 = 1
+hi = 0 + 0 + 0 + 
+[tr-thinking call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 0 = 0
+
+Since aNeg !== bNeg is false (both negative), we don't negate.
+Result: lo = 1, hi = 0. But correct answer is (-1)*(-1) = 1, with 64-bit representation 0x00000000_00000001. That's correct.
+
+What about -1 * 2 = -2?
+a = -1, b = 2
+absA = 1, absB = 2
+p0 = 1*2 = 2
+lo = 2, hi = 0
+aNeg = true, bNeg = false, so a
+[tr-thinking call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed] Neg !== bNeg = true
+lo = (~2 + 1) = (0xFFFFFFFD + 1) = 0xFFFFFFFE = -2 (unsigned: 4294967294)
+hi = (~0 + 0) = 0xFFFFFFFF = -1 (unsigned: 4294967295)
+
+64-bit result: 0xFFFFFFFF_FFFFFFFE = -2 in 64-bit two's complement. Correct!
+
+OK so mult seems fine for simple cases. But what about overflow in the intermediate calculations?
+
+Let me try a larger example: 0x80000000 * 2 = 
+[tr-thinking call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 0x100000000_00000000
+a = -2147483648 (0x80000000)
+absA = 2147483648
+aHi = 2147483648 >>> 16 = 32768
+aLo = 2147483648 & 0xFFFF = 0
+
+b = 2
+absB = 2
+bLo = 2, bHi = 0
+
+p0 = 0
+[tr-thinking call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  * 2 = 0
+p1 = 0 * 0 = 0
+p2 = 32768 * 2 = 65536
+p3 = 32768 * 0 = 0
+
+lo = 0 + 0 + (65536 << 16) = 0 + 0 + 4294967296 = 4294967296
+But 4294967296 > 2^32, so `lo >= 0x100
+[tr-thinking call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 000000 ? 1 : 0` is true.
+hi = 0 + 0 + 0 + 1 = 1
+lo = 4294967296 >>> 0 = 0
+
+aNeg = true, bNeg = false, so negate:
+lo = (~0 + 1) >>> 0 = 0
+hi = (~1 + 1) >>> 0 = 0xFFFFFFFF
+
+64-bit result: 0xFFFFFFFF_00000000 = -4294967296
+But 
+[tr-thinking call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 0x80000000 * 2 = 0x100000000, and as a signed 64-bit value: -2147483648 * 2 = -4294967296. Correct!
+
+OK so the mult seems fine. But I'm worried about floating point precision for large intermediate values. Let me check if `65536 << 16` gives the right answer... In JavaScript, `65536 << 16` = 4294967296 = 2^32,
+[tr-thinking call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  which is exact. But with bigger intermediates...
+
+What about 0x80000000 * 0x80000000 = 0x40000000_00000000?
+a = -2147483648, absA = 2147483648
+aHi = 32768, aLo = 0
+
+b = -2147483648, absB = 2147483648
+bHi = 32768, bLo = 0
+
+p0 = 0, p1 = 0, p2 = 0, p3 = 
+[tr-thinking call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 32768 * 32768 = 1073741824
+
+lo = 0
+hi = 1073741824 + 0 + 0 + 0 = 1073741824
+
+aNeg !== bNeg is false (both negative), so no negation.
+Result: lo = 0, hi = 1073741824 = 0x40000000
+
+64-bit: 0x40000000_0
+[tr-thinking call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 0000000. Correct!
+
+But what about 1234567 * 8901234?
+a = 1234567
+aLo = 1234567 & 0xFFFF = 1234567 & 65535 = let me compute: 1234567 / 65536 = 18.83..., so aHi = 18, aLo = 1234567 - 18*65536 = 1234567 - 1179648 = 54919
+
+b = 8901234
+bHi
+[tr-thinking call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  = 8901234 / 65536 = 135.82..., bHi = 135, bLo = 8901234 - 135*65536 = 8901234 - 8847360 = 53874
+
+p0 = 54919 * 53874 = 2958654246
+p1 = 54919 * 135 = 741406
+[tr-thinking call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 5
+p2 = 18 * 53874 = 969732
+p3 = 18 * 135 = 2430
+
+lo = 2958654246 + ((7414065 & 0xFFFF) << 16) + ((969732 & 0xFFFF) << 16)
+= 2958654246 + (12625 << 16) + (481652 << 16)
+Wait, 7414065 & 0xFFFF = 7414065 % 65536 = 7414065 -
+[tr-thinking call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  113*65536 = 7414065 - 7405568 = 8497
+969732 & 0xFFFF = 969732 % 65536 = 969732 - 14*65536 = 969732 - 917504 = 52228
+
+lo = 2958654246 + (8497 << 16) + (52228 << 16)
+= 2958654246 + 556860
+[tr-thinking call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 416 + 3422568448
+= 6948083110
+
+This is > 2^32, so `lo >= 0x100000000` is true (1).
+
+hi = 2430 + (7414065 >>> 16) + (969732 >>> 16) + 1
+= 2430 + 113 + 14 + 1 = 2558
+
+lo >>> 0 = 6948083110 & 0xFFFFFFFF = 
+[tr-thinking call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 6948083110 - 4294967296 = 2653115814
+hi >>> 0 = 2558
+
+64-bit result: 2558 * 2^32 + 2653115814 = 10985416122030
+
+Correct answer: 1234567 * 8901234 = let me compute...
+1234567 * 8901234 ≈ 
+[tr-thinking call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 1.0989e13
+
+Actually let me compute exactly:
+1234567 * 8901234
+= 1234567 * 8000000 + 1234567 * 901234
+= 9876536000000 + 1234567 * 901234
+
+Hmm, this is getting complex. Let me just verify with JS:
+Actually, let me just trust the implementation for now and look for other issues.
+
+The
+[tr-thinking call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  issue might be simpler - maybe my printf or some other C function implementation is wrong, causing corrupted sizes. Or maybe the malloc free-list isn't being set up correctly because BSS isn't properly zeroed.
+
+Actually wait - let me think about the printf issue. The output "41:2:3204" for %i format specifier is very suspicious. What if the problem isn't in the zone size but in the printf format? Let me look at the actual error more carefully.
+
+Looking at d_main.c, R_Init is called and Z_Malloc is called from R_Init. The error message says the allocation failed. The size printed as
+[tr-thinking call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  "41:2:3204" is suspicious.
+
+Actually, I bet the issue is that the printf format `%i` is working but the argument being passed is corrupted. This could be because of a CPU bug somewhere earlier that corrupts memory.
+
+Let me try a different approach - let me add some debug output to trace where the issue is, and also check if there are any common MIPS instruction bugs.
+
+Actually, I think the most likely issue is in the lw/sw implementation when it crosses page boundaries. Also, I might have an issue with the load delay slots or branch delay slots.
+
+Wait, I just realized - the
+[tr-thinking call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  binary has "noreorder" flag which means the assembler doesn't reorder instructions. This means the code as compiled uses explicit NOP after branches or relies on delay slots. My implementation already handles branch delay slots correctly (the instruction after a branch is always executed because `this.pc = this.npc; this.npc = this.npc + 4;` processes them sequentially).
+
+Actually no - I'm NOT handling delay slots correctly. In my implementation, `this.pc = this.npc; this.npc += 4;` for every instruction. When I encounter a branch, I set `this.npc = target`. But the NEXT instruction after the branch is still at `old_n
+[tr-thinking call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed] pc`, which will be executed because `this.pc` was already set to it. Then on the next step, `this.npc` will be the target. This is actually correct! The branch delay slot instruction executes before the branch takes effect.
+
+Wait, let me trace through:
+1. Step: pc = branch_addr, npc = branch_addr + 4. Execute branch, set npc = target.
+2. Step: pc = branch_addr + 4, npc = target. Execute delay slot instruction. 
+3. Step: pc = target, npc = target + 4. Execute first instruction at target.
+
+Yes, this is correct. The delay slot instruction at
+[tr-thinking call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  branch_addr + 4 is executed.
+
+Hmm, but what about JAL? The return address should be the instruction AFTER the delay slot (branch_addr + 8), not after the jump (npc). Let me check my JAL:
+
+```javascript
+case 3: { // jal
+  u[31] = (pc + 8) >>> 0;
+  this.npc = ((pc + 4) & 0xF0000000) | ((I & 0x03FFFFFF) << 2);
+  return;
+}
+```
+
+Here, `pc` is the address of the JAL instruction itself (since we're executing at `pc`). So `pc
+[tr-thinking call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  + 8` is the instruction after the delay slot. This is correct!
+
+And for JALR:
+```javascript
+case 9: // jalr
+{ const t = u[rs]; u[rd || 31] = (pc + 8) >>> 0; this.npc = t; return; }
+```
+
+Same - pc is the JALR instruction, so pc+8 is correct.
+
+OK so delay slots seem fine. Let me look for other potential issues.
+
+One thing I notice - my BRK handler might have a problem. Let me check:
+
+```javascript
+case SYS_brk: {
+  if (a0 === 0 || a0 <= this.heapEnd) this.u[2] = this.heapEnd;
+  else { this.heapEnd = a0; this.u[2] = a0; }
+  return
+[tr-thinking call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed] ;
+}
+```
+
+But the binary doesn't use brk - it uses its own bump allocator in BSS. So brk is irrelevant.
+
+Let me think about what could be wrong. The issue is that Z_Malloc fails. This could be because:
+1. The zone is too small (but 6MB should be enough for DOOM)
+2. The zone memory is corrupted
+3. A CPU bug causes incorrect allocation sizes
+
+Let me check if there might be an issue with my readString function - if the WAD file path is wrong, it might not load properly. But we see "adding doom.wad" in the output, so it seems to load.
+
+Actually, looking
+[tr-thinking call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  at the output more carefully:
+```
+R_Init: Init DOOM refresh daemon - Z_Malloc: failed on allocation of %i bytes
+```
+
+Wait, the FIRST line says "of %i bytes" literally - the %i format specifier was NOT processed! This means there's a bug in my printf implementation. The `printf` function should process `%i` but it's printing it literally.
+
+Let me look at the printf implementation... Actually, the binary has its own printf at 0x439938. Let me disassemble it:
+
+Actually, the binary implements its own printf using `vsnprintf` or similar. The key question is whether the
+[tr-thinking call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  `%i` format is handled. In standard C, `%i` is equivalent to `%d` for integers.
+
+Wait, I see the issue. The first line is:
+```
+R_Init: Init DOOM refresh daemon - Z_Malloc: failed on allocation of %i bytes
+```
+
+This is printed by I_Error which likely calls printf with a format string. The format string is "R_Init: Init DOOM refresh daemon - Z_Malloc: failed on allocation of %i bytes" and it's passing an integer argument. But it's printing `%i` literally, which means the printf function encountered an error or skipped the %i processing.
+
+Actually
+[tr-thinking call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed] , looking at the custom printf in my_stdlib.c, it uses `vsnprintf` which calls into a custom implementation. Let me look at the binary's printf:
+
+0x439938 is `printf` with 40 bytes. It's probably a wrapper that calls `vfprintf` or `vsnprintf`. Let me disassemble it.
+
+Actually, the issue might be more fundamental. The format string "R_Init: Init DOOM refresh daemon - Z_Malloc: failed on allocation of %i bytes" - this is not a standard format string for printf. It's from d_main.c's error
+[tr-thinking call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  handling.
+
+Let me look at the d_main.c code for R_Init:
+
+```c
+void D_DoomMain (void)
+{
+    ...
+    R_Init();
+    ...
+}
+```
+
+And R_Init calls R_ExecuteSetViewSize which calls Z_Malloc. If Z_Malloc fails, it calls I_Error with the format string.
+
+But the issue is that the printf doesn't seem to be processing the %i format. This could mean:
+1. The printf in the binary uses a custom implementation that doesn't handle %i
+2. There's a bug in my CPU that corrupts the format string pointer or argument passing
+
+Actually, looking
+[tr-thinking call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  at the second line: "Z_Malloc: failed on allocation of 41:2:3204 bytes" - this IS processing %i, but the value "41:2:3204" is weird. It looks like the integer value might be printed in a non-standard way, or the argument is not an integer.
+
+Hmm wait, I think I might be misreading the output. Let me reconsider - maybe the output is:
+```
+Z_Malloc: failed on allocation of 41996293204 bytes
+```
+or something like that, and the terminal just wrapped. But "41:2:3204" doesn't match any integer
+[tr-thinking call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  pattern.
+
+Actually, "41:2:3204" could be the format string being re-parsed. Like if there's a circular buffer issue or the format string pointer is wrong.
+
+Let me just focus on making the VM faster and more correct. The key issue might be a simple bug in one instruction. Let me check the multiply instruction more carefully.
+
+Actually, let me reconsider the multu implementation:
+
+```javascript
+case 25: { // multu
+  const a = u[rs], b = u[rt];
+  const aLo = a & 0xFFFF, aHi = a >>> 16;
+  const bLo = b & 0xFFFF, b
+[tr-thinking call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed] Hi = b >>> 16;
+  const p0 = aLo * bLo, p1 = aLo * bHi, p2 = aHi * bLo, p3 = aHi * bHi;
+  const lo = (p0 + ((p1 & 0xFFFF) << 16) + ((p2 & 0xFFFF) << 16)) >>> 0;
+  const hi = (p3 + (p1 >>> 16) + (p2 >>> 16) + (((p0 + ((p1 & 0xFFFF) << 16) + ((p2 & 0xFFFF) << 16)) >= 0x100000000) ? 1 : 0)) >>> 0;
+  this.lo = lo; this.hi = hi;
+  return
+[tr-thinking call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed] ;
+}
+```
+
+Wait, there's a subtle bug here! The carry calculation for `hi` recomputes the `lo` expression. But `lo` was already computed with `>>> 0`. Let me check if the carry calculation matches.
+
+Actually, looking more carefully, the carry condition is:
+`(p0 + ((p1 & 0xFFFF) << 16) + ((p2 & 0xFFFF) << 16)) >= 0x100000000`
+
+This is the same expression as `lo` before the `>>> 0`. In JavaScript, this is a regular number (double), and since `p0`
+[tr-thinking call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  can be up to 0xFFFF * 0xFFFF = 0xFFFE0001 ≈ 4.29 billion, and `(p1 & 0xFFFF) << 16` can be up to 0xFFFF << 16 = 0xFFFF0000 ≈ 4.29 billion, the sum can be up to about 8.6 billion, which exceeds 2^32 but is within double precision.
+
+Actually, wait. `p0` can be up to `0xFFFF * 0xFFFF = 4294836225`. `(
+[tr-thinking call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed] p1 & 0xFFFF) << 16` can be up to `0xFFFF << 16 = 4294901760`. And `(p2 & 0xFFFF) << 16` can also be up to `4294901760`. So the sum can be up to `4294836225 + 4294901760 + 4294901760 = 12884639745`, which is about 12.9 billion. This is within double precision
+[tr-thinking call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  range (2^53 ≈ 9e15), so it's fine.
+
+But there's a potential issue: `(p1 & 0xFFFF) << 16` - in JavaScript, `<<` operates on 32-bit integers. `0xFFFF << 16 = 0xFFFF0000` which as a signed 32-bit number is `-65536`. When used as a number in the addition, it becomes `-65536`. But we want `0xFFFF0000 = 4294901760` as an unsigned value.
+
+
+[tr-thinking call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed] Hmm, `<<` in JavaScript converts to signed 32-bit, then shifts. `0xFFFF << 16`:
+- `0xFFFF` = `65535` as a signed 32-bit integer
+- `65535 << 16` = `4294901760` as a number, but JavaScript's `<<` returns a signed 32-bit value, which would be `-65536`
+
+Wait, let me check: In JavaScript, `0xFFFF << 16` gives `-65536` (signed
+[tr-thinking call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  32-bit). When used in the addition `p0 + ((p1 & 0xFFFF) << 16) + ...`, we get `p0 + (-65536) + ...`. This is WRONG! We need unsigned arithmetic.
+
+This is a real bug! The `<< 16` can produce a negative number in JavaScript. I need to use `>>> 0` after the shift or use multiplication instead.
+
+For the `lo` calculation:
+```javascript
+const lo = (p0 + ((p1 & 0xFFFF) << 16) + ((p2 & 0xFFFF) << 16)) >>> 0;
+```
+
+If `(
+[tr-thinking call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed] p1 & 0xFFFF) << 16` gives a negative value, then the addition `p0 + negative + negative` will give a wrong intermediate result. Even though `>>> 0` at the end converts to unsigned 32-bit, the intermediate result could be wrong.
+
+Wait, actually, let me think about this more carefully. In JavaScript, `p0` is a regular number (double). `(p1 & 0xFFFF) << 16` is a signed 32-bit value (from the `<<` operation). When added to `p0` (a double), the result is a double.
+
+If `p1 & 0xFFFF = 0xFFFF
+[tr-thinking call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  = 65535`, then `65535 << 16 = -65536` (signed 32-bit). When added to `p0`, we get `p0 - 65536`. But we want `p0 + 4294901760`.
+
+`p0 - 65536` vs `p0 + 4294901760`: these differ by `4294901760 + 65536 = 429496
+[tr-thinking call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 7296 = 2^32`. So when we apply `>>> 0`, the results will be the same! Because `(x - 2^32) >>> 0 === (x + 2^32) >>> 0` when x is around 2^32.
+
+Actually wait, let me think more carefully. Let's say p0 = 4000000000 and the shift gives -65536.
+
+Desired: (4000000000 + 4294901760) = 8294901760
+8294901760 >>> 0 = 8294901760
+[tr-thinking call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  - 2*4294967296 = 8294901760 - 8589934592 = -295032832
+Actually, `>>> 0` converts to unsigned: 8294901760 % 4294967296 = 3999934464
+
+Got (p0 + negative): 4000000000 + (-65536) = 3999934464
+3999934464 >>> 0 = 399993
+[tr-thinking call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 4464
+
+They're the same! So the `>>> 0` at the end does make it correct.
+
+But what about the carry calculation for `hi`? The carry condition checks if the sum is >= 2^32. With the negative shift, the sum is about 2^32 less, so it would appear to NOT overflow when it should.
+
+Let me check: 
+Correct: p0 + (p1 & 0xFFFF)*2^16 + (p2 & 0xFFFF)*2^16 >= 2^32?
+With shift: p0 + ((p1 & 0xFFFF) << 16) + ((p2 & 0xFFFF) << 
+[tr-thinking call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 16) >= 2^32?
+
+If (p1 & 0xFFFF) << 16 is negative, then the sum could be negative, and it would be < 2^32. So the carry would not be detected. This IS a bug!
+
+For example:
+p0 = 1, p1 = 0xFFFF, p2 = 0
+Correct: 1 + 0xFFFF0000 = 4294967297 >= 2^32? YES (carry = 1)
+With shift: 1 + (-65536) = -65535 >= 2^32? NO (carry = 0) -- BUG!
+
+So my multu is
+[tr-thinking call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  buggy. I need to fix this by using unsigned operations.
+
+The fix is to use `>>> 0` after the shift to convert back to unsigned, or use multiplication:
+`((p1 & 0xFFFF) << 16) >>> 0` - this converts the signed 32-bit to unsigned.
+
+Or better yet, use `* 0x10000` instead of `<< 16`.
+
+Let me also check the mult implementation... same issue there.
+
+Actually, the simplest fix for multu is to use BigInt:
+```javascript
+case 25: { // multu
+  const a = BigInt(u[rs]);
+  const b = BigInt(u[rt]);
+  const result = a * b;
+  this.lo = Number(result & 0xFFFFFFFFn) >>> 0;
+  this.hi = Number((result >> 
+[tr-thinking call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 32n) & 0xFFFFFFFFn) >>> 0;
+  return;
+}
+```
+
+And for mult:
+```javascript
+case 24: { // mult
+  const a = BigInt(r[rs]);
+  const b = BigInt(r[rt]);
+  const result = a * b;
+  this.lo = Number(result & 0xFFFFFFFFn) >>> 0;
+  this.hi = Number((result >> 32n) & 0xFFFFFFFFn) >>> 0;
+  return;
+}
+```
+
+This is simpler and correct, though slower due to BigInt. But correctness > speed for now.
+
+Also, I should double-check my other instructions for similar issues.
+
+Actually,
+[tr-thinking call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  let me also look at the `srlv` instruction: `u[rd] = u[rt] >>> (u[rs] & 31)`. This should be correct since `>>>` is unsigned right shift.
+
+And `srav`: `u[rd] = r[rt] >> (u[rs] & 31)`. `r[rt]` is signed, and `>>` is arithmetic right shift. But we store in `u[rd]` which is the unsigned view. This should be fine since the bit pattern is the same.
+
+Actually, wait. When we do `u[rd] = r[rt] >> (u[rs] & 31)`, the right side produces a signed 
+[tr-thinking call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 32-bit value (from the signed Int32Array read + signed >>). When we assign to `u[rd]`, it should be stored as unsigned. But does JavaScript handle this correctly?
+
+`r[rt]` is a signed 32-bit int. `>>` gives a signed result. `u[rd] = signed_result` should work because the Uint32Array will reinterpret the bits correctly.
+
+Actually, the assignment `u[rd] = r[rt] >> shift` - `r[rt] >> shift` returns a signed 32-bit value (e.g., -1 for shifting -
+[tr-thinking call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 1 right). Storing -1 in Uint32Array gives 4294967295. This is correct.
+
+OK, so the main bug is in mult/multu. Let me also check if there might be issues with the `move` pseudo-instruction. In MIPS, `move rd, rs` is actually `addu rd, rs, $zero`. But in the assembly, it could also be `or rd, rs, $zero`. My implementation handles both.
+
+Let me also check the load instructions for sign extension issues.
+
+`lb`: `u[rt] = ((m.r8(addr)) << 24) >> 24` - this sign-extends a byte.
+[tr-thinking call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  The `<< 24` converts to a 32-bit signed int, then `>> 24` arithmetic-shifts right to sign-extend. This should be correct.
+
+`lh`: `u[rt] = ((m.r16(addr)) << 16) >> 16` - same for halfword. Should be correct.
+
+`lbu`: `u[rt] = m.r8(addr)` - unsigned byte, correct.
+
+`lhu`: `u[rt] = m.r16(addr)` - unsigned halfword, correct.
+
+Wait, but `m.r16(addr)` returns a 
+[tr-thinking call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 16-bit value. If the value is 0xFFFF, it's stored correctly in u[rt] as 65535. That's correct for lhu.
+
+OK, I think the main issue is the mult/multu bug. Let me also consider whether there might be issues with the buddy allocator in basic_malloc.
+
+Actually, thinking about this more, there could also be an issue with the 32-bit address space. The binary has BSS that goes from 0x4750c0 to 0x404B1790. That's a range that includes addresses above 0x80000000... wait, 0x404B1790 is only
+[tr-thinking call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  about 1.07 billion, which is within 32-bit unsigned range. The stack is at 0x7FFF0000 which is about 2.15 billion. Both fit in 32-bit unsigned.
+
+But in my memory implementation, the page index is `addr >>> 16`. For addr 0x404B1790, that's 0x404B = 16459. The MAX_PAGES is 0x10000 = 65536. So this is fine.
+
+The BSS is very large (0x4003c6d0 bytes ≈ 1GB). My memory implementation creates pages on
+[tr-thinking call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  demand, so this shouldn't be an issue until that memory is actually accessed.
+
+Let me now fix the mult/multu bug and also optimize the VM. Let me use BigInt for mult/multu which is simpler and correct. Actually, for performance, I can use the 16-bit chunk approach but fix the unsigned issue:
+
+```javascript
+case 25: { // multu
+  const a = u[rs], b = u[rt];
+  const aLo = a & 0xFFFF, aHi = a >>> 16;
+  const bLo = b & 0xFFFF, bHi = b >>> 16;
+  const p0 = aLo * bLo, p1 = aLo * bHi, p2 = aHi * bLo, p3 = aHi * bHi;
+ 
+[tr-thinking call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  // Use >>> 0 to handle unsigned conversion after shift
+  const mid = ((p1 & 0xFFFF) * 0x10000) + ((p2 & 0xFFFF) * 0x10000);
+  const lo = (p0 + mid) >>> 0;
+  const carry = (p0 + mid) >= 0x100000000 ? 1 : 0;
+  const hi = (p3 + (p1 >>> 16) + (p2 >>> 16) + carry) >>> 0;
+  this.lo = lo; this.hi = hi;
+  return;
+}
+```
+
+Actually, even simpler - just
+[tr-thinking call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  use BigInt:
+```javascript
+case 24: { // mult
+  const result = BigInt(r[rs]) * BigInt(r[rt]);
+  this.lo = Number(result & 0xFFFFFFFFn) >>> 0;
+  this.hi = Number((result >> 32n) & 0xFFFFFFFFn) >>> 0;
+  return;
+}
+case 25: { // multu
+  const result = BigInt(u[rs]) * BigInt(u[rt]);
+  this.lo = Number(result & 0xFFFFFFFFn) >>> 0;
+  this.hi = Number((result >> 32n) & 0xFFFFFFFFn) >>> 0;
+  return;
+}
+```
+
+This is correct and simple
+[tr-thinking call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed] . BigInt might be slower but correctness matters.
+
+But actually, thinking about performance, the main issue is that the VM is simply too slow. Even with this fix, DOOM needs to process the 4MB WAD file which involves millions of instructions. Let me think about what I can do to speed it up.
+
+One major optimization: I can batch-execute instructions in a tight loop instead of the step() method which does a function call per instruction. I can also avoid the `>>> 0` conversions in memory access by using a DataView on a large ArrayBuffer.
+
+Actually, the biggest win would be to JIT compile hot paths, but that's very complex. Let me instead try to optimize the common paths:
+
+1. Use a
+[tr-thinking call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  single large ArrayBuffer for all memory (4GB). This is too big for Node.js.
+2. Use a Uint32Array for the memory region that covers code and data. But BSS is 1GB, so this won't work.
+3. Use the page-based approach but make the common case fast.
+
+Actually, I think the page-based approach is already decent. The main overhead is the per-instruction overhead of the step() function call, opcode decoding, and switch statements.
+
+Let me try a different approach: interpret instructions in a tight loop without function call overhead.
+
+```javascript
+run() {
+  let pc = this.pc;
+  let npc = this.npc;
+
+[tr-thinking call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed]   const u = this.u;
+  const r = this.r;
+  const mem = this.mem;
+  const pages = mem.pages;
+  
+  while (this.exitCode === null) {
+    const I = mem.r32(pc);
+    pc = npc;
+    npc = (npc + 4) >>> 0;
+    // decode and execute inline
+    ...
+  }
+  this.pc = pc;
+  this.npc = npc;
+}
+```
+
+Actually, one big optimization would be to keep `pc` and `npc` as local variables in the run loop, rather than as object properties. Accessing local variables is much faster than object property access in V8.
+
+Let me rewrite the
+[tr-thinking call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  run loop to be as tight as possible, with all state in local variables.
+
+Also, I should avoid using `this.step()` - instead, inline the decode and execute.
+
+Let me write a much more optimized version:
+
+Actually, I think the biggest gain would come from implementing a simple direct-threaded interpreter. Instead of decoding the opcode every time, I can cache the decoded instruction at each PC.
+
+But this is getting complex. Let me first fix the mult/multu bug, run it, and see if it produces correct output, even if slowly. Then optimize.
+
+Actually wait - looking at the error output more carefully:
+
+```
+Z_Malloc: failed on allocation of 41:2:3204 bytes
+```
+
+Could
+[tr-thinking call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  "41:2:3204" be the result of a bogus %i format? What if the printf's %i implementation is buggy? Let me look at the binary's printf implementation...
+
+Actually, the binary has its own printf at 0x439938 which is only 56 bytes - it's probably a wrapper. Let me disassemble it.
+
+But actually, the key insight might be different. Let me look at what's happening:
+
+The output says:
+1. "zone memory: 0x5e6b50, 600000 allocated for zone" - This is correct, 6MB allocated
+
+[tr-thinking call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 2. "R_Init: Init DOOM refresh daemon - Z_Malloc: failed on allocation of %i bytes"
+3. "Z_Malloc: failed on allocation of 41:2:3204 bytes"
+
+Line 2 shows %i literally - this means the format string in I_Error was not processed. Maybe I_Error doesn't use printf for its first output? Let me look:
+
+Actually, I_Error in the binary likely calls printf twice - once to stderr and once to an error handler. The first message might be going to stderr with the raw format string, while the second processes it.
+
+Wait, actually, looking at this again - line 2 might
+[tr-thinking call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  be from I_Error's format string, and line 3 is from a separate Z_Malloc error handler. Let me look at z_zone.c:
+
+```c
+void Z_Malloc(int size, int tag, void *user)
+{
+    ...
+    // On failure
+    I_Error("Z_Malloc: failed on allocation of %i bytes", size);
+}
+```
+
+So the format string "Z_Malloc: failed on allocation of %i bytes" is the same for both lines. But the first one (line 2) seems to come from somewhere that doesn't process %i, and the second (line 3) processes it incorrectly.
+
+Actually, I think what
+[tr-thinking call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 's happening is that I_Error calls printf which then outputs the message. The first line "R_Init: Init DOOM refresh daemon - Z_Malloc: failed on allocation of %i bytes" might be the error message from the exception handler that catches the Z_Malloc failure, and it includes the raw format string of the failed call. The second line "Z_Malloc: failed on allocation of 41:2:3204 bytes" is the actual I_Error output.
+
+In any case, the issue is that Z_Malloc fails because the zone is full. This could be because:
+1. The zone is too small for R_Init
+2. A CPU bug causes incorrect memory allocation or sizing
+[tr-thinking call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 
+
+6MB should be enough for DOOM. The R_Init allocations are mostly screen buffers (640*400*4*2 = ~2MB), texture cache, sprite cache, etc.
+
+Actually, the problem might be simpler. Let me check what `mainzone` is. From the symbol table: `mainzone` is at 0x4b0a40. Let me look at what Z_Init does with it.
+
+Z_Init in z_zone.c:
+```c
+void Z_Init(void)
+{
+    memblock_t *block;
+    
+    // Set up the main zone
+    mainzone = (memzone_t *)main
+[tr-thinking call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed] zone_data;  // or allocated from I_ZoneBase
+    ...
+}
+```
+
+Wait, `mainzone` is at 0x4b0a40 in BSS. But the actual zone memory is allocated by I_ZoneBase and returned as a pointer. Let me check how Z_Init uses the zone.
+
+Actually, from d_main.c:
+```c
+byte *zonemem;
+int zonesize;
+zonemem = I_ZoneBase(&zonesize);
+Z_Init(zonemem, zonesize);
+```
+
+Wait, the symbol `mainzone` at 0x4b0a40 is probably a global
+[tr-thinking call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  pointer variable, not the actual zone memory. The zone memory is the 6MB block returned by I_ZoneBase.
+
+OK, let me focus on the mult/multu bug since that's likely the root cause. Let me fix it and also look for other potential issues.
+
+Actually, let me think about this from a different angle. The output shows "Z_Malloc: failed on allocation of %i bytes" - what if the problem is not the zone being too small, but the size argument being garbage? If a CPU bug causes a corrupted size value to be passed to Z_Malloc, it would try to allocate a huge amount and fail.
+
+"41:2:3204" - what if this is
+[tr-thinking call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  decimal, like `41323204` or something? Or what if it's three separate numbers because there are colons in the format output?
+
+Actually, looking at the custom printf in my_stdlib.c, it processes format specifiers. The `%i` specifier should be handled the same as `%d`. If the value being printed is actually an integer, it should print correctly. "41:2:3204" doesn't look like a valid integer, which suggests either:
+1. The value is not an integer (corrupted)
+2. The printf has a bug in my_stdlib.c
+
+But wait - the printf
+[tr-thinking call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  is part of the BINARY, not my implementation. The binary's printf works correctly on a real MIPS system. If my CPU emulation has a bug, it could cause the printf to malfunction.
+
+Let me focus on fixing the known bug (mult/multu) and see if that helps. Let me also check for other common MIPS emulation pitfalls:
+
+1. Sign extension on loads (lb, lh) - I think this is correct
+2. Branch delay slots - I think this is correct
+3. Byte order - the binary is little-endian, and my memory reads/writes are little-endian
+4. Word alignment - MIPS requires aligned access for lw/sw
+[tr-thinking call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed] . Let me check if I handle unaligned access... Actually, MIPS o32 ABI might require aligned access, but the binary might do unaligned access via lwl/lwr instructions. My implementation handles lwl/lwr.
+
+5. The `sltiu` instruction: `u[rt] = (u[rs] >>> 0) < (simm >>> 0) ? 1 : 0` - wait, `simm` is sign-extended. For `sltiu`, the immediate is sign-extended to 32 bits, then the comparison is unsigned. So:
+- `simm` is already sign-extended (as
+[tr-thinking call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  a JavaScript number, it could be negative)
+- `simm >>> 0` converts to unsigned 32-bit
+- `u[rs] >>> 0` is already unsigned
+This looks correct.
+
+6. The `slti` instruction: `u[rt] = r[rs] < simm ? 1 : 0` - signed comparison, correct.
+
+Let me just fix the mult/multu and re-run.
+
+Actually, let me also double-check something. In the original optimized code, I check:
+
+```javascript
+case 10: if (u[rt] === 0) u[rd] = u[rs]; return; // movz
+```
+
+This should be
+[tr-thinking call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  `r[rd]` for signed consistency... but actually `u[rd] = u[rs]` just copies the bits, which is correct for movz.
+
+And for `movn`:
+```javascript
+case 11: if (u[rt] !== 0) u[rd] = u[rs]; return; // movn
+```
+Same - correct.
+
+One more thing: `movz rd, rs, rt` means "if rt == 0, rd = rs". Looking at my code: `if (u[rt] === 0) u[rd] = u[rs]`. This is correct.
+
+OK, let me fix the mult/multu bug.
+[tr-thinking call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  I'll also take the opportunity to optimize the memory access patterns and the main execution loop.
+
+Actually, let me just fix the bug first and see how it goes:
+
+I'll fix mult/multu to use BigInt. Also, I need to fix the memory write performance - the page lookup `this.pages[addr >>> PAGE_SHIFT]` is done on every read/write, which should be fast with a direct array access but let me verify.
+
+Actually, the real bottleneck is the WAD file reading. The binary reads 4MB of WAD data using read() syscalls, which involves copying data byte-by-byte from the file to memory. Each read
+[tr-thinking call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  syscall requires:
+1. Allocate a Node.js Buffer
+2. Read from the host file
+3. Copy byte-by-byte from Buffer to emulated memory
+
+The byte-by-copy is the bottleneck. Let me optimize the read syscall to copy more efficiently.
+
+For the read syscall, instead of copying byte-by-byte, I can write directly into the memory pages:
+
+```javascript
+case SYS_read: {
+  const fd = a0, buf = a1, count = a2;
+  const e = this.fds.get(fd);
+  if (!e) { this.u[2] = -1 >>> 0; return; }
+  if (e.type === 's') { this.u[2] = 
+[tr-thinking call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 0; return; }
+  const tmp = Buffer.alloc(count);
+  const n = fs.readSync(e.hfd, tmp, 0, count, e.pos);
+  // Write directly to memory pages
+  for (let i = 0; i < n; i++) {
+    const addr = (buf + i) >>> 0;
+    const idx = addr >>> PAGE_SHIFT;
+    let p = this.mem.pages[idx];
+    if (!p) { p = new Uint8Array(PAGE_SIZE); this.mem.pages[idx] = p; }
+    p[addr & PAGE_MASK] = tmp[i];
+  }
+  e.pos += n;
+  this
+[tr-thinking call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed] .u[2] = n;
+  return;
+}
+```
+
+This avoids the double lookup (first in mem.w8, then in the page map). But it's still O(n) byte-by-byte.
+
+Actually, the biggest optimization would be to use a single large ArrayBuffer (e.g., 64MB) for the code/data region and only use pages for BSS/stack. But this is complex.
+
+Let me just fix the mult/multu bug first and re-run. If it's still too slow, I'll optimize further.
+
+Let me also think about whether there are other bugs that could cause the Z_Malloc failure. If mult/multu is
+[tr-thinking call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  buggy, then any code that uses multiply (like array indexing, address calculations) could produce wrong results. This could easily cause memory corruption or wrong allocation sizes.
+
+OK let me write the fixed version. I'll also try to make the execution loop tighter by inlining the decode.
+[tr-stream call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed] {
+  "analysis": "The Z_Malloc failure is likely caused by the mult/multu bug (incorrect carry handling with JavaScript's signed shift operators). Let me fix that and also optimize the VM for speed. The main bottleneck is the per-instruction overhead and the byte-by-byte file read copying.",
+  "plan": "Fix mult/multu using BigInt for correctness, optimize the execution loop and memory access, and add bulk
+[tr-stream call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  memory copy for file reads.",
+  "commands": [
+    {
+      "keystrokes": "cat > /app/vm.js << 'VMEOF'\n'use strict';\nconst fs = require('fs');\nconst path = require('path');\n\n// ELF Loader\nfunction loadELF(fp) {\n  const d = fs.readFileSync(fp);\n  const r16 = o => d[o] | (d[o+1] << 8);\n  const r32 = o => (d[o] | (d[o+1] << 8) | (d[o
+[tr-stream call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed] +2] << 16) | (d[o+3] << 24)) >>> 0;\n  const entry = r32(0x18), phoff = r32(0x1c), phnum = r16(0x2c), phesz = r16(0x2a);\n  const segs = [];\n  for (let i = 0; i < phnum; i++) {\n    const o = phoff + i * phesz;\n    if (r32(o) !== 1) continue;\n    segs.push({ off: r32(o+4), va: r32(o+8), fsz: r32(o+16), msz: r32(o+20) });\n  }\
+[tr-stream call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed] n  return { entry, segs, data: d };\n}\n\n// Memory - 64KB pages\nconst PS = 16, PZ = 1 << PS, PM = PZ - 1;\nclass Mem {\n  constructor() { this.p = new Array(0x10000); }\n  _g(a) { const i = a >>> PS; let p = this.p[i]; if (!p) { p = new Uint8Array(PZ); this.p[i] = p; } return p; }\n  r8(a) { a >>>
+[tr-stream call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed] = 0; return (this.p[a >>> PS] || 0)[a & PM]; }\n  w8(a, v) { a >>>= 0; this._g(a)[a & PM] = v; }\n  r32(a) {\n    a >>>= 0; const o = a & PM, p = this.p[a >>> PS];\n    if (!p) return 0;\n    if (o < PZ - 3) return (p[o] | (p[o+1] << 8) | (p[o+2] << 16) | (p[o+3] << 24)) >>> 0;\n    return (this.r8(a) | (this.r8(a+1) << 8) | (this.r8
+[tr-stream call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed] (a+2) << 16) | (this.r8(a+3) << 24)) >>> 0;\n  }\n  w32(a, v) {\n    a >>>= 0; const o = a & PM, p = this._g(a);\n    if (o < PZ - 3) { p[o]=v; p[o+1]=v>>>8; p[o+2]=v>>>16; p[o+3]=v>>>24; return; }\n    this.w8(a,v); this.w8(a+1,v>>>8); this.w8(a+2,v>>>16); this.w8(a+3,v>>>24);\n  }\n  r16(a) { return this.r8(a) | (this.r
+[tr-stream call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 8(a+1) << 8); }\n  w16(a, v) { this.w8(a, v); this.w8(a+1, v>>>8); }\n  str(a) {\n    a >>>= 0; const b = [];\n    while (1) { const c = this.r8(a++); if (!c) break; b.push(c); if (b.length > 4096) break; }\n    return String.fromCharCode(...b);\n  }\n  loadSeg(va, data, off, fsz) {\n    for (let i = 0; i < fsz; i++) this.w8(va + i
+[tr-stream call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed] , data[off + i]);\n  }\n  // Bulk write from buffer at addr (faster than byte-by-byte for reads)\n  writeBulk(a, buf, n) {\n    for (let i = 0; i < n; i++) {\n      const ai = (a + i) >>> 0;\n      this._g(ai)[ai & PM] = buf[i];\n    }\n  }\n  // Bulk read to buffer\n  readBulk(a, buf, n) {\n    for (let i = 0; i < n; i++) buf[i] = this.r8((a + i) >>> 0);\
+[tr-stream call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed] n  }\n}\n\n// Syscall numbers (x86_64 Linux)\nconst S_read=0,S_write=1,S_open=2,S_close=3,S_lseek=8,S_brk=12;\nconst S_exit=60,S_fsync=74,S_rename=82,S_mkdir=83,S_unlink=87,S_time=201;\n\nfunction xlatFlags(f) {\n  const ac = f & 7;\n  let s = ac === 0 ? 'r' : ac === 1 ? 'w' : 'r+'
+[tr-stream call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed] ;\n  if (f & 64 && s === 'r') s = 'r+';\n  if (f & 512) s = s.includes('+') ? 'w+' : 'w';\n  if (f & 1024) s = s.includes('+') ? 'a+' : 'a';\n  return s;\n}\n\n// CPU\nclass CPU {\n  constructor(mem, entry) {\n    this.mem = mem;\n    this.pc = entry >>> 0;\n    this.npc = (entry + 4) >>> 0;\n    this.r = new Int32Array(32);\n    this.u =
+[tr-stream call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  new Uint32Array(this.r.buffer);\n    this.hi = 0; this.lo = 0;\n    this.exitCode = null;\n    this.ic = 0;\n    this.heapEnd = 0;\n    this.fds = new Map();\n    this.nfd = 3;\n    this.fds.set(0, {t:'s'}); this.fds.set(1, {t:'s'}); this.fds.set(2, {t:'s'});\n  }\n\n  run() {\n    const m = this.mem, u = this.u, r = this.r;\n    let pc = this.pc, npc = this.npc;\n    let ic
+[tr-stream call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  = 0;\n    const checkExit = () => { this.exitCode !== null };\n\n    while (this.exitCode === null) {\n      const I = m.r32(pc);\n      pc = npc;\n      npc = (npc + 4) >>> 0;\n      ic++;\n\n      const op = I >>> 26;\n      const rs = (I >>> 21) & 31, rt = (I >>> 16) & 31, rd = (I >>> 11) & 31;\n      const sh = (I >>> 6) & 31;\n      const si = (I << 16)
+[tr-stream call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  >> 16;\n      const ui = I & 0xFFFF;\n\n      if (op === 0) {\n        // SPECIAL\n        const fn = I & 63;\n        switch (fn) {\n          case 0: u[rd] = (u[rt] << sh) >>> 0; break; // sll\n          case 2: u[rd] = u[rt] >>> sh; break; // srl\n          case 3: u[rd] = r[rt] >> sh; break; // sra\n          case 4: u[rd] = (u[rt] << (u[rs] & 31)) >>> 0; break; // sllv\n          case 6: u[rd] = u[rt] >>> (u[rs] & 31
+[tr-stream call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed] ); break; // srlv\n          case 7: u[rd] = r[rt] >> (u[rs] & 31); break; // srav\n          case 8: npc = u[rs]; break; // jr\n          case 9: { const t = u[rs]; u[rd||31] = (pc + 4) >>> 0; npc = t; break; } // jalr\n          case 10: if (u[rt]===0) u[rd]=u[rs]; break; // movz\n          case 11: if (u[rt]!==0) u[rd]=u[rs]; break; // movn\n          case 12: { // syscall\n            this
+[tr-stream call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed] .doSyscall(u, m, pc);\n            if (this.exitCode !== null) break;\n            break;\n          }\n          case 15: break; // sync\n          case 16: u[rd] = this.hi >>> 0; break; // mfhi\n          case 17: this.hi = u[rs]; break; // mthi\n          case 18: u[rd] = this.lo >>> 0; break; // mflo\n          case 19: this.lo = u[rs]; break; // mtlo\n          case 24: { // mult (signed)\n            const res
+[tr-stream call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  = BigInt(r[rs]) * BigInt(r[rt]);\n            this.lo = Number(res & 0xFFFFFFFFn) >>> 0;\n            this.hi = Number((res >> 32n) & 0xFFFFFFFFn) >>> 0;\n            break;\n          }\n          case 25: { // multu (unsigned)\n            const res = BigInt(u[rs]) * BigInt(u[rt]);\n            this.lo = Number(res & 0xFFFFFFFFn) >>> 0;\n            this.hi = Number((res >> 32n) & 0xFFFFFFFFn) >>> 0;\n            break;\n          }\n          case 26: { // div\n            const a=r[rs], b=r[rt]; if(b){this.lo=(
+[tr-stream call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed] Math.trunc(a/b))>>>0;this.hi=(a%b)>>>0;} break;\n          }\n          case 27: { // divu\n            const a=u[rs], b=u[rt]; if(b){this.lo=(a/b)>>>0;this.hi=(a%b)>>>0;} break;\n          }\n          case 32: case 33: u[rd]=(u[rs]+u[rt])>>>0; break; // add/addu\n          case 34: case 35: u[rd]=(u[rs]-u[rt])>>>0; break; // sub/subu\n          case 36: u[rd]=u[rs]&u[rt]; break; // and\n          case 37:
+[tr-stream call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  u[rd]=u[rs]|u[rt]; break; // or\n          case 38: u[rd]=u[rs]^u[rt]; break; // xor\n          case 39: u[rd]=~(u[rs]|u[rt])>>>0; break; // nor\n          case 42: u[rd]=r[rs]<r[rt]?1:0; break; // slt\n          case 43: u[rd]=(u[rs]>>>0)<(u[rt]>>>0)?1:0; break; // sltu\n          case 48: case 50: case 52: case 54: break; // traps\n          default: this.err(`SPECIAL fn=
+[tr-stream call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 0x${fn.toString(16)} PC=0x${pc.toString(16)}`);\n        }\n      } else {\n        switch (op) {\n          case 2: npc=((pc+4)&0xF0000000)|((I&0x3FFFFFF)<<2); break; // j\n          case 3: u[31]=(pc+4)>>>0; npc=((pc+4)&0xF0000000)|((I&0x3FFFFFF)<<2); break; // jal\n          case 4: if(u[rs]===u[rt]) npc=(pc+4+(si<<2))>>>0; break; // be
+[tr-stream call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed] q\n          case 5: if(u[rs]!==u[rt]) npc=(pc+4+(si<<2))>>>0; break; // bne\n          case 6: if(r[rs]<=0) npc=(pc+4+(si<<2))>>>0; break; // blez\n          case 7: if(r[rs]>0) npc=(pc+4+(si<<2))>>>0; break; // bgtz\n          case 8: case 9: u[rt]=(u[rs]+si)>>>0; break; // addi/addiu
+[tr-stream call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed] \n          case 10: u[rt]=r[rs]<si?1:0; break; // slti\n          case 11: u[rt]=(u[rs]>>>0)<(si>>>0)?1:0; break; // sltiu\n          case 12: u[rt]=u[rs]&ui; break; // andi\n          case 13: u[rt]=u[rs]|ui; break; // ori\n          case 14: u[rt]=u[rs]^ui; break; // xori\n          case 15: u[rt]=(ui<<16)>>>0; break; // lui\n          case 1: { // regimm\n            const sub=rt, tgt=(pc+4+(si<<
+[tr-stream call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 2))>>>0;\n            if(sub===0){if(r[rs]<0)npc=tgt;} // bltz\n            else if(sub===1){if(r[rs]>=0)npc=tgt;} // bgez\n            else if(sub===16){u[31]=(pc+4)>>>0;if(r[rs]<0)npc=tgt;} // bltzal\n            else if(sub===17){u[31]=(pc+4)>>>0;if(r[rs]>=0)npc=tgt;} // bgezal\n            else this.err(`REGIMM ${sub}`);\n            break;\n          }\n          case 16: case 17: case 18: case 19: case 20: case 21: case 22: case 
+[tr-stream call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 23: break; // COPn\n          case 28: { // SPECIAL2\n            const fn2=I&63;\n            switch(fn2){\n              case 2: u[rd]=Math.imul(u[rs],u[rt])>>>0; break; // mul\n              case 0: { // madd\n                const res=BigInt(r[rs])*BigInt(r[rt]);\n                let acc=(BigInt(this.hi>>>0)<<32n)|BigInt(this.lo>>>0);\n                acc=(acc+res)&0xFFFFFFFFFFFFFFFFn;\n                this.lo=Number(acc&0xFFFFFFFFn)>>>0;\n                this.hi=Number(acc>>
+[tr-stream call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 32n)>>>0;\n                break;\n              }\n              case 1: { // maddu\n                const res=BigInt(u[rs])*BigInt(u[rt]);\n                let acc=(BigInt(this.hi>>>0)<<32n)|BigInt(this.lo>>>0);\n                acc=(acc+res)&0xFFFFFFFFFFFFFFFFn;\n                this.lo=Number(acc&0xFFFFFFFFn)>>>0;\n                this.hi=Number(acc>>32n)>>>0;\n                break;\n              }\n              case 32: u[rd]=u[rs]===0?32:Math.clz32(u[rs]); break; // clz\n              case 33: u[rd]=~u[rs]===0?32:Math.clz32(~u[rs]>>>0); break;
+[tr-stream call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  // clo\n              default: this.err(`SPEC2 fn=0x${fn2.toString(16)}`);\n            }\n            break;\n          }\n          case 31: { // SPECIAL3\n            const fn3=I&63;\n            switch(fn3){\n              case 0: u[rt]=(u[rs]>>>sh)&((1<<(rd+1))-1); break; // ext\n              case 4: { const m2=((1<<(rd+1-sh))-1)<<sh; u[rt]=(u[rt]&~m2|((u[rs]<<sh)&m2))>>>0; break; } // ins\n              case 32:
+[tr-stream call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  {\n                const sub=sh;\n                switch(sub){\n                  case 0: { // bitswap\n                    let v=u[rt],r2=0;\n                    for(let i=0;i<4;i++){let b=(v>>>(i*8))&0xff;b=((b&1)<<7)|((b&2)<<5)|((b&4)<<3)|((b&8)<<1)|((b&16)>>1)|((b&32)>>3)|((b&64)>>5)|((b&128)>>7);r2|=(b<<(i*8));}\n                    u[rd]=r2
+[tr-stream call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed] >>>0; break;\n                  }\n                  case 2: u[rd]=(((u[rt]&0x00FF00FF)<<8)|((u[rt]&0xFF00FF00)>>>8))>>>0; break; // wsbh\n                  case 16: u[rd]=((u[rt]&0xFF)<<24)>>24; break; // seb\n                  case 24: u[rd]=((u[rt]&0xFFFF)<<16)>>16; break; // seh\n                  default: this.err(`BSHFL 0x${sub.toString(16)}`);\n                }\n                break;\n              }\n              case 59: u[rt]=0; break; // rdhwr\n              default
+[tr-stream call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed] : this.err(`SPEC3 fn=0x${fn3.toString(16)}`);\n            }\n            break;\n          }\n          // Loads\n          case 32: u[rt]=((m.r8((u[rs]+si)>>>0))<<24)>>24; break; // lb\n          case 33: u[rt]=((m.r16((u[rs]+si)>>>0))<<16)>>16; break; // lh\n          case 34: { // lwl\n            const a=(u[rs]+si)>>>0, al=a&~3, bo=a&3, mv=m.r32(al);\n            if
+[tr-stream call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed] (bo===0)u[rt]=mv;else if(bo===1)u[rt]=(u[rt]&0xFF000000|mv>>>8)>>>0;\n            else if(bo===2)u[rt]=(u[rt]&0xFFFF0000|mv>>>16)>>>0;\n            else u[rt]=(u[rt]&0xFFFFFF00|mv>>>24)>>>0;\n            break;\n          }\n          case 35: u[rt]=m.r32((u[rs]+si)>>>0); break; // lw\n          case 36: u[rt]=m.r8((u[rs]+si)>>>0); break; // lbu\n          case 37: u[rt]=m.r16
+[tr-stream call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed] ((u[rs]+si)>>>0); break; // lhu\n          case 38: { // lwr\n            const a=(u[rs]+si)>>>0, al=a&~3, bo=a&3, mv=m.r32(al);\n            if(bo===0)u[rt]=(u[rt]&0x00FFFFFF|mv<<24)>>>0;\n            else if(bo===1)u[rt]=(u[rt]&0x0000FFFF|mv<<16)>>>0;\n            else if(bo===2)u[rt]=(u[rt]&0x000000FF|mv<<8)>>>0;\n            else u[rt]=mv;\n            break;\n          }\n          // Stores\n          case 40: m.w8((u[rs]+si
+[tr-stream call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed] )>>>0,u[rt]); break; // sb\n          case 41: m.w16((u[rs]+si)>>>0,u[rt]); break; // sh\n          case 42: { // swl\n            const a=(u[rs]+si)>>>0, al=a&~3, bo=a&3, old=m.r32(al), v=u[rt];\n            if(bo===0)m.w32(al,v);else if(bo===1)m.w32(al,(old&0xFF000000|v&0x00FFFFFF)>>>0);\n            else if(bo===2)m.w32(al,(old&0xFFFF0000|v&0x0000FFFF)>>>0);\n            else m.w32(al,(old&0
+[tr-stream call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed] xFFFFFF00|v&0x000000FF)>>>0);\n            break;\n          }\n          case 43: m.w32((u[rs]+si)>>>0,u[rt]); break; // sw\n          case 46: { // swr\n            const a=(u[rs]+si)>>>0, al=a&~3, bo=a&3, old=m.r32(al), v=u[rt];\n            if(bo===0)m.w32(al,(old&0x00FFFFFF|v<<24
+[tr-stream call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed] )>>>0);\n            else if(bo===1)m.w32(al,(old&0x0000FFFF|v<<16)>>>0);\n            else if(bo===2)m.w32(al,(old&0x000000FF|v<<8)>>>0);\n            else m.w32(al,v);\n            break;\n          }\n          case 48: case 49: case 50: case 51: case 52: case 53: case 54: case 55:\n          case 56: case 57: case 58: case 59: case 60: case 61: case 62: case 63: break; // FPU\n          default: this.err(`op=0x${op.toString(
+[tr-stream call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 16)} PC=0x${pc.toString(16)}`);\n        }\n      }\n    }\n    this.pc = pc; this.npc = npc; this.ic = ic;\n  }\n\n  doSyscall(u, m, pc) {\n    const num = u[2], a0 = u[4], a1 = u[5], a2 = u[6];\n    switch (num) {\n      case S_read: {\n        const e = this.fds.get(a0);\n        if (!e || e.t === 's') { u[2] = e ?
+[tr-stream call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  0 : (-1>>>0); return; }\n        const tmp = Buffer.alloc(a2);\n        const n = fs.readSync(e.h, tmp, 0, a2, e.p);\n        m.writeBulk(a1, tmp, n);\n        e.p += n;\n        u[2] = n;\n        return;\n      }\n      case S_write: {\n        const e = this.fds.get(a0);\n        if (!e) { u[2] = -1>>>0; return; }\n        const tmp = Buffer.alloc(a2);\n        m.readBulk(a1, tmp, a2);\n        if (e.t === 's') { try { u[2]=fs.writeSync(a0
+[tr-stream call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed] , tmp); } catch(er){u[2]=a2;} return; }\n        const n = fs.writeSync(e.h, tmp, 0, a2, e.p);\n        e.p += n;\n        if (e.p > e.sz) e.sz = e.p;\n        u[2] = n;\n        return;\n      }\n      case S_open: {\n        const p = m.str(a0), flags = a1, mode = a2;\n        let hp = p;\n        if (p === 'doom.wad' || p === './doom.wad') hp = '/app/doom.wad';\n        try {\n
+[tr-stream call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed]           const hf = xlatFlags(flags);\n          const h = fs.openSync(hp, hf, mode || 0o644);\n          const fd = this.nfd++;\n          let sz = 0;\n          try { sz = fs.fstatSync(h).size; } catch(er){}\n          this.fds.set(fd, {t:'f', h, p:0, sz});\n          u[2] = fd;\n        } catch(er) { u[2] = -1>>>0; }\n        return;\n      }\n      case S_close: {\n        const e = this.fds.get(a0);\n        if (!e) { u[2] = -1>>>0; return; }\n        if (e.t === 'f') try
+[tr-stream call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  { fs.closeSync(e.h); } catch(er){}\n        this.fds.delete(a0);\n        u[2] = 0;\n        return;\n      }\n      case S_lseek: {\n        const e = this.fds.get(a0);\n        if (!e || e.t !== 'f') { u[2] = -1>>>0; return; }\n        const off = (a1<<0)>>0, wh = a2;\n        let np;\n        if (wh===0) np=off; else if(wh===1) np=e.p+off; else np=e.sz+off;\n        if (np<0) { u[2]=-1>>>0; } else { e.p=np; u
+[tr-stream call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed] [2]=np>>>0; }\n        return;\n      }\n      case S_brk: {\n        if (a0===0 || a0<=this.heapEnd) u[2]=this.heapEnd;\n        else { this.heapEnd=a0; u[2]=a0; }\n        return;\n      }\n      case S_exit: this.exitCode=a0; return;\n      case S_fsync: u[2]=0; return;\n      case S_rename: { const o=m.str(a0),n=m.str(a1); try{fs.renameSync(o,n);u[2]=0;}catch(e){u[2]=-1>>>0;} return; }\n      case S_mkdir: { const p
+[tr-stream call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed] =m.str(a0); try{fs.mkdirSync(p,{recursive:true});u[2]=0;}catch(e){u[2]=-1>>>0;} return; }\n      case S_unlink: { const p=m.str(a0); try{fs.unlinkSync(p);u[2]=0;}catch(e){u[2]=-1>>>0;} return; }\n      case S_time: { const t=a0,now=Math.floor(Date.now()/1000); if(t)m.w32(t,now); u[2]=now; return; }\n      default: this.err(`syscall ${num} PC=0x${(pc-4).toString(16)}`);\n    }\n  }\n\n  err(msg)
+[tr-stream call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  { console.error('ERR: ' + msg); process.exit(1); }\n}\n\n// Main\nconst elf = loadELF('/app/doomgeneric_mips');\nconst mem = new Mem();\nfor (const s of elf.segs) mem.loadSeg(s.va, elf.data, s.off, s.fsz);\nconst cpu = new CPU(mem, elf.entry);\ncpu.u[29] = 0x7FFF0000;\ncpu.heapEnd = 0x404b2000;\ntry { fs.mkdirSync('/tmp', {recursive:true}); } catch(e) {}\nconsole
+[tr-stream call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed] .error('Running...');\nconst t0 = Date.now();\nconst exit = cpu.run();\nconst dt = (Date.now()-t0)/1000;\nconsole.error(`Exit: ${exit}, ${cpu.ic} insns in ${dt.toFixed(1)}s (${Math.floor(cpu.ic/dt)} ips)`);\nVMEOF\n",
+      "duration": 0.5
+    }
+  ]
+}
+
+[tr-stream call-0052:worker:xiaomi/mimo-v2.5-pro-ultraspeed] worker.done finish=stop cost_microdollars=153252
+[tr-stream call-0052:xiaomi/mimo-v2.5-pro-ultraspeed] {
+  "analysis": "The Z_Malloc failure is likely caused by the mult/multu bug (incorrect carry handling with JavaScript's signed shift operators). Let me fix that and also optimize the VM for speed. The main bottleneck is the per-instruction overhead and the byte-by-byte file read copying.",
+  "plan": "Fix mult/multu using BigInt for correctness, optimize the execution loop and memory access, and add bulk memory copy for file reads.",
+  "commands": [
+    {
+      "keystrokes": "cat > /app/vm.js << 'VMEOF'\n'use strict';\nconst fs = require('fs');\nconst path = require('path');\n\n// ELF Loader\nfunction loadELF(fp) {\n  const d = fs.readFileSync(fp);\n  const r16 = o => d[o] | (d[o+1] << 8);\n  const r32 = o => (d[o] | (d[o+1] << 8) | (d[o+2] << 16) | (d[o+3] << 24)) >>> 0;\n  const entry = r32(0x18), phoff = r32(0x1c), phnum = r16(0x2c), phesz = r16(0x2a);\n  const segs = [];\n  for (let i = 0; i < phnum; i++) {\n    const o = phoff + i * phesz;\n    if (r32(o) !== 1) continue;\n    segs.push({ off: r32(o+4), va: r32(o+8), fsz: r32(o+16), msz: r32(o+20) });\n  }\n  return { entry, segs, data: d };\n}\n\n// Memory - 64KB pages\nconst PS = 16, PZ = 1 << PS, PM = PZ - 1;\nclass Mem {\n  constructor() { this.p = new Array(0x10000); }\n  _g(a) { const i = a >>> PS; let p = this.p[i]; if (!p) { p = new Uint8Array(PZ); this.p[i] = p; } return p; }\n  r8(a) { a >>>= 0; return (this.p[a >>> PS] || 0)[a & PM]; }\n  w8(a, v) { a >>>= 0; this._g(a)[a & PM] = v; }\n  r32(a) {\n    a >>>= 0; const o = a & PM, p = this.p[a >>> PS];\n    if (!p) return 0;\n    if (o < PZ - 3) return (p[o] | (p[o+1] << 8) | (p[o+2] << 16) | (p[o+3] << 24)) >>> 0;\n    return (this.r8(a) | (this.r8(a+1) << 8) | (this.r8(a+2) << 16) | (this.r8(a+3) << 24)) >>> 0;\n  }\n  w32(a, v) {\n    a >>>= 0; const o = a & PM, p = this._g(a);\n    if (o < PZ - 3) { p[o]=v; p[o+1]=v>>>8; p[o+2]=v>>>16; p[o+3]=v>>>24; return; }\n    this.w8(a,v); this.w8(a+1,v>>>8); this.w8(a+2,v>>>16); this.w8(a+3,v>>>24);\n  }\n  r16(a) { return this.r8(a) | (this.r8(a+1) << 8); }\n  w16(a, v) { this.w8(a, v); this.w8(a+1, v>>>8); }\n  str(a) {\n    a >>>= 0; const b = [];\n    while (1) { const c = this.r8(a++); if (!c) break; b.push(c); if (b.length > 4096) break; }\n    return String.fromCharCode(...b);\n  }\n  loadSeg(va, data, off, fsz) {\n    for (let i = 0; i < fsz; i++) this.w8(va + i, data[off + i]);\n  }\n  // Bulk write from buffer at addr (faster than byte-by-byte for reads)\n  writeBulk(a, buf, n) {\n    for (let i = 0; i < n; i++) {\n      const ai = (a + i) >>> 0;\n      this._g(ai)[ai & PM] = buf[i];\n    }\n  }\n  // Bulk read to buffer\n  readBulk(a, buf, n) {\n    for (let i = 0; i < n; i++) buf[i] = this.r8((a + i) >>> 0);\n  }\n}\n\n// Syscall numbers (x86_64 Linux)\nconst S_read=0,S_write=1,S_open=2,S_close=3,S_lseek=8,S_brk=12;\nconst S_exit=60,S_fsync=74,S_rename=82,S_mkdir=83,S_unlink=87,S_time=201;\n\nfunction xlatFlags(f) {\n  const ac = f & 7;\n  let s = ac === 0 ? 'r' : ac === 1 ? 'w' : 'r+';\n  if (f & 64 && s === 'r') s = 'r+';\n  if (f & 512) s = s.includes('+') ? 'w+' : 'w';\n  if (f & 1024) s = s.includes('+') ? 'a+' : 'a';\n  return s;\n}\n\n// CPU\nclass CPU {\n  constructor(mem, entry) {\n    this.mem = mem;\n    this.pc = entry >>> 0;\n    this.npc = (entry + 4) >>> 0;\n    this.r = new Int32Array(32);\n    this.u = new Uint32Array(this.r.buffer);\n    this.hi = 0; this.lo = 0;\n    this.exitCode = null;\n    this.ic = 0;\n    this.heapEnd = 0;\n    this.fds = new Map();\n    this.nfd = 3;\n    this.fds.set(0, {t:'s'}); this.fds.set(1, {t:'s'}); this.fds.set(2, {t:'s'});\n  }\n\n  run() {\n    const m = this.mem, u = this.u, r = this.r;\n    let pc = this.pc, npc = this.npc;\n    let ic = 0;\n    const checkExit = () => { this.exitCode !== null };\n\n    while (this.exitCode === null) {\n      const I = m.r32(pc);\n      pc = npc;\n      npc = (npc + 4) >>> 0;\n      ic++;\n\n      const op = I >>> 26;\n      const rs = (I >>> 21) & 31, rt = (I >>> 16) & 31, rd = (I >>> 11) & 31;\n      const sh = (I >>> 6) & 31;\n      const si = (I << 16) >> 16;\n      const ui = I & 0xFFFF;\n\n      if (op === 0) {\n        // SPECIAL\n        const fn = I & 63;\n        switch (fn) {\n          case 0: u[rd] = (u[rt] << sh) >>> 0; break; // sll\n          case 2: u[rd] = u[rt] >>> sh; break; // srl\n          case 3: u[rd] = r[rt] >> sh; break; // sra\n          case 4: u[rd] = (u[rt] << (u[rs] & 31)) >>> 0; break; // sllv\n          case 6: u[rd] = u[rt] >>> (u[rs] & 31); break; // srlv\n          case 7: u[rd] = r[rt] >> (u[rs] & 31); break; // srav\n          case 8: npc = u[rs]; break; // jr\n          case 9: { const t = u[rs]; u[rd||31] = (pc + 4) >>> 0; npc = t; break; } // jalr\n          case 10: if (u[rt]===0) u[rd]=u[rs]; break; // movz\n          case 11: if (u[rt]!==0) u[rd]=u[rs]; break; // movn\n          case 12: { // syscall\n            this.doSyscall(u, m, pc);\n            if (this.exitCode !== null) break;\n            break;\n          }\n          case 15: break; // sync\n          case 16: u[rd] = this.hi >>> 0; break; // mfhi\n          case 17: this.hi = u[rs]; break; // mthi\n          case 18: u[rd] = this.lo >>> 0; break; // mflo\n          case 19: this.lo = u[rs]; break; // mtlo\n          case 24: { // mult (signed)\n            const res = BigInt(r[rs]) * BigInt(r[rt]);\n            this.lo = Number(res & 0xFFFFFFFFn) >>> 0;\n            this.hi = Number((res >> 32n) & 0xFFFFFFFFn) >>> 0;\n            break;\n          }\n          case 25: { // multu (unsigned)\n            const res = BigInt(u[rs]) * BigInt(u[rt]);\n            this.lo = Number(res & 0xFFFFFFFFn) >>> 0;\n            this.hi = Number((res >> 32n) & 0xFFFFFFFFn) >>> 0;\n            break;\n          }\n          case 26: { // div\n            const a=r[rs], b=r[rt]; if(b){this.lo=(Math.trunc(a/b))>>>0;this.hi=(a%b)>>>0;} break;\n          }\n          case 27: { // divu\n            const a=u[rs], b=u[rt]; if(b){this.lo=(a/b)>>>0;this.hi=(a%b)>>>0;} break;\n          }\n          case 32: case 33: u[rd]=(u[rs]+u[rt])>>>0; break; // add/addu\n          case 34: case 35: u[rd]=(u[rs]-u[rt])>>>0; break; // sub/subu\n          case 36: u[rd]=u[rs]&u[rt]; break; // and\n          case 37: u[rd]=u[rs]|u[rt]; break; // or\n          case 38: u[rd]=u[rs]^u[rt]; break; // xor\n          case 39: u[rd]=~(u[rs]|u[rt])>>>0; break; // nor\n          case 42: u[rd]=r[rs]<r[rt]?1:0; break; // slt\n          case 43: u[rd]=(u[rs]>>>0)<(u[rt]>>>0)?1:0; break; // sltu\n          case 48: case 50: case 52: case 54: break; // traps\n          default: this.err(`SPECIAL fn=0x${fn.toString(16)} PC=0x${pc.toString(16)}`);\n        }\n      } else {\n        switch (op) {\n          case 2: npc=((pc+4)&0xF0000000)|((I&0x3FFFFFF)<<2); break; // j\n          case 3: u[31]=(pc+4)>>>0; npc=((pc+4)&0xF0000000)|((I&0x3FFFFFF)<<2); break; // jal\n          case 4: if(u[rs]===u[rt]) npc=(pc+4+(si<<2))>>>0; break; // beq\n          case 5: if(u[rs]!==u[rt]) npc=(pc+4+(si<<2))>>>0; break; // bne\n          case 6: if(r[rs]<=0) npc=(pc+4+(si<<2))>>>0; break; // blez\n          case 7: if(r[rs]>0) npc=(pc+4+(si<<2))>>>0; break; // bgtz\n          case 8: case 9: u[rt]=(u[rs]+si)>>>0; break; // addi/addiu\n          case 10: u[rt]=r[rs]<si?1:0; break; // slti\n          case 11: u[rt]=(u[rs]>>>0)<(si>>>0)?1:0; break; // sltiu\n          case 12: u[rt]=u[rs]&ui; break; // andi\n          case 13: u[rt]=u[rs]|ui; break; // ori\n          case 14: u[rt]=u[rs]^ui; break; // xori\n          case 15: u[rt]=(ui<<16)>>>0; break; // lui\n          case 1: { // regimm\n            const sub=rt, tgt=(pc+4+(si<<2))>>>0;\n            if(sub===0){if(r[rs]<0)npc=tgt;} // bltz\n            else if(sub===1){if(r[rs]>=0)npc=tgt;} // bgez\n            else if(sub===16){u[31]=(pc+4)>>>0;if(r[rs]<0)npc=tgt;} // bltzal\n            else if(sub===17){u[31]=(pc+4)>>>0;if(r[rs]>=0)npc=tgt;} // bgezal\n            else this.err(`REGIMM ${sub}`);\n            break;\n          }\n          case 16: case 17: case 18: case 19: case 20: case 21: case 22: case 23: break; // COPn\n          case 28: { // SPECIAL2\n            const fn2=I&63;\n            switch(fn2){\n              case 2: u[rd]=Math.imul(u[rs],u[rt])>>>0; break; // mul\n              case 0: { // madd\n                const res=BigInt(r[rs])*BigInt(r[rt]);\n                let acc=(BigInt(this.hi>>>0)<<32n)|BigInt(this.lo>>>0);\n                acc=(acc+res)&0xFFFFFFFFFFFFFFFFn;\n                this.lo=Number(acc&0xFFFFFFFFn)>>>0;\n                this.hi=Number(acc>>32n)>>>0;\n                break;\n              }\n              case 1: { // maddu\n                const res=BigInt(u[rs])*BigInt(u[rt]);\n                let acc=(BigInt(this.hi>>>0)<<32n)|BigInt(this.lo>>>0);\n                acc=(acc+res)&0xFFFFFFFFFFFFFFFFn;\n                this.lo=Number(acc&0xFFFFFFFFn)>>>0;\n                this.hi=Number(acc>>32n)>>>0;\n                break;\n              }\n              case 32: u[rd]=u[rs]===0?32:Math.clz32(u[rs]); break; // clz\n              case 33: u[rd]=~u[rs]===0?32:Math.clz32(~u[rs]>>>0); break; // clo\n              default: this.err(`SPEC2 fn=0x${fn2.toString(16)}`);\n            }\n            break;\n          }\n          case 31: { // SPECIAL3\n            const fn3=I&63;\n            switch(fn3){\n              case 0: u[rt]=(u[rs]>>>sh)&((1<<(rd+1))-1); break; // ext\n              case 4: { const m2=((1<<(rd+1-sh))-1)<<sh; u[rt]=(u[rt]&~m2|((u[rs]<<sh)&m2))>>>0; break; } // ins\n              case 32: {\n                const sub=sh;\n                switch(sub){\n                  case 0: { // bitswap\n                    let v=u[rt],r2=0;\n                    for(let i=0;i<4;i++){let b=(v>>>(i*8))&0xff;b=((b&1)<<7)|((b&2)<<5)|((b&4)<<3)|((b&8)<<1)|((b&16)>>1)|((b&32)>>3)|((b&64)>>5)|((b&128)>>7);r2|=(b<<(i*8));}\n                    u[rd]=r2>>>0; break;\n                  }\n                  case 2: u[rd]=(((u[rt]&0x00FF00FF)<<8)|((u[rt]&0xFF00FF00)>>>8))>>>0; break; // wsbh\n                  case 16: u[rd]=((u[rt]&0xFF)<<24)>>24; break; // seb\n                  case 24: u[rd]=((u[rt]&0xFFFF)<<16)>>16; break; // seh\n                  default: this.err(`BSHFL 0x${sub.toString(16)}`);\n                }\n                break;\n              }\n              case 59: u[rt]=0; break; // rdhwr\n              default: this.err(`SPEC3 fn=0x${fn3.toString(16)}`);\n            }\n            break;\n          }\n          // Loads\n          case 32: u[rt]=((m.r8((u[rs]+si)>>>0))<<24)>>24; break; // lb\n          case 33: u[rt]=((m.r16((u[rs]+si)>>>0))<<16)>>16; break; // lh\n          case 34: { // lwl\n            const a=(u[rs]+si)>>>0, al=a&~3, bo=a&3, mv=m.r32(al);\n            if(bo===0)u[rt]=mv;else if(bo===1)u[rt]=(u[rt]&0xFF000000|mv>>>8)>>>0;\n            else if(bo===2)u[rt]=(u[rt]&0xFFFF0000|mv>>>16)>>>0;\n            else u[rt]=(u[rt]&0xFFFFFF00|mv>>>24)>>>0;\n            break;\n          }\n          case 35: u[rt]=m.r32((u[rs]+si)>>>0); break; // lw\n          case 36: u[rt]=m.r8((u[rs]+si)>>>0); break; // lbu\n          case 37: u[rt]=m.r16((u[rs]+si)>>>0); break; // lhu\n          case 38: { // lwr\n            const a=(u[rs]+si)>>>0, al=a&~3, bo=a&3, mv=m.r32(al);\n            if(bo===0)u[rt]=(u[rt]&0x00FFFFFF|mv<<24)>>>0;\n            else if(bo===1)u[rt]=(u[rt]&0x0000FFFF|mv<<16)>>>0;\n            else if(bo===2)u[rt]=(u[rt]&0x000000FF|mv<<8)>>>0;\n            else u[rt]=mv;\n            break;\n          }\n          // Stores\n          case 40: m.w8((u[rs]+si)>>>0,u[rt]); break; // sb\n          case 41: m.w16((u[rs]+si)>>>0,u[rt]); break; // sh\n          case 42: { // swl\n            const a=(u[rs]+si)>>>0, al=a&~3, bo=a&3, old=m.r32(al), v=u[rt];\n            if(bo===0)m.w32(al,v);else if(bo===1)m.w32(al,(old&0xFF000000|v&0x00FFFFFF)>>>0);\n            else if(bo===2)m.w32(al,(old&0xFFFF0000|v&0x0000FFFF)>>>0);\n            else m.w32(al,(old&0xFFFFFF00|v&0x000000FF)>>>0);\n            break;\n          }\n          case 43: m.w32((u[rs]+si)>>>0,u[rt]); break; // sw\n          case 46: { // swr\n            const a=(u[rs]+si)>>>0, al=a&~3, bo=a&3, old=m.r32(al), v=u[rt];\n            if(bo===0)m.w32(al,(old&0x00FFFFFF|v<<24)>>>0);\n            else if(bo===1)m.w32(al,(old&0x0000FFFF|v<<16)>>>0);\n            else if(bo===2)m.w32(al,(old&0x000000FF|v<<8)>>>0);\n            else m.w32(al,v);\n            break;\n          }\n          case 48: case 49: case 50: case 51: case 52: case 53: case 54: case 55:\n          case 56: case 57: case 58: case 59: case 60: case 61: case 62: case 63: break; // FPU\n          default: this.err(`op=0x${op.toString(16)} PC=0x${pc.toString(16)}`);\n        }\n      }\n    }\n    this.pc = pc; this.npc = npc; this.ic = ic;\n  }\n\n  doSyscall(u, m, pc) {\n    const num = u[2], a0 = u[4], a1 = u[5], a2 = u[6];\n    switch (num) {\n      case S_read: {\n        const e = this.fds.get(a0);\n        if (!e || e.t === 's') { u[2] = e ? 0 : (-1>>>0); return; }\n        const tmp = Buffer.alloc(a2);\n        const n = fs.readSync(e.h, tmp, 0, a2, e.p);\n        m.writeBulk(a1, tmp, n);\n        e.p += n;\n        u[2] = n;\n        return;\n      }\n      case S_write: {\n        const e = this.fds.get(a0);\n        if (!e) { u[2] = -1>>>0; return; }\n        const tmp = Buffer.alloc(a2);\n        m.readBulk(a1, tmp, a2);\n        if (e.t === 's') { try { u[2]=fs.writeSync(a0, tmp); } catch(er){u[2]=a2;} return; }\n        const n = fs.writeSync(e.h, tmp, 0, a2, e.p);\n        e.p += n;\n        if (e.p > e.sz) e.sz = e.p;\n        u[2] = n;\n        return;\n      }\n      case S_open: {\n        const p = m.str(a0), flags = a1, mode = a2;\n        let hp = p;\n        if (p === 'doom.wad' || p === './doom.wad') hp = '/app/doom.wad';\n        try {\n          const hf = xlatFlags(flags);\n          const h = fs.openSync(hp, hf, mode || 0o644);\n          const fd = this.nfd++;\n          let sz = 0;\n          try { sz = fs.fstatSync(h).size; } catch(er){}\n          this.fds.set(fd, {t:'f', h, p:0, sz});\n          u[2] = fd;\n        } catch(er) { u[2] = -1>>>0; }\n        return;\n      }\n      case S_close: {\n        const e = this.fds.get(a0);\n        if (!e) { u[2] = -1>>>0; return; }\n        if (e.t === 'f') try { fs.closeSync(e.h); } catch(er){}\n        this.fds.delete(a0);\n        u[2] = 0;\n        return;\n      }\n      case S_lseek: {\n        const e = this.fds.get(a0);\n        if (!e || e.t !== 'f') { u[2] = -1>>>0; return; }\n        const off = (a1<<0)>>0, wh = a2;\n        let np;\n        if (wh===0) np=off; else if(wh===1) np=e.p+off; else np=e.sz+off;\n        if (np<0) { u[2]=-1>>>0; } else { e.p=np; u[2]=np>>>0; }\n        return;\n      }\n      case S_brk: {\n        if (a0===0 || a0<=this.heapEnd) u[2]=this.heapEnd;\n        else { this.heapEnd=a0; u[2]=a0; }\n        return;\n      }\n      case S_exit: this.exitCode=a0; return;\n      case S_fsync: u[2]=0; return;\n      case S_rename: { const o=m.str(a0),n=m.str(a1); try{fs.renameSync(o,n);u[2]=0;}catch(e){u[2]=-1>>>0;} return; }\n      case S_mkdir: { const p=m.str(a0); try{fs.mkdirSync(p,{recursive:true});u[2]=0;}catch(e){u[2]=-1>>>0;} return; }\n      case S_unlink: { const p=m.str(a0); try{fs.unlinkSync(p);u[2]=0;}catch(e){u[2]=-1>>>0;} return; }\n      case S_time: { const t=a0,now=Math.floor(Date.now()/1000); if(t)m.w32(t,now); u[2]=now; return; }\n      default: this.err(`syscall ${num} PC=0x${(pc-4).toString(16)}`);\n    }\n  }\n\n  err(msg) { console.error('ERR: ' + msg); process.exit(1); }\n}\n\n// Main\nconst elf = loadELF('/app/doomgeneric_mips');\nconst mem = new Mem();\nfor (const s of elf.segs) mem.loadSeg(s.va, elf.data, s.off, s.fsz);\nconst cpu = new CPU(mem, elf.entry);\ncpu.u[29] = 0x7FFF0000;\ncpu.heapEnd = 0x404b2000;\ntry { fs.mkdirSync('/tmp', {recursive:true}); } catch(e) {}\nconsole.error('Running...');\nconst t0 = Date.now();\nconst exit = cpu.run();\nconst dt = (Date.now()-t0)/1000;\nconsole.error(`Exit: ${exit}, ${cpu.ic} insns in ${dt.toFixed(1)}s (${Math.floor(cpu.ic/dt)} ips)`);\nVMEOF\n",
+      "duration": 0.5
+    }
+  ]
+}

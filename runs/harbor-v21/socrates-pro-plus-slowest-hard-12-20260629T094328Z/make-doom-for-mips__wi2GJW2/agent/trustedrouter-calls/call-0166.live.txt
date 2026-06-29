@@ -1,0 +1,126 @@
+
+[tr-stream call-0166:socrates:trustedrouter/socrates-pro-plus-1.0] socrates.started
+
+[tr-stream call-0166:worker:xiaomi/mimo-v2.5-pro-ultraspeed] worker.started
+[tr-thinking call-0166:worker:xiaomi/mimo-v2.5-pro-ultraspeed] The header bytes show:
+- 49 57 41 44 = "IWAD" ✓
+- f0 04 00 00 = 0x000004f0 = 1264 (little-endian) ✓
+- b4 b7 3f 00 = 0x003fb7b4 = 4175796 (little-endian) ✓
+
+So the header is read correctly! The directory entry shows:
+- 0c 00 00 00 = filepos = 12
+
+[tr-thinking call-0166:worker:xiaomi/mimo-v2.5-pro-ultraspeed] - 00 2a 00 00 = size = 0x2a00 = 10752
+- 50 4c 41 59 = "PLAY"
+- 50 41 4c 00 = "PAL\x00"
+
+This is "PLAYPAL" which is the first lump. filepos=12 is correct (after 12-byte header). size=10752 seems reasonable for PLAYPAL.
+
+So the WAD is loading correctly! But then later we get "W_CacheLumpNum: 9260 >= numlumps" and
+[tr-thinking call-0166:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  "R_InitData...Program terminated at PC=0x0".
+
+The crash at PC=0x0 suggests a null function pointer. And the fact that it now crashes with PC=0x0 instead of the W_CacheLumpNum error (after changing the header debug code) is interesting.
+
+Wait, looking more carefully at the output - there's no "W_CacheLumpNum: 9260 >= numlumps" error anymore. Instead it crashes at "R_InitData...Program terminated at PC=0x0". So the WAD loading seems to be working now! But there's a new crash at PC=0x0 during R_InitData.
+
+Actually, the
+[tr-thinking call-0166:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  issue might be that R_InitData calls functions through function pointers that got corrupted, or it's calling a function that doesn't exist. Let me look at what R_InitData does.
+
+Actually, R_InitData likely calls R_InitColormaps which uses the pow() function. Our pow() returns 1.0 always, which might cause issues.
+
+Actually, let me think about this differently. The "PC=0x0" means a jump to address 0, which means a null function pointer. This could be caused by:
+1. A function pointer in a struct that wasn't initialized
+2. A virtual function table
+3. An indirect call through a corrupted pointer
+
+Let me check what R_InitData does and add
+[tr-thinking call-0166:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  more debug output.
+
+Actually, let me step back. The WAD seems to load correctly now. The crash is in R_InitData. Let me look at what R_InitData does.
+
+But wait - before I debug R_InitData, I should check if the zone memory is large enough. The zone memory is 600000 bytes which is only about 586KB. The original doom might need much more.
+
+Actually, the bigger issue might be the heap. We have a 32MB heap for malloc, but the zone memory allocator uses Z_Malloc which might work differently.
+
+Let me look at the zone allocator more carefully.
+
+Actually, looking at the output again:
+- zone memory: 0x005c1
+[tr-thinking call-0166:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 988, 600000 allocated for zone
+
+The 600000 is 600KB. This might not be enough to load all the WAD lumps. The doom.wad is 4MB, and if we're caching lumps in memory, we might run out.
+
+But the crash is at PC=0x0 which is a null pointer dereference, not an out-of-memory error. So something is going wrong with function pointers.
+
+Let me think about this more carefully. The issue might be with the VM's memory model. The BSS section contains the 32MB heap buffer,
+[tr-thinking call-0166:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  which needs to be zero-initialized. Let me check if the BSS section is being loaded correctly.
+
+Actually, wait - the heap is defined as a static variable in my_stdlib.c, so it should be in the BSS section. But BSS is 32MB + other BSS variables. The VM only loads .text, .data, and .rodata sections. Let me check if it loads .bss.
+
+Looking at the runElf function:
+```
+const sectionsToLoad = [textSection, dataSection, rodataSection].filter(s => s !== null);
+```
+
+It only loads .text, .data, and .rodata sections. .bss is NOT loaded! This means our 
+[tr-thinking call-0166:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 32MB heap is not initialized, and all static variables are uninitialized.
+
+This is likely the root cause of many issues. We need to either:
+1. Add .bss loading to the VM
+2. Initialize the heap in startup code
+3. Move the heap to .data instead of .bss
+
+Let me fix this by initializing the heap from the __start function or making the heap an initialized array (which puts it in .data).
+
+Actually, the simpler fix is to make the heap array initialized (e.g., `static char heap[32 * 1024 * 1024] = {0};`) which should put it in .data instead of .bss, but
+[tr-thinking call-0166:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  that would make the ELF file 32MB. 
+
+A better approach is to modify the VM to load .bss, or add a startup routine that zeroes the BSS.
+
+Actually, the simplest fix is to modify the __start function in doomgeneric_img.c to clear the BSS section before calling main. We need to define the _bss_start and _bss_end symbols in the linker script, then clear that memory in __start.
+
+Let me implement this.
+
+Actually, an even simpler approach: the heap is uninitialized memory, but the malloc/free functions should work fine with uninitialized memory as long as they don't depend on the heap being zeroed. The real issue is
+[tr-thinking call-0166:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  that other BSS variables (like numlumps, static variables, etc.) are uninitialized.
+
+Wait, actually the heap_offset is initialized to 0 at compile time (static size_t heap_offset = 0), and free_list is initialized to NULL (static block_header_t *free_list = NULL). These initializations are in .init_array or similar, or they're just .bss zeroing.
+
+Actually, in C, static variables that are initialized to 0 or NULL are placed in BSS, which the loader should zero. But our VM doesn't load .bss, so they start as whatever the memory happens to contain.
+
+Let me fix this by:
+1. Adding BSS clearing in __
+[tr-thinking call-0166:worker:xiaomi/mimo-v2.5-pro-ultraspeed] start
+2. Or modifying the VM to handle .bss
+
+The most robust fix is to modify __start to clear BSS.
+[tr-stream call-0166:worker:xiaomi/mimo-v2.5-pro-ultraspeed] The header and directory data look correct (IWAD=1264 lumps, first entry is PLAYPAL). The real issue is that the VM only loads .text, .data, and .rodata sections - it does NOT load .bss. This means all static variables (including the heap, global counters, function pointers, etc.) are uninitialized. Let me fix this.
+
+{
+  "analysis": "The VM doesn't load .bss section. All static/global variables that default to zero (
+[tr-stream call-0166:worker:xiaomi/mimo-v2.5-pro-ultraspeed] including heap allocator state, zone memory, function pointers) are uninitialized. Need to add BSS clearing in __start or modify VM to handle .bss.",
+  "plan": "1. Add _bss_start/_end symbols to linker script. 2. Modify __start to clear BSS before calling main. 3. Rebuild and test.",
+  "commands": [
+    {"keystrokes": "cat > /app/doomgeneric/doomgeneric/mips.ld << 'EOF'\nOUTPUT_FORMAT(\"elf32-tradlittlemips\")\nENTRY(main)\nSECTIONS\n{\n  . = 0x400000;\n  .text : { *(.text.startup
+[tr-stream call-0166:worker:xiaomi/mimo-v2.5-pro-ultraspeed] ) *(.text*) }\n  .rodata : { *(.rodata*) }\n  .data : { *(.data*) }\n  .bss : { _bss_start = .; *(.bss*) *(COMMON)\n    . = ALIGN(16);\n    _bss_end = .;\n  }\n  _end = .;\n}\nEOF\n", "duration": 0.1},
+    {"keystrokes": "cat > /tmp/fix_start.py << 'PYEOF'\ndata = open('/app/doomgeneric/doomgeneric/doomgeneric_img.c').read()\nold = '''
+[tr-stream call-0166:worker:xiaomi/mimo-v2.5-pro-ultraspeed] void __start(void) __attribute__((section(\".text.startup\")));\nvoid __start(void) {\n  main(0, 0);\n  while (1);\n}'''\nnew = '''extern char _bss_start[];\nextern char _bss_end[];\n\nvoid __start(void) __attribute__((section(\".text.startup\")));\nvoid __start(void) {\n  // Clear BSS\n  char *p = _bss_start;\n  while (p < _bss_end) *p++ = 0;\n  main(0, 0);\n  while (1);\n}'''\ndata = data.replace(old, new)\n
+[tr-stream call-0166:worker:xiaomi/mimo-v2.5-pro-ultraspeed] open('/app/doomgeneric/doomgeneric/doomgeneric_img.c', 'w').write(data)\nprint('Done')\nPYEOF\n", "duration": 0.1},
+    {"keystrokes": "python3 /tmp/fix_start.py\n", "duration": 0.5},
+    {"keystrokes": "grep -A12 '__start' /app/doomgeneric/doomgeneric/doomgeneric_img.c | head -15\n", "duration": 0.1}
+  ]
+}
+
+[tr-stream call-0166:worker:xiaomi/mimo-v2.5-pro-ultraspeed] worker.done finish=stop cost_microdollars=164279
+[tr-stream call-0166:xiaomi/mimo-v2.5-pro-ultraspeed] The header and directory data look correct (IWAD=1264 lumps, first entry is PLAYPAL). The real issue is that the VM only loads .text, .data, and .rodata sections - it does NOT load .bss. This means all static variables (including the heap, global counters, function pointers, etc.) are uninitialized. Let me fix this.
+
+{
+  "analysis": "The VM doesn't load .bss section. All static/global variables that default to zero (including heap allocator state, zone memory, function pointers) are uninitialized. Need to add BSS clearing in __start or modify VM to handle .bss.",
+  "plan": "1. Add _bss_start/_end symbols to linker script. 2. Modify __start to clear BSS before calling main. 3. Rebuild and test.",
+  "commands": [
+    {"keystrokes": "cat > /app/doomgeneric/doomgeneric/mips.ld << 'EOF'\nOUTPUT_FORMAT(\"elf32-tradlittlemips\")\nENTRY(main)\nSECTIONS\n{\n  . = 0x400000;\n  .text : { *(.text.startup) *(.text*) }\n  .rodata : { *(.rodata*) }\n  .data : { *(.data*) }\n  .bss : { _bss_start = .; *(.bss*) *(COMMON)\n    . = ALIGN(16);\n    _bss_end = .;\n  }\n  _end = .;\n}\nEOF\n", "duration": 0.1},
+    {"keystrokes": "cat > /tmp/fix_start.py << 'PYEOF'\ndata = open('/app/doomgeneric/doomgeneric/doomgeneric_img.c').read()\nold = '''void __start(void) __attribute__((section(\".text.startup\")));\nvoid __start(void) {\n  main(0, 0);\n  while (1);\n}'''\nnew = '''extern char _bss_start[];\nextern char _bss_end[];\n\nvoid __start(void) __attribute__((section(\".text.startup\")));\nvoid __start(void) {\n  // Clear BSS\n  char *p = _bss_start;\n  while (p < _bss_end) *p++ = 0;\n  main(0, 0);\n  while (1);\n}'''\ndata = data.replace(old, new)\nopen('/app/doomgeneric/doomgeneric/doomgeneric_img.c', 'w').write(data)\nprint('Done')\nPYEOF\n", "duration": 0.1},
+    {"keystrokes": "python3 /tmp/fix_start.py\n", "duration": 0.5},
+    {"keystrokes": "grep -A12 '__start' /app/doomgeneric/doomgeneric/doomgeneric_img.c | head -15\n", "duration": 0.1}
+  ]
+}

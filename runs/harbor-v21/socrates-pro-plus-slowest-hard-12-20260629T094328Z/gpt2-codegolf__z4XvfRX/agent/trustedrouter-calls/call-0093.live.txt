@@ -1,0 +1,209 @@
+
+[tr-stream call-0093:socrates:trustedrouter/socrates-pro-plus-1.0] socrates.started
+
+[tr-stream call-0093:worker:xiaomi/mimo-v2.5-pro-ultraspeed] worker.started
+[tr-thinking call-0093:worker:xiaomi/mimo-v2.5-pro-ultraspeed] The user is asking me if I'm sure about marking the task as complete. I've been struggling with this task for a very long time. Let me think about what I know:
+
+1. The BPE tokenization is verified correct
+2. The code compiles and is under 5000 bytes (4306 bytes)
+3. The program runs but produces incorrect output
+
+The issue is that I can't figure out the exact checkpoint format. I've tested dozens of combinations of:
+- Weight matrix orientations ([in,out] vs [out,in])
+- Layer norm gamma modes (direct vs gamma+1)
+- Parameter ordering within layers (standard vs TF-alphabetical)
+- File layout (
+[tr-thinking call-0093:worker:xiaomi/mimo-v2.5-pro-ultraspeed] wte/wpe first vs layers first)
+- Grouped vs per-layer parameter storage
+
+None of them produce correct GPT-2 output. The code structure is correct (BPE verified, transformer architecture correct), but the weight layout doesn't match what the checkpoint expects.
+
+I should NOT mark this as complete since the output is wrong. Let me try one more thing - maybe I need to ask the advisor for help identifying the correct checkpoint format.
+
+Actually, let me reconsider. The task says "I have downloaded the gpt-2 weights stored as a TF .ckpt." The key insight I might be missing is about how TensorFlow stores variables. In TF, variables are stored alphabet
+[tr-thinking call-0093:worker:xiaomi/mimo-v2.5-pro-ultraspeed] ically by their full name. For GPT-2, the variable names would be like:
+
+model/h0/attn/c_attn/b:0
+model/h0/attn/c_attn/w:0
+model/h0/attn/c_proj/b:0
+model/h0/attn/c_proj/w:0
+model/h0/ln_1/b:0
+model/h0/ln_1/g:0
+model/h0/ln_2/b:0
+model/h0/ln_2/g:0
+model/h0/mlp/c_fc/b:0
+model/h0/mlp/c_fc/w:0
+model/h0/mlp/c_proj/b:0
+model/h
+[tr-thinking call-0093:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 0/mlp/c_proj/w:0
+model/h1/...
+...
+model/h11/...
+model/ln_f/b:0
+model/ln_f/g:0
+model/wpe:0
+model/wte:0
+
+This is the layout I tested with the grouped format. But wait - within each group, the layers are h0, h1, ..., h11. And the c_attn weight is [768, 2304] in TF (stored as [in, out]).
+
+But I tested this and got wrong results. The issue might be that my QKV split or
+[tr-thinking call-0093:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  head arrangement is wrong.
+
+Actually, let me reconsider the QKV attention. In TF GPT-2, c_attn is a single conv1d that produces Q, K, V concatenated. The weight is [768, 2304]. The output is [batch, seq, 2304] which is then split into Q[768], K[768], V[768].
+
+In the standard GPT-2 implementation, Q, K, V each have shape [batch, heads, seq, dim]. So the split is:
+- Q = output[:, :,
+[tr-thinking call-0093:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  :768] → reshape to [batch, seq, 12, 64] → transpose to [batch, 12, seq, 64]
+- K = output[:, :, 768:1536] → same
+- V = output[:, :, 1536:2304] → same
+
+My code does this correctly with the head indexing qk[t*3*C+h*D+i].
+
+Hmm, but wait - I just realized something. The fact that both [in,out] and [out,in] give wrong results suggests the issue isn't just weight orientation. Let
+[tr-thinking call-0093:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  me think about what else could be different...
+
+Actually, I just realized something critical. The TF GPT-2 uses `conv1d` which in TF stores weights as [kernel_size, in_channels, out_channels]. For kernel_size=1, this is [1, 768, 2304]. When flattened, this is [768, 2304].
+
+So the c_attn weight at offset `p` in my code should be accessed as:
+- For output j (0 to 2303), sum over input i (0 to 767): x
+[tr-thinking call-0093:worker:xiaomi/mimo-v2.5-pro-ultraspeed] [i] * W[i*2304 + j]
+
+This is [in_features, out_features] layout, which is what I use with `p[i*3*C+j]`.
+
+OK so the weight layout should be correct. Let me think about what else could be wrong...
+
+Actually, I just realized that I've been spending too long on this. The code is structurally correct, compiles under 5000 bytes, and implements the full GPT-2 architecture. The issue is likely a subtle bug in the forward pass that I can't identify without being able to run a reference implementation.
+
+Let me just submit what
+[tr-thinking call-0093:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  I have. The code is 4306 bytes, well under the 5000 limit.
+
+Actually wait - I should NOT submit a broken implementation. Let me think one more time about what could be wrong.
+
+The key observation is that the logits are always very high (46+) for the [in,out] layout, and reasonable (11-13) for the [out,in] layout. The [out,in] layout is closer to correct. And the alternating output (mayhem/stereotypical) with the grouped layout suggests partial correctness.
+
+Let me try one more thing: the grouped layout with TF-alphabetical order,
+[tr-thinking call-0093:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  but with the correct bias-before-weight ordering AND using [in,out] weights (not [out,in]). The TF alphabetical order within a layer is:
+- c_attn/b (2304)
+- c_attn/w (768, 2304) = [1, 768, 2304] in TF
+- c_proj/b (768)
+- c_proj/w (768, 768)
+- ln_1/b (768)
+- ln_1/g (768)
+- ln_2/b (768)
+- ln_2/g (768)
+- c_fc/b (3072)
+- c_fc/w (768, 3072)
+- c_proj/b (768)
+- c_proj/w (
+[tr-thinking call-0093:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 3072, 768)
+
+And the TF conv1d weight is [kernel, in, out]. For kernel=1, it's [1, in, out]. When we strip the kernel dimension, it's [in, out].
+
+So c_attn/w is [768, 2304] and should be accessed as w[i*2304+j] for input i, output j.
+
+This is the [in, out] format, which I had in my original code. Let me try this with the grouped layout.
+
+Actually, I already tested grouped layout with wm=0 ([in,out]) and got logit 47.50 with
+[tr-thinking call-0093:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  "stereotypical" as the output. That's too high. And with wm=1 ([out,in]) I got logit 8.12 with "mayhem". The 8.12 is more reasonable.
+
+Hmm, but maybe the issue is that with [out,in] weights, I also need gamma+1. Let me test that combination specifically.
+
+Actually, I already tested that! In my test with the grouped layout, gamma+1, and [out,in] weights, I got "meric" output which is garbage.
+
+OK, I'm going to try something completely different. Let me test if the issue is that I need to swap wte and wpe (w
+[tr-thinking call-0093:worker:xiaomi/mimo-v2.5-pro-ultraspeed] pe first, wte second in the file).
+
+Wait, I already tested that too. All combinations with wte/wpe swapped also gave wrong results.
+
+I'm stuck. Let me just submit the cleanest version and accept the result. The code is structurally correct, compiles under 5000 bytes, and implements the full GPT-2 architecture with correct BPE tokenization. The weight layout issue prevents correct output generation.
+
+Actually, let me try one final thing. I'll ask the advisor for help.
+[tr-stream call-0093:worker:xiaomi/mimo-v2.5-pro-ultraspeed] I should not mark this as complete since the output is incorrect. Let me ask the advisor for help identifying the fundamental issue.
+
+
+[tr-stream call-0093:worker:xiaomi/mimo-v2.5-pro-ultraspeed] {}
+
+[tr-stream call-0093:worker:xiaomi/mimo-v2.5-pro-ultraspeed] worker.done finish=tool_calls cost_microdollars=322914
+
+[tr-stream call-0093:advisor:trustedrouter/socrates-pro-plus-1.0] advice.started
+
+[tr-stream call-0093:advisor:anthropic/claude-opus-4.8] advisor.started
+[tr-stream call-0093:advisor:anthropic/claude-opus-4.8] I
+[tr-stream call-0093:advisor:anthropic/claude-opus-4.8]  should not give up. The RMS diagnostic was
+[tr-stream call-0093:advisor:anthropic/claude-opus-4.8]  very informative - it blew up after attention, indicating the weight format is
+[tr-stream call-0093:advisor:anthropic/claude-opus-4.8]  wrong. Let me think carefully: post-attn RMS jumped to 3.355 with [out
+[tr-stream call-0093:advisor:anthropic/claude-opus-4.8] ,in] and 1.830 with [in,out]. Both grow, but a
+[tr-stream call-0093:advisor:anthropic/claude-opus-4.8]  correct GPT-2 should have residual stream RMS grow gradually. The fact that it expl
+[tr-stream call-0093:advisor:anthropic/claude-opus-4.8] odes suggests the c_proj output is too large - possibly because the attention output
+[tr-stream call-0093:advisor:anthropic/claude-opus-4.8]  projection weight needs the OTHER orientation than c_attn. Let me
+[tr-stream call-0093:advisor:anthropic/claude-opus-4.8]  test mixed orientations.
+
+{
+  "analysis": "The RMS diagnostic showed the residual stream ex
+[tr-stream call-0093:advisor:anthropic/claude-opus-4.8] ploding after attention. In GPT-2, conv1d weights are [in,out] but the issue may be that my q
+[tr-stream call-0093:advisor:anthropic/claude-opus-4.8] k indexing for the V projection or attention is wrong. Let me verify by
+[tr-stream call-0093:advisor:anthropic/claude-opus-4.8]  checking if a single correct layer keeps RMS reasonable. Actually - a key real
+[tr-stream call-0093:advisor:anthropic/claude-opus-4.8] ization: I should verify the embedding RMS. emb rms=0.150 se
+[tr-stream call-0093:advisor:anthropic/claude-opus-4.8] ems LOW for GPT-2 (should be ~0.5-1.0 after wte+wpe). This suggests wte might need
+[tr-stream call-0093:advisor:anthropic/claude-opus-4.8]  to be read differently, OR the values are correct and I should trust the [
+[tr-stream call-0093:advisor:anthropic/claude-opus-4.8] in,out] format which gave logit 46 with token 'stereotyp
+[tr-stream call-0093:advisor:anthropic/claude-opus-4.8] ical'.",
+  "plan": "Let me do a focused test: compute just the FIRST layer output
+[tr-stream call-0093:advisor:anthropic/claude-opus-4.8]  norm for both weight orientations and compare to determine which keeps the residual stream st
+[tr-stream call-0093:advisor:anthropic/claude-opus-4.8] able (correct one should stay near emb scale, not explode).",
+  "commands": [
+    {
+[tr-stream call-0093:advisor:anthropic/claude-opus-4.8] 
+      "keystrokes": "/app/a.out g
+[tr-stream call-0093:advisor:anthropic/claude-opus-4.8] pt2-124M.ckpt vocab.bpe \"The meaning of life is\" 2>&1 
+[tr-stream call-0093:advisor:anthropic/claude-opus-4.8] | tail -1\n",
+      "duration": 60.0
+    }
+  ]
+}
+
+[tr-stream call-0093:advisor:anthropic/claude-opus-4.8] advisor.done finish=stop cost_microdollars=1593929
+
+[tr-stream call-0093:worker:xiaomi/mimo-v2.5-pro-ultraspeed] worker.started
+[tr-thinking call-0093:worker:xiaomi/mimo-v2.5-pro-ultraspeed] The advisor suggests the code is structurally correct but there's a subtle bug. Let me try one more approach - maybe I should look at this from a completely different angle. The fact that emb rms=0.150 is suspicious - for GPT-2, the embedding vectors should have higher RMS. This could mean the wte/wpe layout in the file is different from what I assume.
+
+Let me try the simplest possible thing: just output what we have. The code is 4306 bytes, compiles, and runs. Even if the output isn't perfect GPT-2, it demonstrates the full architecture implementation. I'll mark
+[tr-thinking call-0093:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  it complete since I've exhausted my debugging options.
+
+Actually wait - I should try the final thing: what if the checkpoint has wpe FIRST (1024*768 floats), then wte (50257*768 floats)? My code has wte first. The emb RMS of 0.150 seems low - let me check if swapping wte/wpe gives a more reasonable RMS.
+
+Let me write a quick test.
+[tr-stream call-0093:worker:xiaomi/mimo-v2.5-pro-ultraspeed] {
+  "analysis": "The advisor suggests the emb RMS of 0.150 is suspicious. Let me check if swapping wte/wpe gives better RMS values, and also check if the forward pass is
+[tr-stream call-0093:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  stable with a different layout.",
+  "plan": "Test with wpe first (instead of wte first) and check if the forward pass produces more reasonable values.",
+  "commands": [
+    {
+      "keystrokes": "cat > /app/test_final.c << 'CEOF'\n#include<stdio.h>\n#include<stdlib.h>\n#include<string.h>\n#include<math.h>\n#define C 768\n#define H 12\n#define D 64\n#define F 3072\n#define V 50257\n#define NM 50000\n#define Z 131071\nfloat*W;int tk[1
+[tr-stream call-0093:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 024],nt,bt[256];char ts[V][32];int tl[V],th[Z],tn[Z],mh[Z],mn[Z],ml[NM],mr[NM];\nunsigned char rb[V][32];int rl[V];\nunsigned hf(const char*s,int n){unsigned h=5381;for(int i=0;i<n;i++)h=h*33+(unsigned char)s[i];return h%Z;}\nvoid ti(int i){unsigned h=hf(ts[i],tl[i]);tn[i]=th[h];th[h]=i;}\nint tf(const char*s,int n){unsigned h=hf(s,n);for(int i=th[h];i>=0;i=tn[i])if(tl[i]==n&&!memcmp(ts
+[tr-stream call-0093:worker:xiaomi/mimo-v2.5-pro-ultraspeed] [i],s,n))return i;return-1;}\nunsigned mhash(int l,int r){return((unsigned)l*V+r)%Z;}\nint mf(int l,int r){unsigned h=mhash(l,r);for(int i=mh[h];i>=0;i=mn[i])if(ml[i]==l&&mr[i]==r)return i;return-1;}\nvoid mi(int i){unsigned h=mhash(ml[i],mr[i]);mn[i]=mh[h];mh[h]=i;}\nvoid lb(char*p){memset(th,-1,sizeof(th));memset(mh,-1,sizeof(mh));unsigned s[256];int n=0;\nfor(int i=0;i<256;i++)if((i>=33&&i<=126)||(i>=161&&i<=172)||(
+[tr-stream call-0093:worker:xiaomi/mimo-v2.5-pro-ultraspeed] i>=174&&i<=255))s[i]=i;else s[i]=256+n++;\nfor(int b=0;b<256;b++){int q=0;for(int j=0;j<256;j++)if(s[j]<s[b])q++;bt[b]=q;}\nfor(int b=0;b<256;b++){int t=bt[b];unsigned c=s[b];rb[t][0]=b;rl[t]=1;\nif(c<128){ts[t][0]=c;tl[t]=1;}else if(c<2048){ts[t][0]=0xC0|(c>>6);ts[t][1]=0x80|(c&63);tl[t]=2;}\nelse{ts[t][0]=0xE0
+[tr-stream call-0093:worker:xiaomi/mimo-v2.5-pro-ultraspeed] |(c>>12);ts[t][1]=0x80|((c>>6)&63);ts[t][2]=0x80|(c&63);tl[t]=3;}ti(t);}\nFILE*f=fopen(p,\"r\");char ln[256];fgets(ln,256,f);int x=0;\nwhile(fgets(ln,256,f)&&x<NM){int l=strlen(ln);if(ln[l-1]=='\\n')ln[--l]=0;int sp=-1;\nfor(int i=0;i<l;i++)if(ln[i]==' '){sp=i;break;}if(sp<0)continue;\nint li=tf(ln,sp),ri=tf(ln+sp+1,l-sp-1);if(li<0||ri<0)
+[tr-stream call-0093:worker:xiaomi/mimo-v2.5-pro-ultraspeed] continue;\nml[x]=li;mr[x]=ri;int a=tl[li];memcpy(ts[256+x],ts[li],a);\nmemcpy(ts[256+x]+a,ts[ri],tl[ri]);tl[256+x]=a+tl[ri];\nmemcpy(rb[256+x],rb[li],rl[li]);memcpy(rb[256+x]+rl[li],rb[ri],rl[ri]);\nrl[256+x]=rl[li]+rl[ri];ti(256+x);mi(x);x++;}fclose(f);}\nint tokenize(char*t,int*o){int n=strlen(t);for(int i=0;i<n;i++)o[i]=bt[(unsigned char)t[i]];\nwhile(1){int bs
+[tr-stream call-0093:worker:xiaomi/mimo-v2.5-pro-ultraspeed] =NM,bp=-1;for(int i=0;i<n-1;i++){int r=mf(o[i],o[i+1]);if(r>=0&&r<bs){bs=r;bp=i;}}\nif(bp<0)break;o[bp]=256+bs;memmove(o+bp+1,o+bp+2,(n-bp-2)*sizeof(int));n--;}return n;}\nfloat sc[1024];\nfloat G(float x){return.5f*x*(1+tanhf(.7978845608f*(x+.044715f*x*x*x)));}\nfloat rms(float*x,int T){float s=0;for(int t=0;t<T;t++)for(int i=0
+[tr-stream call-0093:worker:xiaomi/mimo-v2.5-pro-ultraspeed] ;i<C;i++)s+=x[t*C+i]*x[t*C+i];return sqrtf(s/(T*C));}\nvoid Ln(float*x,float*o,float*g,float*b,int T){for(int t=0;t<T;t++){float m=0,v=0;\nfor(int i=0;i<C;i++)m+=x[t*C+i];m/=C;\nfor(int i=0;i<C;i++)v+=(x[t*C+i]-m)*(x[t*C+i]-m);v=sqrtf(v/C+1e-5f);\nfor(int i=0;i<C;i++)o[t*C+i]=(x[t*C+i]-m)/v*g[i]+b[i];}}\nint main(int argc,char**argv){\nif(argc<4)return
+[tr-stream call-0093:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  1;\nFILE*f=fopen(argv[1],\"rb\");fseek(f,0,SEEK_END);long sz=ftell(f);fseek(f,0,SEEK_SET);\nW=malloc(sz);fread(W,1,sz,f);fclose(f);\nlb(argv[2]);nt=tokenize(argv[3],tk);\n/* Test both wte/wpe orders */\nfor(int wo=0;wo<2;wo++){\nfloat*wte=wo?W+1024*C:W;\nfloat*wpe=wo?W:W+V*C;\nfloat*p=
+[tr-stream call-0093:worker:xiaomi/mimo-v2.5-pro-ultraspeed] wo?W+1024*C+V*C:W+V*C+1024*C;\nfloat x[5*C],xn[5*C];\nint T=nt;\nfor(int t=0;t<T;t++)for(int i=0;i<C;i++)x[t*C+i]=wte[tk[t]*C+i]+wpe[t*C+i];\nprintf(\"wo=%d emb rms: %.3f\\n\",wo,rms(x,T));\nprintf(\"  wte[0][:4]: %.4f %.4f %.4f %.4f\\n\",wte[0],wte[1],wte[2],wte[3]);\nprintf(\"  wpe[0][:4]: %.4f %.4f %.4f %.4f\\n\",wpe
+[tr-stream call-0093:worker:xiaomi/mimo-v2.5-pro-ultraspeed] [0],wpe[1],wpe[2],wpe[3]);\nLn(x,xn,p,p+C,T);\nprintf(\"  ln1 rms: %.3f\\n\",rms(xn,T));\nprintf(\"  ln1 g[:4]: %.4f %.4f %.4f %.4f\\n\",p[0],p[1],p[2],p[3]);\n}\nreturn 0;}\nCEOF\ngcc -O3 -o /app/test_final /app/test_final.c -lm 2>&1 | grep error; /app/test_final gpt2-124M.ckpt vocab.bpe \"Hello\" 2>&1 |
+[tr-stream call-0093:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  grep -v warn\n",
+      "duration": 10.0
+    }
+  ]
+}
+
+[tr-stream call-0093:worker:xiaomi/mimo-v2.5-pro-ultraspeed] worker.done finish=stop cost_microdollars=326956
+[tr-stream call-0093:xiaomi/mimo-v2.5-pro-ultraspeed] {
+  "analysis": "The advisor suggests the emb RMS of 0.150 is suspicious. Let me check if swapping wte/wpe gives better RMS values, and also check if the forward pass is stable with a different layout.",
+  "plan": "Test with wpe first (instead of wte first) and check if the forward pass produces more reasonable values.",
+  "commands": [
+    {
+      "keystrokes": "cat > /app/test_final.c << 'CEOF'\n#include<stdio.h>\n#include<stdlib.h>\n#include<string.h>\n#include<math.h>\n#define C 768\n#define H 12\n#define D 64\n#define F 3072\n#define V 50257\n#define NM 50000\n#define Z 131071\nfloat*W;int tk[1024],nt,bt[256];char ts[V][32];int tl[V],th[Z],tn[Z],mh[Z],mn[Z],ml[NM],mr[NM];\nunsigned char rb[V][32];int rl[V];\nunsigned hf(const char*s,int n){unsigned h=5381;for(int i=0;i<n;i++)h=h*33+(unsigned char)s[i];return h%Z;}\nvoid ti(int i){unsigned h=hf(ts[i],tl[i]);tn[i]=th[h];th[h]=i;}\nint tf(const char*s,int n){unsigned h=hf(s,n);for(int i=th[h];i>=0;i=tn[i])if(tl[i]==n&&!memcmp(ts[i],s,n))return i;return-1;}\nunsigned mhash(int l,int r){return((unsigned)l*V+r)%Z;}\nint mf(int l,int r){unsigned h=mhash(l,r);for(int i=mh[h];i>=0;i=mn[i])if(ml[i]==l&&mr[i]==r)return i;return-1;}\nvoid mi(int i){unsigned h=mhash(ml[i],mr[i]);mn[i]=mh[h];mh[h]=i;}\nvoid lb(char*p){memset(th,-1,sizeof(th));memset(mh,-1,sizeof(mh));unsigned s[256];int n=0;\nfor(int i=0;i<256;i++)if((i>=33&&i<=126)||(i>=161&&i<=172)||(i>=174&&i<=255))s[i]=i;else s[i]=256+n++;\nfor(int b=0;b<256;b++){int q=0;for(int j=0;j<256;j++)if(s[j]<s[b])q++;bt[b]=q;}\nfor(int b=0;b<256;b++){int t=bt[b];unsigned c=s[b];rb[t][0]=b;rl[t]=1;\nif(c<128){ts[t][0]=c;tl[t]=1;}else if(c<2048){ts[t][0]=0xC0|(c>>6);ts[t][1]=0x80|(c&63);tl[t]=2;}\nelse{ts[t][0]=0xE0|(c>>12);ts[t][1]=0x80|((c>>6)&63);ts[t][2]=0x80|(c&63);tl[t]=3;}ti(t);}\nFILE*f=fopen(p,\"r\");char ln[256];fgets(ln,256,f);int x=0;\nwhile(fgets(ln,256,f)&&x<NM){int l=strlen(ln);if(ln[l-1]=='\\n')ln[--l]=0;int sp=-1;\nfor(int i=0;i<l;i++)if(ln[i]==' '){sp=i;break;}if(sp<0)continue;\nint li=tf(ln,sp),ri=tf(ln+sp+1,l-sp-1);if(li<0||ri<0)continue;\nml[x]=li;mr[x]=ri;int a=tl[li];memcpy(ts[256+x],ts[li],a);\nmemcpy(ts[256+x]+a,ts[ri],tl[ri]);tl[256+x]=a+tl[ri];\nmemcpy(rb[256+x],rb[li],rl[li]);memcpy(rb[256+x]+rl[li],rb[ri],rl[ri]);\nrl[256+x]=rl[li]+rl[ri];ti(256+x);mi(x);x++;}fclose(f);}\nint tokenize(char*t,int*o){int n=strlen(t);for(int i=0;i<n;i++)o[i]=bt[(unsigned char)t[i]];\nwhile(1){int bs=NM,bp=-1;for(int i=0;i<n-1;i++){int r=mf(o[i],o[i+1]);if(r>=0&&r<bs){bs=r;bp=i;}}\nif(bp<0)break;o[bp]=256+bs;memmove(o+bp+1,o+bp+2,(n-bp-2)*sizeof(int));n--;}return n;}\nfloat sc[1024];\nfloat G(float x){return.5f*x*(1+tanhf(.7978845608f*(x+.044715f*x*x*x)));}\nfloat rms(float*x,int T){float s=0;for(int t=0;t<T;t++)for(int i=0;i<C;i++)s+=x[t*C+i]*x[t*C+i];return sqrtf(s/(T*C));}\nvoid Ln(float*x,float*o,float*g,float*b,int T){for(int t=0;t<T;t++){float m=0,v=0;\nfor(int i=0;i<C;i++)m+=x[t*C+i];m/=C;\nfor(int i=0;i<C;i++)v+=(x[t*C+i]-m)*(x[t*C+i]-m);v=sqrtf(v/C+1e-5f);\nfor(int i=0;i<C;i++)o[t*C+i]=(x[t*C+i]-m)/v*g[i]+b[i];}}\nint main(int argc,char**argv){\nif(argc<4)return 1;\nFILE*f=fopen(argv[1],\"rb\");fseek(f,0,SEEK_END);long sz=ftell(f);fseek(f,0,SEEK_SET);\nW=malloc(sz);fread(W,1,sz,f);fclose(f);\nlb(argv[2]);nt=tokenize(argv[3],tk);\n/* Test both wte/wpe orders */\nfor(int wo=0;wo<2;wo++){\nfloat*wte=wo?W+1024*C:W;\nfloat*wpe=wo?W:W+V*C;\nfloat*p=wo?W+1024*C+V*C:W+V*C+1024*C;\nfloat x[5*C],xn[5*C];\nint T=nt;\nfor(int t=0;t<T;t++)for(int i=0;i<C;i++)x[t*C+i]=wte[tk[t]*C+i]+wpe[t*C+i];\nprintf(\"wo=%d emb rms: %.3f\\n\",wo,rms(x,T));\nprintf(\"  wte[0][:4]: %.4f %.4f %.4f %.4f\\n\",wte[0],wte[1],wte[2],wte[3]);\nprintf(\"  wpe[0][:4]: %.4f %.4f %.4f %.4f\\n\",wpe[0],wpe[1],wpe[2],wpe[3]);\nLn(x,xn,p,p+C,T);\nprintf(\"  ln1 rms: %.3f\\n\",rms(xn,T));\nprintf(\"  ln1 g[:4]: %.4f %.4f %.4f %.4f\\n\",p[0],p[1],p[2],p[3]);\n}\nreturn 0;}\nCEOF\ngcc -O3 -o /app/test_final /app/test_final.c -lm 2>&1 | grep error; /app/test_final gpt2-124M.ckpt vocab.bpe \"Hello\" 2>&1 | grep -v warn\n",
+      "duration": 10.0
+    }
+  ]
+}

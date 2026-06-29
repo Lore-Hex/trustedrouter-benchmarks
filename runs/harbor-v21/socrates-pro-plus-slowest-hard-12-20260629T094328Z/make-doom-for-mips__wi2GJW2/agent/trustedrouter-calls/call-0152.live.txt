@@ -1,0 +1,526 @@
+
+[tr-stream call-0152:socrates:trustedrouter/socrates-pro-plus-1.0] socrates.started
+
+[tr-stream call-0152:worker:xiaomi/mimo-v2.5-pro-ultraspeed] worker.started
+[tr-thinking call-0152:worker:xiaomi/mimo-v2.5-pro-ultraspeed] The output shows "IWAD?" which means the header identification was read correctly (IWAD). But the numlumps is wrong - it says 9260 when it should be 1264. The raw bytes printed after "IWAD" are the raw header bytes.
+
+Looking at the output: "IWAD?" - the question mark is interesting. The 12 bytes printed include the 4-byte identification, 4-byte numlumps, and 4-byte infotableofs. The "?" after IWAD is actually the first byte of numlumps rendered as ASCII.
+
+Wait, the issue is that I'm printing raw bytes as characters
+[tr-thinking call-0152:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  - the numlumps and infotableofs are binary values, not ASCII. Let me look at what's happening more carefully.
+
+The doom.wad file has:
+- identification: IWAD
+- numlumps: 1264 (0x000004F0 in little-endian: F0 04 00 00)
+- infotableofs: 4175796 (0x003FB8B4 in little-endian: B4 B8 3F 00)
+
+So the 12 bytes would be: 'I','W','A','D', 0xF0, 0x0
+[tr-thinking call-0152:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 4, 0x00, 0x00, 0xB4, 0xB8, 0x3F, 0x00
+
+But the error says 9260 lumps. 9260 = 0x242C. Let me think about what could produce 9260...
+
+Actually, wait. The problem might be that `sizeof(header)` in the W_Read call doesn't match what we expect. The `wadinfo_t` structure might have different padding on MIPS compared to what the compiler produces.
+
+Let me look at the wadinfo_t structure definition:
+```c
+typedef struct
+{
+    char identification[4];
+    int numlumps;
+    int infotableofs;
+} wadinfo_t;
+```
+
+This
+[tr-thinking call-0152:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  should be 12 bytes with no padding. But maybe the compiler is adding padding?
+
+Actually, looking at the "IWAD?" output - the '?' character is the first byte of numlumps being printed as a character. 0xF0 (which is 240) would render as 'ð' in Latin-1, but the terminal might show it as '?'. So the header IS being read correctly from the file.
+
+Wait, but then why is numlumps = 9260? Let me think...
+
+9260 in hex is 0x242C. If the header is
+[tr-thinking call-0152:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  read correctly, numlumps should be 1264 = 0x04F0. 
+
+Hmm, maybe the issue is that the `W_Read` function isn't reading the right data. Or maybe the file position isn't being reset properly between reads.
+
+Actually, wait. Let me look at the W_Read implementation again:
+
+```c
+size_t W_StdC_Read(wad_file_t *wad, unsigned int offset,
+                   void *buffer, size_t buffer_len)
+{
+    stdc_wad_file_t *stdc_wad;
+    size_t result;
+
+    stdc_wad = (stdc_wad_file_t *) wad;
+
+    // Jump to the specified position in the file.
+    fseek(stdc_wad->fstream
+[tr-thinking call-0152:worker:xiaomi/mimo-v2.5-pro-ultraspeed] , offset, SEEK_SET);
+
+    // Read into the buffer.
+    result = fread(buffer, 1, buffer_len, stdc_wad->fstream);
+
+    return result;
+}
+```
+
+This uses `fseek` which is implemented as:
+```c
+int fseek(FILE *fp, long offset, int whence) {
+    if (!fp) return -1;
+    fp->eof = 0;
+    return sys_lseek(fp->fd, offset, whence);
+}
+```
+
+And `sys_lseek` is:
+```c
+int sys_lseek(int fd, int offset, int whence) {
+    return _syscall3(SYS_LSEEK, fd, offset, whence);
+}
+```
+
+But wait - `SYS_LSEEK` is 
+[tr-thinking call-0152:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 8 which is the x86 syscall number. But in the VM, lseek returns the new file position in `$v0` (register 2), and our C code uses that as the return value.
+
+Actually, looking more carefully at the VM's lseek:
+```javascript
+} else if (syscallNum === 8) {  // SYS_lseek
+    const fd = this.fileDescriptors[this.registers[4]];
+    const offset = this.registers[5];
+    const whence = this.registers[6];
+```
+
+The registers used are `$a0` (register 4), `$a1` (register 5), `$a2` (register 6). These are correct for the MIPS syscall convention.
+
+But wait - the
+[tr-thinking call-0152:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  `offset` parameter in lseek is typically `off_t` which on 32-bit is 32 bits. This should be fine.
+
+The issue might be that the VM's file caching is not working correctly. When the file is opened, the VM reads the entire file into memory. When fseek is called, it should update the position in the cache. When fread is called, it should read from that position.
+
+Let me look at how the VM handles file reads. The `SYS_read` handler uses `this.fileCache[fd]` to read data. The position is tracked in `fileInfo.position`.
+
+Actually, I think I see the issue! The VM's
+[tr-thinking call-0152:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  `SYS_lseek` handler uses `this.fileDescriptors[this.registers[4]]` to get the actual fd, but `SYS_read` uses the fd directly from `this.registers[4]`. Let me check...
+
+Looking at SYS_read:
+```javascript
+} else if (syscallNum === 0) {  // SYS_read
+    const fd = this.registers[4];
+```
+
+And SYS_lseek:
+```javascript
+} else if (syscallNum === 8) {  // SYS_lseek
+    const fd = this.fileDescriptors[this.registers[4]];
+```
+
+The read uses the MIPS fd directly, while lseek maps it through `this.fileDescriptors`! This is
+[tr-thinking call-0152:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  inconsistent and would cause lseek to operate on a different file than what read is using.
+
+Actually wait, let me re-read. For SYS_read:
+```javascript
+const fd = this.registers[4];
+```
+
+And the file cache is indexed by `fd`. When the file is opened with SYS_open:
+```javascript
+const fd = fs.openSync(pathname, fsFlags, mode);
+this.fileDescriptors[this.fdCounter] = fd;
+this.fileCache[fd] = { ... };
+```
+
+So `this.fileDescriptors` maps MIPS fds to Node.js fds. When MIPS code does `read(mips_fd, ...)`, the VM reads `mips_fd` from `$a0`, but uses
+[tr-thinking call-0152:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  it directly to look up in `this.fileCache`. But the file was stored with the Node.js fd as the key!
+
+So SYS_read uses `this.registers[4]` (which is the MIPS fd counter like 3, 4, 5...) but the fileCache is indexed by the Node.js fd (like 23, 24, 25...).
+
+Wait, but it also does:
+```javascript
+if (this.fileCache[fd]) {
+```
+
+If `fd` is the MIPS fd (like 3) and the fileCache key is the Node.js fd (like 23), then `this.fileCache[3]` would be undefined, and it would fall through to the else case:
+```javascript
+} else {
+    // For regular files,
+[tr-thinking call-0152:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  read from our cached file data
+    if (!this.fileCache[fd]) {
+        this.registers[2] = -1;  // Error: file not in cache
+        return;
+    }
+```
+
+Hmm, this would mean reads always fail. But the WAD file IS being read (it says "Open!" and starts loading). So maybe the fds are actually the same.
+
+Let me re-read the open handler more carefully:
+
+```javascript
+const fd = fs.openSync(pathname, fsFlags, mode);
+// ...
+this.fileDescriptors[this.fdCounter] = fd;
+```
+
+And the returned fd to MIPS is:
+```javascript
+this.registers[2] = this.fdCounter;
+this.fdCounter++;
+```
+
+So the MIPS gets
+[tr-thinking call-0152:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  `this.fdCounter` (starting from 3), and the Node.js fd is stored in `this.fileDescriptors[mips_fd]`.
+
+When SYS_read is called:
+```javascript
+const fd = this.registers[4];  // This is the MIPS fd (e.g., 3)
+```
+
+Then it checks:
+```javascript
+if (this.fileCache[fd]) {
+```
+
+But `this.fileCache` is indexed by the Node.js fd, not the MIPS fd! So `this.fileCache[3]` would not match the actual file (which was stored with the Node.js fd as key).
+
+Wait, actually let me re-read the file caching code:
+
+```
+[tr-thinking call-0152:worker:xiaomi/mimo-v2.5-pro-ultraspeed] javascript
+if (accessMode === O_RDONLY) {
+    // For read-only files, read all data immediately
+    fileData = Buffer.alloc(stats.size);
+    fs.readSync(fd, fileData, 0, stats.size, 0);
+}
+
+this.fileCache[fd] = {
+    data: fileData,
+    position: 0,
+    path: pathname,
+    mode: fsFlags
+};
+```
+
+So `this.fileCache[fd]` uses the Node.js fd as the key.
+
+And when SYS_read accesses it:
+```javascript
+const fd = this.registers[4];  // MIPS fd (e.g., 3)
+if (!this.fileCache[fd]) {     // fileCache[3] would
+[tr-thinking call-0152:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  be undefined!
+```
+
+This would always fail for regular files! But the WAD is being read (we see output). Let me look more carefully at how stdout/stderr writes work...
+
+For SYS_write:
+```javascript
+const fd = this.registers[4];
+```
+
+Then it checks if the fd is stdout/stderr and writes directly. For stdout/stderr it works because the fd for stdout (1) maps directly.
+
+But for regular file reads, it seems like there's a bug. Unless... wait, maybe I'm misreading the code. Let me look at SYS_open again more carefully.
+
+Actually, looking at the
+[tr-thinking call-0152:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  complete SYS_open code:
+
+```javascript
+const fd = fs.openSync(pathname, fsFlags, mode);
+
+if (fs.fstatSync(fd).isCharacterDevice()) {
+    // ...
+} else {
+    // For regular files, read the entire file into memory
+    const stats = fs.fstatSync(fd);
+    if (stats.isFile()) {
+        if (accessMode === 0) {  // Read-only
+            fileData = Buffer.alloc(stats.size);
+            fs.readSync(fd, fileData, 0, stats.size, 0);
+        }
+    }
+    this.fileCache[fd] = { ... };
+}
+
+this.fileDescriptors[this.fdCounter] = fd;
+this.registers[2] = this.fdCounter;
+this.fdCounter++;
+```
+
+So:
+1. Node.js fd is
+[tr-thinking call-0152:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  stored in `this.fileDescriptors[mips_fd]`
+2. File data is stored in `this.fileCache[nodejs_fd]`
+3. MIPS code uses `mips_fd` for read/close
+4. When read is called with `mips_fd`, it checks `this.fileCache[mips_fd]` which would be undefined
+
+This is definitely a bug in the VM. But wait, maybe it works by accident in some cases? Let me think...
+
+Actually wait, I need to re-read the read handler more carefully:
+
+```javascript
+} else if (syscallNum === 0) {  // SYS_read
+    const fd = this.registers[4];
+   
+[tr-thinking call-0152:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  const bufferAddr = this.registers[5];
+    const count = this.registers[6];
+    
+    if (fd === 0) {
+        // stdin
+    } else {
+        if (!this.fileCache[fd]) {
+            this.registers[2] = -1;
+            return;
+        }
+        const fileInfo = this.fileCache[fd];
+        // ... read from fileInfo.data
+    }
+```
+
+So it uses the MIPS fd (e.g., 3) to look up in `this.fileCache`. But the file was cached under the Node.js fd. So `this.fileCache[3]` would not find the data.
+
+Unless the Node
+[tr-thinking call-0152:worker:xiaomi/mimo-v2.5-pro-ultraspeed] .js fd happens to be 3. On Linux, when stdin=0, stdout=1, stderr=2, the next file descriptor would be 3. So the Node.js fd for the WAD file might be 3, which matches the MIPS fd counter starting at 3.
+
+Actually wait, let me think about this again. The fdCounter starts at 3 in the constructor. When we open the WAD file, it returns fdCounter (3) to MIPS. And the Node.js fd from `fs.openSync` would be... well, on Linux, if stdin, stdout, stderr are 0, 1, 2, then the next open file would get fd 3.
+
+So in this case, the MIPS fd (3) happens to equal
+[tr-thinking call-0152:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  the Node.js fd (3)! And `this.fileCache[3]` would find the correct data.
+
+This works by coincidence for the first file, but might fail for subsequent files.
+
+But actually, looking more carefully, there's a subtlety. The `this.fileDescriptors[this.fdCounter] = fd` stores the Node.js fd. When lseek is called:
+```javascript
+const fd = this.fileDescriptors[this.registers[4]];
+```
+It maps MIPS fd to Node.js fd. Then it uses the Node.js fd for `this.fileCache[fd]`.
+
+So lseek uses the Node.js fd, while
+[tr-thinking call-0152:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  read uses the MIPS fd directly. If the fds happen to match, it works. If they don't, lseek would update a different file position than what read uses.
+
+For the doom WAD case:
+- First open: MIPS fd = 3, Node.js fd might be 3 (or could be different)
+- fileCache is indexed by Node.js fd
+- lseek maps MIPS fd → Node.js fd and uses it
+- read uses MIPS fd directly
+
+If Node.js fd = 3 (same as MIPS fd), both work correctly.
+If Node.js fd ≠ 3, lseek would update the wrong position or fail, while read would also
+[tr-thinking call-0152:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  fail.
+
+Given that the WAD is being read (we can see the identification bytes "IWAD"), it seems like the fds are matching for the first file. But the numlumps is wrong...
+
+Wait, maybe the issue is something else. Let me look at the actual numlumps value: 9260. In hex, that's 0x242C. The expected value is 1264 = 0x04F0.
+
+Let me think about what bytes would produce 9260 when read as a little-endian 32-bit integer:
+9260 = 0x0000242C → bytes: 2C 24 00 00
+
+And the correct value:
+
+[tr-thinking call-0152:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 1264 = 0x000004F0 → bytes: F0 04 00 00
+
+The file content at offset 4-7 should be: F0 04 00 00
+
+If the file is being read correctly but at a wrong offset, we'd get different bytes.
+
+Actually, wait. Let me look at the debug output again. The bytes after "IWAD" in the output are raw binary bytes - I can't see them properly in the terminal. Let me add a better debug output that prints the actual hex values.
+
+Actually, looking at
+[tr-thinking call-0152:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  the output more carefully: "IWAD?" - the '?' is probably byte 0xF0 displayed as '?'. This suggests the identification is correct, but I can't easily see the numlumps bytes.
+
+Let me take a different approach. Instead of printing raw bytes, let me add a debug output that prints the hex values of the numlumps field. But the problem is that the printf keeps failing due to shell escaping.
+
+Actually, let me just use sys_write with a custom format. I'll convert the numlumps to hex digits manually.
+
+Actually, a simpler approach: the issue might be with the `sizeof(wadinfo_t)` - maybe the compiler is adding
+[tr-thinking call-0152:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  padding. Let me check by looking at what the compiler produces.
+
+Or, let me try a different debugging approach. Instead of modifying w_wad.c, let me run the program and see if the issue is consistent, and add a simpler debug output.
+
+Actually, I just realized I can just look at the output differently. The sys_write dumps 12 bytes starting at &header. Let me decode the output.
+
+The output shows: "IWAD?" followed by more text. Let me dump it as hex.
+
+Wait, let me think about this differently. The `sys_write(1, p, 12)` should output 12 raw bytes. The first
+[tr-thinking call-0152:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  4 are "IWAD". The next 4 are numlumps in binary. The next 4 are infotableofs in binary. After those 12 bytes, the normal output continues.
+
+But I can't easily decode the binary bytes from the terminal output. Let me instead write a better debug that converts to hex.
+
+Actually, let me try a completely different approach. Instead of debugging, let me check if the issue is with the file position tracking. Let me add a debug output BEFORE the W_Read to see the file position, and AFTER to verify.
+
+Or even simpler - let me check if the issue is with struct padding. The `wadinfo_t` struct has:
+-
+[tr-thinking call-0152:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  char[4] (4 bytes)
+- int (4 bytes) 
+- int (4 bytes)
+
+This should be 12 bytes with no padding. But what if the compiler pads it differently?
+
+Let me check by adding a `printf("sizeof=%d\n", sizeof(wadinfo_t));` - but I can't use printf in w_wad.c since the escaping keeps failing.
+
+Let me use sys_write with a pre-formatted string approach.
+
+Actually, the simplest approach is to just write a C file that tests the struct layout:
+
+```c
+#include <stdio.h>
+int main() {
+    printf("sizeof wadinfo_t = %d\n", sizeof(wadinfo_t));
+    return 0;
+}
+```
+
+But this would need to be cross
+[tr-thinking call-0152:worker:xiaomi/mimo-v2.5-pro-ultraspeed] -compiled and I'd need to know the struct definition.
+
+Let me just check the struct definition first:
+```c
+typedef struct
+{
+    char identification[4];
+    int numlumps;
+    int infotableofs;
+} wadinfo_t;
+```
+
+On 32-bit MIPS with the compiler we're using, this should be 12 bytes.
+
+OK let me try yet another approach. Let me check if the issue is the VM's file read caching by examining the SYS_read implementation more carefully and checking if the file position is being tracked correctly.
+
+Actually, I think I might have found the real issue. Look at the VM's SYS_lseek handler:
+
+```javascript
+const fd = this.fileDescriptors[this.registers[4]];
+
+[tr-thinking call-0152:worker:xiaomi/mimo-v2.5-pro-ultraspeed] ```
+
+This gets the Node.js fd. Then it checks `this.fileCache[fd]` and updates `fileInfo.position`.
+
+But `SYS_read` uses:
+```javascript
+const fd = this.registers[4]; // MIPS fd
+// ...
+if (!this.fileCache[fd]) {
+    this.registers[2] = -1;
+    return;
+}
+const fileInfo = this.fileCache[fd];
+```
+
+If the MIPS fd (3) equals the Node.js fd (3), then both work on the same cache entry. But lseek updates the position, and fread reads from that position.
+
+Now, the `
+[tr-thinking call-0152:worker:xiaomi/mimo-v2.5-pro-ultraspeed] fread` in our my_stdlib.c calls `sys_read`:
+```c
+size_t fread(void *ptr, size_t size, size_t nmemb, FILE *fp) {
+    size_t total = size * nmemb;
+    int n = sys_read(fp->fd, ptr, total);
+    // ...
+}
+```
+
+And `sys_read` uses the MIPS fd, which is the same as fp->fd (which was returned by `sys_open`).
+
+OK so the fds should be consistent. Let me think about what else could go wrong...
+
+The W_Read function:
+1. `fseek(stdc_w
+[tr-thinking call-0152:worker:xiaomi/mimo-v2.5-pro-ultraspeed] ad->fstream, offset, SEEK_SET)` - this calls sys_lseek which uses the MIPS fd
+2. `fread(buffer, 1, buffer_len, stdc_wad->fstream)` - this calls sys_read which uses the MIPS fd
+
+For the first W_Read (offset=0, reading 12 bytes):
+- fseek to 0
+- fread 12 bytes
+
+For the second W_Read (offset=header.infotableofs, reading header.numlumps*sizeof(filelump_t)):
+- fseek to infotableofs
+- fread the lump directory
+
+But if the position tracking in the VM's file cache isn't working correctly with fseek, the second read might not start at the right position.
+
+Actually, I
+[tr-thinking call-0152:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  just realized something. The VM's lseek handler uses `this.fileDescriptors[this.registers[4]]` to map the MIPS fd to the Node.js fd. But the file cache is indexed by the Node.js fd. So lseek updates `fileCache[nodejs_fd].position`.
+
+Then read uses `this.registers[4]` (MIPS fd) to look up `fileCache[mips_fd]`. If mips_fd == nodejs_fd, it finds the same cache entry. But if they differ, it would read from a different entry (or not find one at all).
+
+For the case where mips_fd == nodejs_fd (which is 3 for the
+[tr-thinking call-0152:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  first file), this works. But wait - there might be multiple opens. The doom binary opens multiple files:
+1. Trying doom2.wad (fails)
+2. Trying plutonia.wad (fails)
+3. Trying tnt.wad (fails)
+4. Opening doom.wad (succeeds)
+5. Opening config files
+etc.
+
+When multiple files are opened and closed, the fds might diverge. But for the WAD file specifically, it should be the first successful open, so fd=3 for both MIPS and Node.js.
+
+Hmm, let me think about what else could cause 9260 instead of 1264...
+
+9260 in
+[tr-thinking call-0152:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  binary: 0010 0100 0010 1100
+1264 in binary: 0000 0100 1111 0000
+
+These don't have a simple bit relationship. But let me check what bytes at different positions in the file would give 9260...
+
+Actually, I wonder if the issue is with the file position being corrupted. Let me check the doom.wad file at the header offset (4175796 = 0x3FB8B4):
+
+The lump directory starts at offset 4175796. There are 1264 lumps, each 16 bytes.
+[tr-thinking call-0152:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  The first lump's filepos field (4 bytes) would be at offset 4175796.
+
+If instead of reading the header (first 12 bytes), the code is reading bytes from a different position, we'd get wrong values.
+
+Or maybe the issue is that `sizeof(wadinfo_t)` is not 12 on the MIPS target, so `W_Read(wad_file, 0, &header, sizeof(header))` reads more or fewer bytes than expected.
+
+Actually, let me check this. The compiler might be adding padding after the struct. With `-fno-builtin -ffreestanding` flags, the
+[tr-thinking call-0152:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  compiler shouldn't add any special padding, but let me verify.
+
+The struct is:
+```c
+typedef struct {
+    char identification[4];  // offset 0, size 4
+    int numlumps;            // offset 4, size 4
+    int infotableofs;        // offset 8, size 4
+} wadinfo_t;                 // total: 12 bytes, no padding needed
+```
+
+This should be 12 bytes. But to be safe, let me check by adding a static assertion or debug output.
+
+Actually, I have another idea. Let me check
+[tr-thinking call-0152:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  if the issue is with the `sys_write` in the debug code actually being called at the right time. Maybe the program is not reaching that code, or it's being called with a different header.
+
+Wait, the output shows "IWAD?" which means the sys_write IS being called and it IS outputting "IWAD" as the first 4 bytes. So the header identification is correct. But the numlumps might be wrong.
+
+Let me create a better debug output. Instead of printing raw bytes, I'll write the numlumps value as hex ASCII.
+
+Actually, let me just take a step back. The numlumps error is 9260, which should be
+[tr-thinking call-0152:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  the value AFTER the LONG() swap. Let me add a debug after the LONG() calls to see the values.
+
+Wait, actually, I need to look at this from a completely different angle. Let me check if the issue is actually in R_InitData, not in W_AddFile. The error is "W_CacheLumpNum: 9260 >= numlumps" which happens when trying to access lump 9260. This means numlumps is less than 9260, but the code is trying to access lump 9260.
+
+This could mean:
+1. The num
+[tr-thinking call-0152:worker:xiaomi/mimo-v2.5-pro-ultraspeed] lumps was read correctly (1264), but the code is trying to access lump 9260 which is way out of range
+2. OR numlumps was read incorrectly as some small value, and the code is trying to access lump 9260
+
+Looking at the doom.wad, there are 1264 lumps. Lump 9260 doesn't exist. So either:
+1. The WAD wasn't loaded properly (numlumps is wrong)
+2. Some other code is computing a bad lump index
+
+Let me look at R_InitData to see what lump it
+[tr-thinking call-0152:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 's trying to access:
+- R_InitData calls R_InitTextures, R_InitFlats, R_InitSpriteLumps
+- R_InitTextures loads texture lumps by name (TEXTURE1, etc.)
+- R_InitSpriteLumps loads sprite lumps
+
+The value 9260 seems like it could be a hash table overflow or something similar. Let me check if the numlumps value is actually being set to 9260...
+
+Actually wait, the error message is: "W_CacheLumpNum: 9260 >= numlumps"
+This means lumpnum=9260 and numlumps < 9260. It doesn't tell us what numlumps is.
+
+Let me add a
+[tr-thinking call-0152:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  debug output that prints both values. But the printf escaping is the problem.
+
+Let me try using a character-by-character approach with sys_write.
+[tr-stream call-0152:worker:xiaomi/mimo-v2.5-pro-ultraspeed] The output shows "IWAD" is read correctly but the numlumps is still wrong. Let me create a better debug approach using a separate C file:
+
+[tr-stream call-0152:worker:xiaomi/mimo-v2.5-pro-ultraspeed] worker.done finish=stop cost_microdollars=163988
+[tr-stream call-0152:xiaomi/mimo-v2.5-pro-ultraspeed] The output shows "IWAD" is read correctly but the numlumps is still wrong. Let me create a better debug approach using a separate C file:

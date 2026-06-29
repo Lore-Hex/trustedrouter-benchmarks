@@ -1,0 +1,516 @@
+
+[tr-stream call-0010:socrates:trustedrouter/socrates-pro-plus-1.0] socrates.started
+
+[tr-stream call-0010:worker:xiaomi/mimo-v2.5-pro-ultraspeed] worker.started
+[tr-thinking call-0010:worker:xiaomi/mimo-v2.5-pro-ultraspeed] Now I have a good understanding of the data distributions. Let me analyze the key insights:
+
+**Bucket 1:**
+- Most requests have small prompt_len: 134 at seq_align=64, 276 at seq_align=128 (510 out of 800)
+- Then a spread from 320-640 (268 requests)
+- And a long tail from 1088-2048 (122 requests)
+- Gen_len: mostly small (174 at ~32, 305 at ~64 = 479), then moderate (2
+[tr-thinking call-0010:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 65 at ~128-256), and a tail of high-gen requests (~56 at 544-1024)
+
+**Bucket 2:**
+- Prompt_len distribution: 64(152), 128(255), 192(121), 256(82), 320(107), then tail (83 requests at 384-704)
+- Gen_len: mostly very small (517 at ~32), moderate (133 at ~64),
+[tr-thinking call-0010:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  then a long tail
+
+The key optimization strategies:
+1. **Minimize padding (pad_ratio):** Group requests with similar prompt_len and gen_len. The S_max in a batch determines the decode cost, so mixing long and short prompts is very expensive. Similarly, G_max determines decode padding.
+
+2. **Limit unique shapes to 8 across both buckets.** This means we need to choose 8 seq_align values that work well for both buckets.
+
+3. **Batch size optimization:** More batches = more overhead but less padding. Fewer batches = less overhead but more padding.
+
+Let me think about the cost model more carefully:
+
+**Prefill cost per request:** Kp_attn * S^2 + Kp_mlp * S * HIDDEN
+[tr-thinking call-0010:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  where S = align(prompt_len, 64)
+This is per-request, depends only on the request's own aligned prompt length.
+
+**Decode cost per request:** Each request in a batch of G_max decode steps. The decode cost per step at context s_ctx is Kd_attn * s_ctx^2 + Kd_mlp * s_ctx * HIDDEN. For a batch with S_max and G_max, the decode cost per request is sum over g=0..G_max-1 of cost(S_max + g).
+
+**So the batch cost is:**
+- sum of prefill costs (fixed per request regardless of batching)
+- N * decode_cost
+[tr-thinking call-0010:worker:xiaomi/mimo-v2.5-pro-ultraspeed] _per_request (where decode depends on S_max and G_max of the batch)
+- per-batch overhead
+
+The padding in prefill comes from aligning each request's prompt to the granularity - this is fixed regardless of batching.
+
+The padding in decode comes from G_max - gen_len for each request - this depends on batching.
+
+The key insight is: **decode cost is dominated by S_max (quadratic) and G_max (also quadratic-like)**. So grouping requests with similar S and similar G is critical.
+
+**Strategy:**
+1. First, decide on the 8 seq_align shapes to use across both buckets
+2. Within each shape group, further sub-b
+[tr-thinking call-0010:worker:xiaomi/mimo-v2.5-pro-ultraspeed] atch by gen_len to keep G_max small
+3. The sub-batches should be sized to balance overhead vs. padding
+
+For the 8 shapes, I need to cover:
+- Bucket 1: 64(134), 128(276), 320-640(268), 1088-2048(122)
+- Bucket 2: 64(152), 128(255), 192(121), 256(82), 320-
+[tr-thinking call-0010:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 704(200)
+
+Possible 8 shapes: 64, 128, 192, 320, 384, 512, 640, 2048
+
+Wait, let me think about this more carefully. The shape's seq_align must be >= ceil(prompt_len/64)*64. So if I choose seq_align=128, all requests with prompt_len <= 128 can use it. But using seq_align=128 for a request with prompt_len=65 means the prefill cost is based on S=128 (the aligned prompt), which is
+[tr-thinking call-0010:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  a small amount of padding. But if I use seq_align=128, then within that batch, the decode cost depends on S_max of the batch.
+
+Actually wait, re-reading the cost model more carefully:
+
+In `batch_metrics`:
+- S_max = max(align(r['prompt_len'], self.g) for r in reqs_list)
+- Prefill cost = sum over requests of Kp_attn * align(prompt_len, g)^2 + ... (each request uses its own aligned length)
+- Decode cost depends on S_max and G_max
+
+And the shape in the plan is separate from S_max. The shape just needs seq_align >= ceil
+[tr-thinking call-0010:worker:xiaomi/mimo-v2.5-pro-ultraspeed] (prompt_len/64)*64 for each request. But S_max in the cost model is computed from the actual aligned prompt lengths of requests in the batch.
+
+Wait, let me re-read the cost model's batch_metrics:
+
+```python
+def batch_metrics(self, reqs: Iterable[Dict[str, int]]) -> Dict[str, Any]:
+    reqs_list = list(reqs)
+    S_max = max(align(r['prompt_len'], self.g) for r in reqs_list)
+    G_max = max(r['gen_len'] for r in reqs_list)
+    cost_prefill = sum(self._prefill_cost(r['prompt_len']) for r in reqs_list)
+```
+
+So S_max is based on the
+[tr-thinking call-0010:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  actual aligned prompt lengths, not the shape's seq_align. But wait, the shape must be >= aligned prompt length. So if shape.seq_align = 128 but a request has prompt_len = 65 (aligned to 128), then S_max considers 128. But if another request in the same batch has prompt_len = 129 (aligned to 192), then shape.seq_align must be >= 192 for that request.
+
+Oh wait, the constraint says "All requests in a batch must have the same shape" and "shape.seq_align >= ceil(prompt_len/64
+[tr-thinking call-0010:worker:xiaomi/mimo-v2.5-pro-ultraspeed] )*64". So if I have requests with different aligned prompt lengths in the same batch, the shape must accommodate the largest one, but S_max in the cost model is still computed from the actual aligned prompt lengths.
+
+Actually, let me re-read: "One record per request_id, identical shapes within each batch_id". So all requests in a batch have the same shape. And shape.seq_align >= ceil(prompt_len/64)*64 for each request. So the shape's seq_align >= max(aligned prompt_len) = S_max. But in the cost model, S_max is the max aligned prompt length, not the shape's seq_align.
+
+Hmm, actually I
+[tr-thinking call-0010:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  wonder if the cost model uses the shape or the actual data. Let me check plan_metrics:
+
+```python
+def plan_metrics(self, requests, plan):
+    batches = defaultdict(list)
+    batch_shape = {}
+    for p in plan:
+        r = requests[p['request_id']]
+        batches[p['batch_id']].append(r)
+        sh = p.get('shape', {})
+        if isinstance(sh, dict) and sh:
+            batch_shape[p['batch_id']] = (int(sh.get('seq_align', 0)), ...)
+    
+    for bid, rs in batches.items():
+        metrics_by_batch[bid] = self.batch_metrics(rs)
+```
+
+So the batch_metrics uses the actual request data,
+[tr-thinking call-0010:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  not the shape. The shape is used only for validation and the unique shapes constraint. So the cost model's S_max = max(align(prompt_len, 64)) across requests in the batch, regardless of what shape.seq_align is set to.
+
+This means the key optimization is purely about how we group requests into batches. The shape is just a labeling that must satisfy the constraints.
+
+OK so the important things:
+1. S_max in a batch = max aligned prompt_len of any request in the batch
+2. G_max in a batch = max gen_len of any request in the batch
+3. Decode cost depends on S_max and G_max (both quadratic effects)
+4. Prefill cost depends on
+[tr-thinking call-0010:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  each request's own aligned prompt_len (fixed regardless of batching)
+5. Per-batch overhead is 10M cost and 8ms latency
+
+So the strategy is:
+- Group requests with similar aligned prompt_len AND similar gen_len into the same batch
+- Keep G_max small by separating high-gen from low-gen requests
+- Keep S_max small by separating long prompts from short prompts
+- But not too many batches (overhead)
+
+The tricky part is the 8 unique shapes constraint. Since shape.seq_align must be >= the aligned prompt_len of any request in the batch, and all requests in a batch share the same shape, I can think of this as: choose up to 8 seq_align values,
+[tr-thinking call-0010:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  assign each request to one, and within each seq_align group, sub-batch by gen_len similarity.
+
+Actually, the shape within a batch just needs to be the same. Multiple batches can share the same shape. So I can have many batches with shape seq_align=128, for example. The constraint is that across all batches in both files, there are at most 8 unique (seq_align, heads_align, hidden_align) tuples.
+
+Since heads_align=32 and hidden_align=4096 are fixed, the only variable is seq_align. So I need at most 8 unique seq_align values.
+
+Now, the seq_align for a batch must be >= max
+[tr-thinking call-0010:worker:xiaomi/mimo-v2.5-pro-ultraspeed] (ceil(prompt_len/64)*64) for requests in that batch. So if I use seq_align=128, all requests in that batch must have aligned prompt_len <= 128.
+
+Strategy:
+1. Choose 8 seq_align values
+2. Assign each request to the smallest seq_align >= its aligned prompt_len
+3. Within each seq_align group, sort by gen_len and create sub-batches of similar gen_len
+
+The 8 seq_align values should cover the data well. Let me think about what values to choose.
+
+For bucket 1: 64(134), 128(276), 320(34), 384(55), 448
+[tr-thinking call-0010:worker:xiaomi/mimo-v2.5-pro-ultraspeed] (38), 512(48), 576(47), 640(46), 1088-2048(122)
+For bucket 2: 64(152), 128(255), 192(121), 256(82), 320(107), 384-704(83)
+
+Option 1: 64, 128, 192, 320, 384, 640, 140
+[tr-thinking call-0010:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 8, 2048
+- This covers bucket 2 well (64, 128, 192, 320 are main buckets)
+- For bucket 1: 64, 128 are good. 320-640 map to 320, 384, 640. Long tail maps to 1408 or 2048.
+
+Wait, let me think about this differently. For bucket 1, requests with aligned seq 320-640 (268 requests) would be assigned to 320, 384, or
+[tr-thinking call-0010:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  640. The ones with aligned seq 448 and 512 would go to 640 (since 384 < 448), which wastes a lot of padding.
+
+Let me reconsider. Maybe: 64, 128, 320, 448, 640, 704, 1408, 2048
+- Bucket 2: 64(152), 128(255), 192->320(121), 256->320(82), 320(
+[tr-thinking call-0010:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 107), 384->448(9), 448(10), 512->640(22), 576->640(28), 640(11), 704(3)
+  - Group 320 gets 121+82+107=310 requests, lots of padding for 192->320
+- Bucket 1: 64(134), 128(276), 320(34), 384->448(55), 448(38), 512->640
+[tr-thinking call-0010:worker:xiaomi/mimo-v2.5-pro-ultraspeed] (48), 576->640(47), 640(46)
+  - Group 448 gets 55+38=93, Group 640 gets 48+47+46=141
+
+Actually the problem is for bucket 2, requests with aligned seq 192 and 256 being bumped to 320 causes a lot of padding. Let me try:
+
+64, 128, 192, 320, 448, 640, 1408, 2048
+- Bucket 2: 64
+[tr-thinking call-0010:worker:xiaomi/mimo-v2.5-pro-ultraspeed] (152), 128(255), 192(121), 256->320(82), 320(107), 384->448(9), 448(10), 512->640(22), 576->640(28), 640(11), 704->1408(3)
+  - Hmm 704->1408 is very wasteful. But it's only 3 requests.
+
+Actually
+[tr-thinking call-0010:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  wait, 704->640 won't work because 640 < 704. So I need something >= 704.
+
+Let me reconsider. The key is to minimize cost, and the cost model has quadratic terms in S_max. So assigning a request with aligned seq 192 to shape 320 means in that batch S_max will be at least 320, which is very expensive for decode.
+
+Wait, no. S_max is computed from the actual aligned prompt_len of the requests in the batch, not from the shape. So if I have a batch with shape seq_align=320, but all requests have aligned prompt_len=192, then S_max=192.
+
+Let me re-read the cost
+[tr-thinking call-0010:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  model more carefully:
+
+```python
+S_max = max(align(r['prompt_len'], self.g) for r in reqs_list)
+```
+
+Yes! S_max is based on the actual request data, not the shape. So the shape is just a label. What matters for cost is the actual composition of the batch.
+
+So I can put requests with aligned seq 192 and 256 in the same batch with shape seq_align=320, and S_max would be 256 (from the actual data). The shape just needs to be >= 256.
+
+This changes the strategy significantly! Now I can group requests more freely, as long as the shape accommod
+[tr-thinking call-0010:worker:xiaomi/mimo-v2.5-pro-ultraspeed] ates the maximum aligned prompt in the batch.
+
+Actually wait, but all requests in a batch must have the same shape. And the shape must be >= each request's aligned prompt. So within a batch, the shape.seq_align = max(aligned_prompt of all requests in batch), rounded up... no, it just has to be >= each one. So shape.seq_align >= max(aligned prompts).
+
+But the cost model uses S_max = max(aligned prompts) which is <= shape.seq_align. So S_max = shape.seq_align in the minimal case (when shape.seq_align = max aligned prompt, rounded to multiples of 64).
+
+Actually shape.seq_align just has to be a multiple of 64 and >= each aligned prompt. Since
+[tr-thinking call-0010:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  aligned prompts are already multiples of 64, shape.seq_align = max(aligned prompts) is the minimal valid shape for a batch.
+
+So the optimization is:
+1. Group requests into batches
+2. For each batch, shape.seq_align = max(aligned prompt_len) = S_max
+3. This means shape.seq_align is determined by the batch composition
+4. The 8 unique shapes constraint limits how many distinct S_max values we can have across all batches
+
+So the approach is:
+1. Choose 8 seq_align values (which will be the S_max of our batches)
+2. Assign each request to a group based on its aligned prompt (
+[tr-thinking call-0010:worker:xiaomi/mimo-v2.5-pro-ultraspeed] must map to a group value >= its aligned prompt)
+3. Within each group, create sub-batches sorted by gen_len to keep G_max small
+
+The cost model within a batch:
+- Prefill: sum of Kp_attn * S_i^2 + Kp_mlp * S_i * H (fixed per request, independent of grouping)
+- Decode: For each request, sum over g=0..G_max-1 of (Kd_attn * (S_max + g)^2 + Kd_mlp * (S_max + g) * H)
+  This is N * f(S_max, G_max) where f grows with
+[tr-thinking call-0010:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  both
+- Overhead: Kbatch_overhead_cost per batch
+
+So to minimize decode cost: keep S_max and G_max small. Sub-batching by gen_len within each S_max group is key.
+
+For each S_max group, sort requests by gen_len. Then create sub-batches where gen_len values are close together. The tradeoff: more sub-batches means more overhead but smaller G_max.
+
+Let me think about optimal sub-batch sizes. The overhead cost is 10M per batch. The decode cost for a batch of N requests with S_max and G_max is roughly N * (Kd_attn * S_max^2 * G_max + ...) which is very large for
+[tr-thinking call-0010:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  big S_max and G_max.
+
+Given the targets, I should probably:
+1. Create many sub-batches (the overhead is small compared to the savings from reducing G_max)
+2. Sort by gen_len within each S_max group
+3. Use small sub-batches (maybe 1-10 requests each) for high gen_len requests
+4. Use larger sub-batches for low gen_len requests where G_max is already small
+
+Let me write the optimizer script. Let me think about the 8 shapes.
+
+For bucket 1:
+- 64: 134
+- 128: 276
+- 320: 
+[tr-thinking call-0010:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 34
+- 384: 55
+- 448: 38
+- 512: 48
+- 576: 47
+- 640: 46
+- 1088: 9
+- 1152: 8
+- ... (many more in the tail)
+- 2048: 17
+
+For bucket 2:
+- 64: 152
+- 128: 255
+- 192: 121
+- 256: 82
+- 320: 107
+- 
+[tr-thinking call-0010:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 384: 9
+- 448: 10
+- 512: 22
+- 576: 28
+- 640: 11
+- 704: 3
+
+I need shapes that work well for both. Let me consider:
+- 64 (essential for both)
+- 128 (essential for both, largest group)
+- 192 (only needed for bucket 2, but avoids padding for 121 requests)
+- 320 (covers 256->320 in b2, 320 in both)
+- 448 or 512 (covers 384,
+[tr-thinking call-0010:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  448, 512 in both)
+- 640 (covers 576, 640 in both, and 704 in b2... no 640 < 704)
+
+Hmm, for bucket 2 we need to cover up to 704. If I use 704, that's one shape. For bucket 1, 704 doesn't appear, but anything from 640 maps to 704.
+
+Wait, let me reconsider. I should think about what S_max values give the best cost tradeoff.
+
+For bucket 1 tail (1088-2048): 122 requests. These need
+[tr-thinking call-0010:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  shapes from 1088 to 2048. I could use 1-3 shapes for them.
+
+Let me try: 64, 128, 192, 320, 512, 704, 1408, 2048
+
+Bucket 1 assignments:
+- 64 -> 64 (134)
+- 128 -> 128 (276)
+- 320 -> 320 (34)
+- 384 -> 512 (55) - waste
+- 448 -> 512 (38) -
+[tr-thinking call-0010:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  some waste
+- 512 -> 512 (48)
+- 576 -> 704 (47)
+- 640 -> 704 (46)
+- 1088 -> 1408 (9)
+- 1152 -> 1408 (8)
+- ... up to 1408 -> 1408
+- 1472 -> 2048 (5)
+- ... up to 2048 -> 2048
+
+Hmm, 384->512 is wasteful.
+[tr-thinking call-0010:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  And 576->704 is somewhat wasteful.
+
+Let me try: 64, 128, 192, 320, 448, 640, 704, 2048
+
+Bucket 1:
+- 64 -> 64 (134)
+- 128 -> 128 (276)
+- 320 -> 320 (34)
+- 384 -> 448 (55) - S_max=384 in batch, shape=448
+- 4
+[tr-thinking call-0010:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 48 -> 448 (38)
+- 512 -> 640 (48) - S_max=512
+- 576 -> 640 (47) - S_max=576
+- 640 -> 640 (46)
+- 1088-2048 -> 2048 (122) - very wasteful for small ones
+
+That's not great for the tail.
+
+Try: 64, 128, 320, 512, 640, 1088, 147
+[tr-thinking call-0010:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 2, 2048
+
+Bucket 2:
+- 64 -> 64 (152)
+- 128 -> 128 (255)
+- 192 -> 320 (121) - wasteful, 192 padded to 320
+- 256 -> 320 (82)
+- 320 -> 320 (107)
+- 384 -> 512 (9)
+- 448 -> 512 (10)
+- 512 -> 512 (22)
+- 576 -> 640 (28)
+- 640 -> 640 (11
+[tr-thinking call-0010:worker:xiaomi/mimo-v2.5-pro-ultraspeed] )
+- 704 -> 1088 (3) - very wasteful
+
+Hmm, having 192->320 is bad. But 121 requests...
+
+Let me try: 64, 128, 192, 320, 512, 640, 1408, 2048
+
+Bucket 1:
+- 64 -> 64 (134)
+- 128 -> 128 (276)
+- 320 -> 320 (34)
+- 384 -> 512 (55)
+- 448 -> 512 (38)
+- 512 -> 512 (48)
+- 57
+[tr-thinking call-0010:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 6 -> 640 (47)
+- 640 -> 640 (46)
+- 1088 -> 1408 (9)
+- 1152 -> 1408 (8)
+- 1216 -> 1408 (9)
+- 1280 -> 1408 (4)
+- 1344 -> 1408 (6)
+- 1408 -> 1408 (11)
+- 1472 -> 2048 (5)
+- 1536 -> 2048 (7)
+- 1600 -> 2048 (5)
+- 1664 -> 204
+[tr-thinking call-0010:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 8 (7)
+- 1728 -> 2048 (8)
+- 1792 -> 2048 (2)
+- 1856 -> 2048 (11)
+- 1920 -> 2048 (8)
+- 1984 -> 2048 (5)
+- 2048 -> 2048 (17)
+
+Tail mapping: 1088-1408 -> 1408 (47 requests), 1472-2048 -> 2048 (75 requests)
+
+But wait, within each
+[tr-thinking call-0010:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  shape group, the S_max depends on the actual requests in the batch. If I put requests with aligned seq 384 and 448 in the same batch with shape 512, the S_max for that batch would be 448 (the max in the batch). So it's better to sub-batch by aligned prompt within each shape group too!
+
+Actually, S_max is determined by the batch, not the shape. So if I create sub-batches within shape 512, I can have:
+- Sub-batch with all 384-aligned requests: S_max=384
+- Sub-batch with all 44
+[tr-thinking call-0010:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 8-aligned requests: S_max=448
+- Sub-batch with all 512-aligned requests: S_max=512
+
+The shape for all of them is 512, but the cost depends on the actual S_max. So I should sub-batch by both prompt alignment AND gen_len.
+
+OK, this is getting complex. Let me just write the optimizer and iterate.
+
+Let me think about the algorithm:
+
+1. For each request, compute aligned_prompt = ceil(prompt_len/64)*64
+2. Choose 8 seq_align values (shapes)
+3. Assign each request to the smallest shape >= its aligned_prompt
+4. Within each shape group, sort by (aligned_prompt, gen_len)
+5.
+[tr-thinking call-0010:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  Create sub-batches where requests have similar aligned_prompt AND similar gen_len
+6. For each sub-batch, the effective S_max is the max aligned_prompt in the sub-batch
+
+The key optimization dimensions:
+- Shape selection (8 values)
+- Sub-batching strategy (how to split within shape groups)
+
+For sub-batching, I think the approach should be:
+- Within each shape group, sort by aligned_prompt first, then by gen_len
+- Create sub-batches of requests with the same aligned_prompt (or close)
+- Within each aligned_prompt subgroup, sort by gen_len and create sub-batches where gen_len values
+[tr-thinking call-0010:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  are close
+
+Actually, since S_max is determined by the max aligned_prompt in the batch, and G_max by the max gen_len, I should:
+- Within each shape group, create sub-batches that minimize max(S_max^2 * G_max) overhead
+- This means grouping by both S and G
+
+Let me think about this as a 2D binning problem. For each shape group:
+- Bin by aligned_prompt (requests with same aligned_prompt go together)
+- Within each aligned_prompt bin, sort by gen_len and create sub-batches
+
+For gen_len sub-batching: sort requests by gen_len. Start a
+[tr-thinking call-0010:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  new sub-batch when adding the next request would increase G_max by too much relative to the overhead saved.
+
+Actually, let me think about it from a simpler angle. The decode cost for a batch is approximately:
+
+decode_cost ≈ N * (Kd_attn * S_max^2 * G_max + lower order terms)
+
+The overhead cost per batch is 10M.
+
+For a batch with S_max=128 and G_max=64: decode ≈ N * (1.0 * 128^2 * 64) = N * 1,048,576
+For N=10: 10M, which
+[tr-thinking call-0010:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  equals the overhead.
+
+So for S_max=128, batches of about 10 requests with G_max~64 are optimal.
+
+For S_max=512: decode ≈ N * (1.0 * 512^2 * G_max) = N * 262,144 * G_max
+If G_max=64: N * 16.7M per request. So even single-request batches are worthwhile.
+
+For S_max=2048: decode ≈ N * (1.0 * 2048^2 * G_max) = N * 4,194,304 * G_max
+If G_max=
+[tr-thinking call-0010:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 32: N * 134M per request. Way more than overhead. So single-request batches are definitely worthwhile.
+
+This suggests: for large S_max, use very small sub-batches (even single requests). For small S_max, use larger sub-batches.
+
+OK let me just write the optimizer. I'll:
+
+1. Choose 8 shapes
+2. Group requests by shape
+3. Within each shape, sort by (aligned_prompt, gen_len)
+4. Create sub-batches greedily, starting new sub-batch when adding a request would increase cost significantly
+
+Actually, let me think about the pad_ratio constraint more carefully. pad_ratio =
+[tr-thinking call-0010:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  sum(pad_tokens) / sum(real_tokens). 
+
+For prefill padding: aligned_prompt - prompt_len (this is fixed, regardless of batching)
+For decode padding: G_max - gen_len for each request in the batch
+
+The targets are very tight: pad_ratio < 0.055 for bucket 1, < 0.15 for bucket 2.
+
+Let me compute the prefill padding:
+For bucket 1, the prefill padding is sum(align(p, 64) - p) for all requests. This is fixed.
+The decode padding depends on G_max per batch.
+
+If I have a batch with G
+[tr-thinking call-0010:worker:xiaomi/mimo-v2.5-pro-ultraspeed] _max=1000 and most requests have gen_len=50, that's 950 tokens of decode padding per request. Very wasteful.
+
+So I need very tight gen_len grouping. Especially for requests with high gen_len.
+
+Let me compute the minimum possible prefill padding for bucket 1:
+Each request has at most 63 tokens of prefill padding. With 800 requests, max prefill padding = 800*63 = 50,400. Real tokens for bucket 1: let me compute...
+
+Actually, let me just code this up and iterate. The approach:
+
+1. Analyze both buckets
+2. Choose 8 shapes
+
+[tr-thinking call-0010:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 3. Group requests by shape and aligned_prompt
+4. Within each group, sort by gen_len and create sub-batches with tight gen_len ranges
+5. Evaluate with the cost model
+6. Iterate on shape selection and sub-batching parameters
+
+Let me write the optimizer script.
+[tr-stream call-0010:worker:xiaomi/mimo-v2.5-pro-ultraspeed] {
+  "analysis": "I now have a thorough understanding of the problem. The cost model penalizes large S_max (max aligned prompt in batch) and G_max (max gen_len in batch) quadratically for decode. The key is to group requests with similar prompt lengths and gen_len values, using at most 8 unique seq_align shapes across both buckets. I need to create sub-batches within shape groups to keep G_max small
+[tr-stream call-0010:worker:xiaomi/mimo-v2.5-pro-ultraspeed] , especially for large S_max values.",
+  "plan": "Write an optimizer script that: 1) Analyzes both bucket distributions, 2) Selects optimal 8 seq_align shapes, 3) Groups requests by shape and aligned prompt, 4) Sub-batches by gen_len within each group, 5) Evaluates with cost model and iterates.",
+  "commands": [
+    {
+      "keystrokes": "cat > /app/task_file/scripts/optimizer.py << 'PYEOF'\n#!/usr/bin/env python3\nimport json, math, os, sys\nfrom collections import defaultdict\nsys.path.insert(0, os.path.dirname(__file__))\nfrom cost_model import CostModel, CostConsts,
+[tr-stream call-0010:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  align, HEADS, HIDDEN\n\ndef load_requests(path):\n    reqs = {}\n    with open(path) as f:\n        for line in f:\n            r = json.loads(line)\n            reqs[r['request_id']] = r\n    return reqs\n\ndef analyze_bucket(reqs):\n    \"\"\"Print analysis of request distribution.\"\"\"\n    aligned_counts = defaultdict(int)\n    for r in reqs.values():\n        s = align(r['prompt_len'], 64)\n        aligned_counts[s] += 1\n    return dict(aligned_counts)\n\ndef build_plan(reqs, shapes, max
+[tr-stream call-0010:worker:xiaomi/mimo-v2.5-pro-ultraspeed] _batch_size=None):\n    \"\"\"Build optimized plan for a set of requests.\n    shapes: list of seq_align values (sorted ascending)\n    \"\"\"\n    # Assign each request to smallest shape >= its aligned prompt\n    shape_groups = defaultdict(list)  # shape -> list of (request_id, aligned_prompt, gen_len)\n    for rid, r in reqs.items():\n        s = align(r['prompt_len'], 64)\n        assigned = None\n        for sh in shapes:\n            if sh >= s:\n                assigned = sh\n                break\n        if assigned is None:\n            assigned = shapes[-1]  # fallback\n        shape_groups[assigned].append((rid, s, r['gen_len']))\n    \n    plan = []\n    batch_counter
+[tr-stream call-0010:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  = 0\n    \n    for shape_val in sorted(shape_groups.keys()):\n        group = shape_groups[shape_val]\n        # Sort by aligned_prompt first, then by gen_len\n        group.sort(key=lambda x: (x[1], x[2]))\n        \n        # Sub-batch: group by aligned_prompt, then by gen_len ranges\n        # First group by aligned_prompt\n        prompt_subgroups = defaultdict(list)\n        for rid, s, g in group:\n            prompt_subgroups[s].append((rid, s, g))\n        \n        for s_val in sorted(prompt_subgroups.keys()):\
+[tr-stream call-0010:worker:xiaomi/mimo-v2.5-pro-ultraspeed] n            subgroup = prompt_subgroups[s_val]\n            subgroup.sort(key=lambda x: x[2])  # sort by gen_len\n            \n            # Create sub-batches with tight gen_len ranges\n            # Strategy: for each aligned_prompt group, create sub-batches\n            # where gen_len values are close together\n            current_batch = []\n            current_gmax = 0\n            \n            for item in subgroup:\n                rid, s, g = item\n                if not current_batch:\n                    current_batch.append(item)\n                    current_gmax = g\n                else:\n                    new_gmax = max(current_gmax, g)\n                    # Check if adding this request would
+[tr-stream call-0010:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  increase G_max significantly\n                    # The decode cost increase is roughly:\n                    # old_cost = len(current_batch) * S^2 * current_gmax\n                    # new_cost = (len(current_batch)+1) * S^2 * new_gmax\n                    # overhead_saved = 10M (if we merge vs separate)\n                    \n                    # Simple heuristic: allow if G_max increase is small relative to batch size\n                    # or if the batch is still small\n                    \n                    # For high S, be more aggressive about splitting\n                    if s_val >= 1024:\n                        max_g_ratio = 1.2 
+[tr-stream call-0010:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  # very tight\n                        max_batch = 4\n                    elif s_val >= 512:\n                        max_g_ratio = 1.3\n                        max_batch = 8\n                    elif s_val >= 256:\n                        max_g_ratio = 1.5\n                        max_batch = 16\n                    else:\n                        max_g_ratio = 2.0\n                        max_batch = 32\n                    \n                    if max_batch_size:\n                        max_batch = min(max_batch, max_batch_size)\n                    \n                    g_ratio = new_gmax / max(current_gmax, 1)\n                    if len(current_batch) >= max_batch or (
+[tr-stream call-0010:worker:xiaomi/mimo-v2.5-pro-ultraspeed] g_ratio > max_g_ratio and len(current_batch) >= 2):\n                        # Flush current batch\n                        batch_counter += 1\n                        bid = f\"b-{batch_counter:04d}\"\n                        for rid2, s2, g2 in current_batch:\n                            plan.append({\n                                'request_id': rid2,\n                                'batch_id': bid,\n                                'shape': {'seq_align': shape_val, 'heads_align': HEADS, 'hidden_align': HIDDEN}\n                            })\n                        current_batch = [item]\n                        current_gmax = g\n                    else:\n                        current_batch.append(item)\n                        current_gmax = new_gmax\n            \n            # Flush remaining\n            if current_batch:\n                batch_counter += 1\n                bid =
+[tr-stream call-0010:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  f\"b-{batch_counter:04d}\"\n                for rid2, s2, g2 in current_batch:\n                    plan.append({\n                        'request_id': rid2,\n                        'batch_id': bid,\n                        'shape': {'seq_align': shape_val, 'heads_align': HEADS, 'hidden_align': HIDDEN}\n                    })\n    \n    return plan\n\ndef evaluate_plan(reqs, plan, label=\"\"):\n    cm = CostModel(64)\n    metrics = cm.plan_metrics(reqs, plan)\n    shapes = set()\n    for p in plan:\n        sh = p['shape']\n        shapes.add((sh['seq_align'], sh['
+[tr-stream call-0010:worker:xiaomi/mimo-v2.5-pro-ultraspeed] heads_align'], sh['hidden_align']))\n    \n    latencies = metrics.get('latencies', metrics.get('per_request_latency', []))\n    if isinstance(latencies, list) and latencies:\n        lat_sorted = sorted(latencies)\n        p95 = lat_sorted[int(len(lat_sorted)*0.95)]\n    else:\n        p95 = 0\n    \n    print(f\"{label}:\")\n    print(f\"  Cost: {metrics['cost']:.4e}\")\n    print(f\"  Pad ratio: {metrics.get('pad_ratio', metrics.get('pad_tokens',0)/max(metrics.get('real_tokens',1),1)):.4f}\")\
+[tr-stream call-0010:worker:xiaomi/mimo-v2.5-pro-ultraspeed] n    print(f\"  P95 latency: {p95:.4e}\")\n    if 'sequential_timecost_ms' in metrics:\n        print(f\"  Sequential timecost: {metrics['sequential_timecost_ms']:.4e}\")\n    print(f\"  Unique shapes: {len(shapes)}\")\n    print(f\"  Batches: {len(set(p['batch_id'] for p in plan))}\")\n    return metrics, shapes\n\nif __name__ == '__main__':\n    root = os.path.dirname(os.path.dirname(__file__))\n    reqs1 = load_requests(os.path.join(root, 'input_data', 'requests_bucket_1.jsonl'))
+[tr-stream call-0010:worker:xiaomi/mimo-v2.5-pro-ultraspeed] \n    reqs2 = load_requests(os.path.join(root, 'input_data', 'requests_bucket_2.jsonl'))\n    \n    print(f\"Bucket 1: {len(reqs1)} requests\")\n    print(f\"Bucket 2: {len(reqs2)} requests\")\n    \n    ac1 = analyze_bucket(reqs1)\n    ac2 = analyze_bucket(reqs2)\n    print(f\"\\nBucket 1 aligned prompt distribution: {dict(sorted(ac1.items()))}\")\n    print(f\"\\nBucket 2 aligned prompt distribution: {dict(sorted(ac2.items()))}\")\n    \n    # Try different shape combinations
+[tr-stream call-0010:worker:xiaomi/mimo-v2.5-pro-ultraspeed] \n    # Need 8 shapes total across both buckets\n    # Key shapes needed: must cover range 64 to 2048 for b1, 64 to 704 for b2\n    \n    shape_options = [\n        [64, 128, 192, 320, 448, 640, 1408, 2048],\n        [64, 128, 192, 320, 512, 704, 1408
+[tr-stream call-0010:worker:xiaomi/mimo-v2.5-pro-ultraspeed] , 2048],\n        [64, 128, 192, 320, 448, 640, 1088, 2048],\n        [64, 128, 192, 320, 448, 704, 1408, 2048],\n        [64, 128, 256, 384, 512, 704, 1408, 2048],\n        [64, 128, 192, 320, 512, 640, 1408, 2
+[tr-stream call-0010:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 048],\n    ]\n    \n    best_cost = float('inf')\n    best_shapes = None\n    \n    for shapes in shape_options:\n        plan1 = build_plan(reqs1, shapes)\n        plan2 = build_plan(reqs2, shapes)\n        m1, s1 = evaluate_plan(reqs1, plan1, f\"Shapes {shapes} - B1\")\n        m2, s2 = evaluate_plan(reqs2, plan2, f\"Shapes {shapes} - B2\")\n        total = m1['cost'] + m2['cost']\n        print(f\"  Total cost: {total:.4e}\\
+[tr-stream call-0010:worker:xiaomi/mimo-v2.5-pro-ultraspeed] n\")\n        if total < best_cost:\n            best_cost = total\n            best_shapes = shapes\n    \n    print(f\"\\nBest shapes: {best_shapes} with cost {best_cost:.4e}\")\nPYEOF\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "cd /app/task_file && python3 scripts/optimizer.py 2>&1\n",
+      "duration": 5.0
+    }
+  ],
+  "task_complete": false
+}
+
+[tr-stream call-0010:worker:xiaomi/mimo-v2.5-pro-ultraspeed] worker.done finish=stop cost_microdollars=40942
+[tr-stream call-0010:xiaomi/mimo-v2.5-pro-ultraspeed] {
+  "analysis": "I now have a thorough understanding of the problem. The cost model penalizes large S_max (max aligned prompt in batch) and G_max (max gen_len in batch) quadratically for decode. The key is to group requests with similar prompt lengths and gen_len values, using at most 8 unique seq_align shapes across both buckets. I need to create sub-batches within shape groups to keep G_max small, especially for large S_max values.",
+  "plan": "Write an optimizer script that: 1) Analyzes both bucket distributions, 2) Selects optimal 8 seq_align shapes, 3) Groups requests by shape and aligned prompt, 4) Sub-batches by gen_len within each group, 5) Evaluates with cost model and iterates.",
+  "commands": [
+    {
+      "keystrokes": "cat > /app/task_file/scripts/optimizer.py << 'PYEOF'\n#!/usr/bin/env python3\nimport json, math, os, sys\nfrom collections import defaultdict\nsys.path.insert(0, os.path.dirname(__file__))\nfrom cost_model import CostModel, CostConsts, align, HEADS, HIDDEN\n\ndef load_requests(path):\n    reqs = {}\n    with open(path) as f:\n        for line in f:\n            r = json.loads(line)\n            reqs[r['request_id']] = r\n    return reqs\n\ndef analyze_bucket(reqs):\n    \"\"\"Print analysis of request distribution.\"\"\"\n    aligned_counts = defaultdict(int)\n    for r in reqs.values():\n        s = align(r['prompt_len'], 64)\n        aligned_counts[s] += 1\n    return dict(aligned_counts)\n\ndef build_plan(reqs, shapes, max_batch_size=None):\n    \"\"\"Build optimized plan for a set of requests.\n    shapes: list of seq_align values (sorted ascending)\n    \"\"\"\n    # Assign each request to smallest shape >= its aligned prompt\n    shape_groups = defaultdict(list)  # shape -> list of (request_id, aligned_prompt, gen_len)\n    for rid, r in reqs.items():\n        s = align(r['prompt_len'], 64)\n        assigned = None\n        for sh in shapes:\n            if sh >= s:\n                assigned = sh\n                break\n        if assigned is None:\n            assigned = shapes[-1]  # fallback\n        shape_groups[assigned].append((rid, s, r['gen_len']))\n    \n    plan = []\n    batch_counter = 0\n    \n    for shape_val in sorted(shape_groups.keys()):\n        group = shape_groups[shape_val]\n        # Sort by aligned_prompt first, then by gen_len\n        group.sort(key=lambda x: (x[1], x[2]))\n        \n        # Sub-batch: group by aligned_prompt, then by gen_len ranges\n        # First group by aligned_prompt\n        prompt_subgroups = defaultdict(list)\n        for rid, s, g in group:\n            prompt_subgroups[s].append((rid, s, g))\n        \n        for s_val in sorted(prompt_subgroups.keys()):\n            subgroup = prompt_subgroups[s_val]\n            subgroup.sort(key=lambda x: x[2])  # sort by gen_len\n            \n            # Create sub-batches with tight gen_len ranges\n            # Strategy: for each aligned_prompt group, create sub-batches\n            # where gen_len values are close together\n            current_batch = []\n            current_gmax = 0\n            \n            for item in subgroup:\n                rid, s, g = item\n                if not current_batch:\n                    current_batch.append(item)\n                    current_gmax = g\n                else:\n                    new_gmax = max(current_gmax, g)\n                    # Check if adding this request would increase G_max significantly\n                    # The decode cost increase is roughly:\n                    # old_cost = len(current_batch) * S^2 * current_gmax\n                    # new_cost = (len(current_batch)+1) * S^2 * new_gmax\n                    # overhead_saved = 10M (if we merge vs separate)\n                    \n                    # Simple heuristic: allow if G_max increase is small relative to batch size\n                    # or if the batch is still small\n                    \n                    # For high S, be more aggressive about splitting\n                    if s_val >= 1024:\n                        max_g_ratio = 1.2  # very tight\n                        max_batch = 4\n                    elif s_val >= 512:\n                        max_g_ratio = 1.3\n                        max_batch = 8\n                    elif s_val >= 256:\n                        max_g_ratio = 1.5\n                        max_batch = 16\n                    else:\n                        max_g_ratio = 2.0\n                        max_batch = 32\n                    \n                    if max_batch_size:\n                        max_batch = min(max_batch, max_batch_size)\n                    \n                    g_ratio = new_gmax / max(current_gmax, 1)\n                    if len(current_batch) >= max_batch or (g_ratio > max_g_ratio and len(current_batch) >= 2):\n                        # Flush current batch\n                        batch_counter += 1\n                        bid = f\"b-{batch_counter:04d}\"\n                        for rid2, s2, g2 in current_batch:\n                            plan.append({\n                                'request_id': rid2,\n                                'batch_id': bid,\n                                'shape': {'seq_align': shape_val, 'heads_align': HEADS, 'hidden_align': HIDDEN}\n                            })\n                        current_batch = [item]\n                        current_gmax = g\n                    else:\n                        current_batch.append(item)\n                        current_gmax = new_gmax\n            \n            # Flush remaining\n            if current_batch:\n                batch_counter += 1\n                bid = f\"b-{batch_counter:04d}\"\n                for rid2, s2, g2 in current_batch:\n                    plan.append({\n                        'request_id': rid2,\n                        'batch_id': bid,\n                        'shape': {'seq_align': shape_val, 'heads_align': HEADS, 'hidden_align': HIDDEN}\n                    })\n    \n    return plan\n\ndef evaluate_plan(reqs, plan, label=\"\"):\n    cm = CostModel(64)\n    metrics = cm.plan_metrics(reqs, plan)\n    shapes = set()\n    for p in plan:\n        sh = p['shape']\n        shapes.add((sh['seq_align'], sh['heads_align'], sh['hidden_align']))\n    \n    latencies = metrics.get('latencies', metrics.get('per_request_latency', []))\n    if isinstance(latencies, list) and latencies:\n        lat_sorted = sorted(latencies)\n        p95 = lat_sorted[int(len(lat_sorted)*0.95)]\n    else:\n        p95 = 0\n    \n    print(f\"{label}:\")\n    print(f\"  Cost: {metrics['cost']:.4e}\")\n    print(f\"  Pad ratio: {metrics.get('pad_ratio', metrics.get('pad_tokens',0)/max(metrics.get('real_tokens',1),1)):.4f}\")\n    print(f\"  P95 latency: {p95:.4e}\")\n    if 'sequential_timecost_ms' in metrics:\n        print(f\"  Sequential timecost: {metrics['sequential_timecost_ms']:.4e}\")\n    print(f\"  Unique shapes: {len(shapes)}\")\n    print(f\"  Batches: {len(set(p['batch_id'] for p in plan))}\")\n    return metrics, shapes\n\nif __name__ == '__main__':\n    root = os.path.dirname(os.path.dirname(__file__))\n    reqs1 = load_requests(os.path.join(root, 'input_data', 'requests_bucket_1.jsonl'))\n    reqs2 = load_requests(os.path.join(root, 'input_data', 'requests_bucket_2.jsonl'))\n    \n    print(f\"Bucket 1: {len(reqs1)} requests\")\n    print(f\"Bucket 2: {len(reqs2)} requests\")\n    \n    ac1 = analyze_bucket(reqs1)\n    ac2 = analyze_bucket(reqs2)\n    print(f\"\\nBucket 1 aligned prompt distribution: {dict(sorted(ac1.items()))}\")\n    print(f\"\\nBucket 2 aligned prompt distribution: {dict(sorted(ac2.items()))}\")\n    \n    # Try different shape combinations\n    # Need 8 shapes total across both buckets\n    # Key shapes needed: must cover range 64 to 2048 for b1, 64 to 704 for b2\n    \n    shape_options = [\n        [64, 128, 192, 320, 448, 640, 1408, 2048],\n        [64, 128, 192, 320, 512, 704, 1408, 2048],\n        [64, 128, 192, 320, 448, 640, 1088, 2048],\n        [64, 128, 192, 320, 448, 704, 1408, 2048],\n        [64, 128, 256, 384, 512, 704, 1408, 2048],\n        [64, 128, 192, 320, 512, 640, 1408, 2048],\n    ]\n    \n    best_cost = float('inf')\n    best_shapes = None\n    \n    for shapes in shape_options:\n        plan1 = build_plan(reqs1, shapes)\n        plan2 = build_plan(reqs2, shapes)\n        m1, s1 = evaluate_plan(reqs1, plan1, f\"Shapes {shapes} - B1\")\n        m2, s2 = evaluate_plan(reqs2, plan2, f\"Shapes {shapes} - B2\")\n        total = m1['cost'] + m2['cost']\n        print(f\"  Total cost: {total:.4e}\\n\")\n        if total < best_cost:\n            best_cost = total\n            best_shapes = shapes\n    \n    print(f\"\\nBest shapes: {best_shapes} with cost {best_cost:.4e}\")\nPYEOF\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "cd /app/task_file && python3 scripts/optimizer.py 2>&1\n",
+      "duration": 5.0
+    }
+  ],
+  "task_complete": false
+}

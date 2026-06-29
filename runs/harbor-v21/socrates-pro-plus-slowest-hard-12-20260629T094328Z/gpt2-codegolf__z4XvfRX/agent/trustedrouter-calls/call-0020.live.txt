@@ -1,0 +1,88 @@
+
+[tr-stream call-0020:socrates:trustedrouter/socrates-pro-plus-1.0] socrates.started
+
+[tr-stream call-0020:worker:xiaomi/mimo-v2.5-pro-ultraspeed] worker.started
+[tr-thinking call-0020:worker:xiaomi/mimo-v2.5-pro-ultraspeed] The weight matrix accesses now use p[j*C+i] instead of p[i*C+j] for all four weight matrices. Let me also need to fix the wte access in the output projection:
+- Currently: `s+=xn[lt*C+i]*wte[j*C+i]` which reads wte[j][i] with j=vocab, i=embedding
+- For [out_features, in_features] layout, wte should be accessed as wte[j*C+i] which is already the same... wait, actually if the layout is [V, C] then wte[j*C+i] means row j, column i, which is correct.
+
+Actually
+[tr-thinking call-0020:worker:xiaomi/mimo-v2.5-pro-ultraspeed] , let me think about this. The embedding table wte is [50257, 768], so wte[j*C+i] gives the embedding for token j at dimension i. This is the same whether the layout is [out, in] or [in, out] because the embedding table is just a lookup table.
+
+But for the linear layer weights:
+- Original (wrong): y[j] = sum_i(x[i] * W[i][j]) using W[i*cols+j] where cols=out_features
+- New (correct): y[j] = sum_i(x[i] * W[j][i]) using W[j*in_features+i] where rows=out_features, cols=in_features
+
+So y
+[tr-thinking call-0020:worker:xiaomi/mimo-v2.5-pro-ultraspeed] [j] = bias[j] + sum_i(x[i] * W[j*in+i])
+
+For QKV: in=C, out=3C. W[j*C+i] where j goes 0..3C-1, i goes 0..C-1. ✓
+For c_proj: in=C, out=C. W[j*C+i] where j goes 0..C-1, i goes 0..C-1. ✓
+For fc: in=C, out=F. W[j*C+i] where j goes 0..F-1, i goes 0..C-1. ✓
+For fc_proj: in=F, out=C. W[j*F+i] where j goes 0..C-1, i goes 0..F-1. ✓
+
+
+[tr-thinking call-0020:worker:xiaomi/mimo-v2.5-pro-ultraspeed] This looks correct. But wait, I changed p[i*F+j] to p[j*C+i] but for fc_proj it should be p[j*F+i]. Let me check...
+
+Looking at the output:
+```
+for(int i=0;i<F;i++)s+=ff[t*F+i]*p[j*F+i];
+```
+This has p[j*F+i] which is correct for fc_proj (output=C, input=F, so W[j*F+i] where j over C, i over F).
+
+And:
+```
+for(int i=0;i<C;i++)s+=xn[t*C+i]*p[j*C+i];
+```
+This has p[j*C+i] for
+[tr-thinking call-0020:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  fc layer (output=F, input=C, so W[j*C+i] where j over F, i over C). ✓
+
+Looks correct. Let me compile and test.
+
+Actually wait, there might be an issue with the sed command. Let me check the c_proj weight more carefully:
+
+```
+for(int t=0;t<T;t++)for(int j=0;j<C;j++){float s=p[C*C+j];
+for(int i=0;i<C;i++)s+=ao[t*C+i]*p[j*C+i];x[t*C+j]+=s;}p+=C*C+C;
+```
+
+This computes:
+s = bias[j] + sum_i(a
+[tr-thinking call-0020:worker:xiaomi/mimo-v2.5-pro-ultraspeed] o[t][i] * W[j*C+i])
+
+Where W has shape [C_out=768, C_in=768]. This means:
+- For each output j, we sum over input i: ao[t][i] * W[j][i]
+- This is the correct matrix-vector product for [out, in] layout
+
+OK, this looks right. Let me compile and test.
+[tr-stream call-0020:worker:xiaomi/mimo-v2.5-pro-ultraspeed] {
+  "analysis": "The weight matrix accesses have been transposed. Now I need to compile and test again. Let me also check that the `fc_proj` bias read is correct since the layout changed.",
+  "plan": "Compile and test the fixed version.
+[tr-stream call-0020:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  The weight matrices now use [out_features, in_features] layout which should match the checkpoint format.",
+  "commands": [
+    {
+      "keystrokes": "gcc -O3 -o /app/a.out /app/gpt2.c -lm 2>&1\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "/app/a.out gpt2-124M.ckpt vocab.bpe \"The meaning of life is\" 2>&1\n",
+      "duration": 60.0
+    }
+  ]
+}
+
+[tr-stream call-0020:worker:xiaomi/mimo-v2.5-pro-ultraspeed] worker.done finish=stop cost_microdollars=35795
+[tr-stream call-0020:xiaomi/mimo-v2.5-pro-ultraspeed] {
+  "analysis": "The weight matrix accesses have been transposed. Now I need to compile and test again. Let me also check that the `fc_proj` bias read is correct since the layout changed.",
+  "plan": "Compile and test the fixed version. The weight matrices now use [out_features, in_features] layout which should match the checkpoint format.",
+  "commands": [
+    {
+      "keystrokes": "gcc -O3 -o /app/a.out /app/gpt2.c -lm 2>&1\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "/app/a.out gpt2-124M.ckpt vocab.bpe \"The meaning of life is\" 2>&1\n",
+      "duration": 60.0
+    }
+  ]
+}

@@ -1,0 +1,355 @@
+
+[tr-stream call-0026:socrates:trustedrouter/socrates-pro-plus-1.0] socrates.started
+
+[tr-stream call-0026:worker:xiaomi/mimo-v2.5-pro-ultraspeed] worker.started
+[tr-thinking call-0026:worker:xiaomi/mimo-v2.5-pro-ultraspeed] The scan only found 1 candidate with avg|v| between 0.7 and 1.3, and it's at offset 2364672 which is 3079*768 = 2364672. That doesn't look like a clean layer norm gamma either (the values include 0.13, 0.20, 0.20, 1.25 which are not typical gamma values that should all be close to 1.0).
+
+This is very strange. GPT-2 layer norm gammas should have values centered around 1.0. Let me think about this differently.
+
+Wait - maybe the checkpoint doesn
+[tr-thinking call-0026:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 't have the standard layer norm format. Or maybe the checkpoint stores weights in a completely different order than I assumed.
+
+Let me think about what the correct layout could be. The file is 497759232 bytes = 124,439,808 floats. Let me check if maybe it's a different layout entirely.
+
+Actually, let me reconsider. What if the checkpoint layout from OpenAI's original GPT-2 uses TensorFlow's standard checkpoint format? In TF, the standard checkpoint uses protocol buffers and has named tensors. But this is raw float data with no header.
+
+Wait, let me look at this from a different angle. The file starts with float
+[tr-thinking call-0026:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 32 data. The very first bytes are: 03 ef f5 3e which is 0x3ef5ef03 in little-endian = approximately 0.479. 
+
+For GPT-2 124M, the parameter count matches perfectly with what I calculated. But the layout might be different.
+
+Actually, I wonder if this is from llm.c or nanoGPT's format. In llm.c (Karpathy's), the checkpoint is a raw binary dump with a specific order. Let me check if maybe the format is:
+- wte (50257*768)
+- wpe (1024*768)
+- In
+[tr-thinking call-0026:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  each layer: ln_1_g, ln_1_b, qkv_w, qkv_b, proj_w, proj_b, ln_2_g, ln_2_b, fc_w, fc_b, proj_w, proj_b
+- ln_f_g, ln_f_b
+
+Wait, I've been calculating wte = 50257*768 = 38,597,376. wpe = 1024*768 = 786,432. Base = 39,383,808.
+
+The ln1_g should be at 
+[tr-thinking call-0026:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 39,383,808 and be ~768 values all near 1.0. But the scan found NO gamma-like values near that position.
+
+Actually wait - I just realized something. Let me recheck: maybe the very first float is 0.479, and looking at wte, the first token's embedding starts at 0.480. Those are reasonable embedding values. 
+
+But what about layer norm gammas? They should be initialized to 1.0 and stay close to 1.0. If none of the 768-wide blocks have average absolute value
+[tr-thinking call-0026:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  close to 1.0 in the entire file... that would be very unusual.
+
+Wait, the scan found ONE candidate at offset 2364672 (3079*768), with avg|v|=0.8678 and values 0.131, 0.209, 0.206, 1.254. That doesn't look like a typical layer norm gamma.
+
+Actually, wait. Let me reconsider. GPT-2's original model uses openai format. The checkpoint format from the original GPT-2 code (not
+[tr-thinking call-0026:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  llm.c) is TF's standard checkpoint format. But this file has NO header and starts directly with float data. This means it's been converted to raw floats.
+
+What if the layout uses TRANSPOSED weights? In TF, conv1d (actually matrix multiply) stores weights as [in, out]. But what if the converter transposed them?
+
+Actually, let me think about the llm.c checkpoint format more carefully. In Karpathy's llm.c, the format is:
+
+model->wte = parameters + 0;
+model->wpe = parameters + 50257*768;
+model->ln1w = parameters + 50257*768 + 1024*768;
+...
+
+Actually
+[tr-thinking call-0026:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  in llm.c, the layer norm gammas are stored first in each layer, then biases, then the weight matrices. The weight matrices are stored as [out, in] (row-major), which is the transposed version compared to the original TF format.
+
+So the format is:
+wte[50257][768]
+wpe[1024][768]
+For each layer:
+  ln1w[768] (layer norm gamma, should be ~1.0)
+  ln1b[768] (layer norm beta, should be ~0.0)
+  qkvw[2304][768] (QKV weight, out x in
+[tr-thinking call-0026:worker:xiaomi/mimo-v2.5-pro-ultraspeed] )
+  qkvb[2304] (QKV bias)
+  attprojw[768][768]
+  attprojb[768]
+  ln2w[768]
+  ln2b[768]
+  fcw[3072][768]
+  fcb[3072]
+  fcprojw[768][3072]
+  fcprojb[768]
+lnfw[768]
+lnfb[768]
+
+But the scan showed that position 39383808 has
+[tr-thinking call-0026:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  values like 0.0126, 0.111, -0.019, etc. which average 0.0147. That looks like biases (near 0), not gammas (near 1).
+
+Wait, what if the ordering within each layer is different? What if it's:
+ln1w, ln1b, qkvw, qkvb, attprojw, attprojb, ln2w, ln2b, fcw, fcb, fcprojw, fcprojb
+
+Let me calculate: ln1w = 768 floats. If I look
+[tr-thinking call-0026:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  at position 39383808, the first 768 values average 0.0147. That doesn't look like gamma.
+
+What if the gamma values were somehow stored differently? Like maybe the format doesn't store gammas as ~1.0 values?
+
+Actually, wait. Let me reconsider the weight ordering. Maybe it starts differently:
+
+What if the file starts with ALL the embedding weights, then ALL the bias vectors, then ALL the weight matrices? Or some other grouping?
+
+Let me look at the file structure differently. The first float is 0.480339. Let me check if this looks like an embedding value (reasonable)
+[tr-thinking call-0026:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  or a gamma value (should be ~1.0).
+
+0.480 is a typical embedding value, so wte first makes sense.
+
+Let me try another approach: search for a block of 768 values where ALL values are close to 1.0 (within ±0.5).
+
+Actually, I realized my search was too strict. Layer norm gammas in GPT-2 are initialized to 1.0, and during training they stay close to 1.0 but can vary. The mean absolute value should be around 1.0, but individual values can range from 0 to 2+
+[tr-thinking call-0026:worker:xiaomi/mimo-v2.5-pro-ultraspeed] .
+
+Let me try a different search: look for blocks where the mean is close to 1.0 and the values are all positive.
+
+Actually, looking at the llm.c format reference more carefully:
+
+The format in llm.c's train_gpt2.py is:
+```
+header[256]  # 256 ints = 1024 bytes header
+```
+
+Wait, that's llm.c format which has a header! But our file has no header (starts with float data).
+
+What if this is from the gpt2tc or picoGPT format? Or from a different converter?
+
+Let me try yet another approach: maybe the layer norm gammas aren't near
+[tr-thinking call-0026:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  1.0 in this particular model. Let me just check what the actual first layer's weights look like at various offsets and try to match them.
+
+Actually, let me reconsider. Maybe the format stores ln1_g and ln1_b differently. What if the ln1_g values really aren't near 1.0?
+
+In GPT-2 124M, the layer norm gamma values should be close to 1.0 after training. Let me check the original OpenAI GPT-2 model - the ln_1 gamma values are indeed close to 1.0.
+
+Hmm, but my scan found no such
+[tr-thinking call-0026:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  values in the entire file. Let me reconsider - maybe I made an error in my scan, or maybe the gamma values are stored at a different granularity.
+
+Actually wait - I used `float a=0; for(int i=0;i<768;i++) a+=fabsf(W[o+i]); a/=768;` which gives the mean absolute value. For gamma near 1.0, this should be about 1.0. But the scan found nothing with avg between 0.9 and 1.1 except one weird position.
+
+What if the gamma values in this checkpoint are NOT near 1.0? That seems
+[tr-thinking call-0026:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  unlikely for GPT-2.
+
+Actually, let me reconsider what the layer norm gamma values look like. In the original GPT-2:
+- The gammas are indeed initialized to 1.0
+- After training, they can vary significantly - some values might be 0.5 to 1.5
+
+Let me broaden my search a bit or look at the structure differently.
+
+Wait - what if the checkpoint format starts with position embeddings first, then token embeddings? Let me check if wpe (which should be [1024][768]) comes first.
+
+Actually, I should just check what the second block of 768 values looks like (
+[tr-thinking call-0026:worker:xiaomi/mimo-v2.5-pro-ultraspeed] at position 768).
+
+Hmm, actually I realize I should think about this more carefully. What format is this checkpoint in? The user said "gpt2 weights stored as a TF .ckpt". But the file has no TF checkpoint header - it's raw floats.
+
+There are several converters that produce raw float dumps:
+1. llm.c format (has a header)
+2. picoGPT format
+3. Custom converters
+
+Let me try a completely different approach. Instead of guessing the format, let me examine the weights more systematically.
+
+Let me check if maybe the first 768 values are ln_f (final layer norm gamma), not wte.
+[tr-thinking call-0026:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  If ln_f gammas are close to 1.0... no, the first value is 0.48, not ~1.0.
+
+Actually, I wonder: what if the format interleaves weights differently? What if it's:
+- wte first, then layers, then wpe, then ln_f?
+
+No, that doesn't make sense.
+
+Let me try yet another approach: check if the wpe is at a different offset. wpe should be a 2D positional pattern - values should vary smoothly with position.
+
+Actually, let me just write a more comprehensive scan. Let me look at blocks of various sizes and characterize them
+[tr-thinking call-0026:worker:xiaomi/mimo-v2.5-pro-ultraspeed] .
+
+Wait, I had another idea. What if this is the picoGPT format? In picoGPT, the weights are stored as:
+
+1. wte (50257, 768)
+2. wpe (1024, 768)
+3. ln1_g (768)
+4. ln1_b (768)
+5. c_attn_w (768, 2304) - in TF conv1d format [in, out]
+6. c_attn_b (2304)
+7. c_proj_w (768, 768) - [in, out]
+8. c_proj_b (768)
+9. ln2_g (768)
+10. ln2_b (768)
+11.
+[tr-thinking call-0026:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  c_fc_w (768, 3072) - [in, out]
+12. c_fc_b (3072)
+13. c_proj_w (3072, 768) - [in, out]
+14. c_proj_b (768)
+(repeat for each layer)
+15. ln_f_g (768)
+16. ln_f_b (768)
+
+This is EXACTLY what I've been using. The ln1_g should be at offset 39,383,808. But the values there average 0.0147, not ~1.0.
+
+Hmm,
+[tr-thinking call-0026:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  unless... wait. Let me check: what does 50257 * 768 equal exactly?
+
+50257 * 768 = 50257 * 700 + 50257 * 68 = 35,179,900 + 3,417,476 = 38,597,376
+1024 * 768 = 786,432
+Total: 38,597,376 + 786,432 = 39,383,808
+
+
+[tr-thinking call-0026:worker:xiaomi/mimo-v2.5-pro-ultraspeed] That's correct. So at offset 39,383,808, we should have ln1_g of layer 0.
+
+But the values are: 0.012614, 0.111258, -0.018961, -0.079713, -0.194477, -0.022865, -0.045445, 0.048738
+Average of first 768: 0.0147
+
+These are NOT gamma values (which should be ~1.0). They look like bias values (
+[tr-thinking call-0026:worker:xiaomi/mimo-v2.5-pro-ultraspeed] close to 0) or something else.
+
+What if the format is: wte, wpe, then within each layer, the order is different:
+- c_attn_w, c_attn_b, c_proj_w, c_proj_b, ln1_g, ln1_b, ln2_g, ln2_b, ...
+
+No, that doesn't make sense either.
+
+OR what if the checkpoint doesn't include layer norm gammas at all (they're assumed to be 1.0)?
+
+OR what if the per-layer order is: ln1_b, ln1_g (bias before gamma)?
+
+If ln1_b is at offset 39,383,
+[tr-thinking call-0026:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 808, then values near 0 make sense! And ln1_g would be at 39,384,576 (768 floats later).
+
+Wait no, 0.0126, 0.111, -0.019, etc. are reasonable for layer norm bias, but the average is 0.0147 which is close to 0. Let me check what's at offset 39,384,576.
+
+Actually, let me try a different hypothesis. What if it's: ln1_b, ln1_g (beta first, then gamma)? Or what if ln_1 gamma
+[tr-thinking call-0026:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  IS near 0 in some weird initialization?
+
+Actually, in GPT-2, the original OpenAI TF code initializes layer norm scale (gamma) to 1.0 and bias (beta) to 0.0. After training, gamma stays close to 1.0 and beta stays close to 0.0.
+
+If what we see at offset 39,383,808 looks like bias (near 0), then maybe the order is reversed: bias first, then gamma. Let me check what's at offset 39,383,808 + 768.
+
+Let me write a quick diagnostic to check several key offsets.
+
+Actually,
+[tr-thinking call-0026:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  maybe I should step back and think about what common GPT-2 raw checkpoint formats exist.
+
+One common format (used by various projects) is:
+1. wte
+2. wpe
+3. Per layer:
+   - ln_1.gamma
+   - ln_1.beta
+   - attn.c_attn.weight (combined QKV)
+   - attn.c_attn.bias
+   - attn.c_proj.weight
+   - attn.c_proj.bias
+   - ln_2.gamma
+   - ln_2.beta
+   - mlp.c_fc.weight
+   - mlp.c_fc.bias
+   - mlp.c_proj.weight
+   - m
+[tr-thinking call-0026:worker:xiaomi/mimo-v2.5-pro-ultraspeed] lp.c_proj.bias
+4. ln_f.gamma
+5. ln_f.beta
+
+In this format, ln_1.gamma is at offset 39,383,808 and should have values near 1.0.
+
+But we're seeing values near 0 there. So either:
+1. The order is different (bias before gamma, or something else is first)
+2. The checkpoint format is completely different
+
+Let me check another hypothesis: maybe it's wte, then 12 layers, then wpe, ln_f.
+
+If layers start at offset 38,597,376 (= wte):
+- Layer 0, first 768 floats at
+[tr-thinking call-0026:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  38,597,376:
+  This is still within the wte range (wte goes from 0 to 38,597,375).
+
+Wait, 38,597,376 = 50257 * 768. So wte ends at index 38,597,375 and wpe starts at 38,597,376.
+
+What if the order is wte, then layers, then wpe, then ln_f?
+
+No, that doesn't save space. The total is still the same.
+
+Let me think
+[tr-thinking call-0026:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  differently. What if the first byte of the file isn't wte[0][0] but is actually a different parameter?
+
+Or what if there are only 50256 tokens in the embedding (not 50257)?
+
+50256 * 768 = 38,596,608
+With wpe: 38,596,608 + 786,432 = 39,383,040
+
+Then layer 0 would start at 39,383,040 instead of 39,383,
+[tr-thinking call-0026:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 808. The difference is 768. 
+
+What if the tokenizer has 50256 tokens? Then layer0 starts 768 earlier.
+
+But even then, the values at that position might still not be near 1.0.
+
+Let me just write a comprehensive diagnostic that checks multiple possible offsets and prints values.
+
+Actually, let me reconsider the problem from scratch. 
+
+The total number of parameters is 124,439,808. I know:
+- 50257 * 768 = 38,597,376 (wte)
+- 1024 * 768 = 786,43
+[tr-thinking call-0026:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 2 (wpe)
+- 12 * 7,087,872 = 85,054,464 (12 layers)
+- 2 * 768 = 1,536 (ln_f)
+Total: 38,597,376 + 786,432 + 85,054,464 + 1,536 = 124,439,808 ✓
+
+This matches exactly. So the sizes are correct. The issue is just the ordering within each layer.
+
+Let me check: what if within each layer, the order starts with
+[tr-thinking call-0026:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  bias vectors rather than gamma? Like:
+
+Per layer:
+- ln1_b[768] (near 0 - this matches what we see!)
+- ln1_g[768] (near 1)
+- c_attn_w[2304][768] or [768][2304]
+- c_attn_b[2304]
+- c_proj_w[768][768]
+- c_proj_b[768]
+- ln2_b[768]
+- ln2_g[768]
+- fc_w[3072][768]
+- fc_b[3072]
+- fcproj_w[768][3
+[tr-thinking call-0026:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 072]
+- fcproj_b[768]
+
+If this is the case, then ln1_b is at 39,383,808 (near 0 - matches!), and ln1_g is at 39,383,808 + 768 = 39,384,576.
+
+Let me check what's at offset 39,384,576!
+
+Actually, maybe the format puts beta BEFORE gamma. This would explain the issue.
+
+Let me verify this hypothesis.
+
+Also, another common ordering from OpenAI's original TF code
+[tr-thinking call-0026:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  might put bias and gamma in different order.
+
+Let me write a quick check.
+[tr-stream call-0026:worker:xiaomi/mimo-v2.5-pro-ultraspeed] The scan found almost no layer-norm-gamma-like blocks in the file. The values at the expected offset look like biases (near 0), not gammas (near 1.0). This suggests the weight layout within each layer may have bias-before-gamma ordering. Let me investigate.
+
+{
+  "analysis": "The values at offset 39383808 (expected layer 0 ln1_g) have avg 0.0147, looking like biases not gammas. The layer norm gamma (should be ~1.0) might come after the bias. I need to check offset
+[tr-stream call-0026:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  +768 to see if that's where gamma is.",
+  "plan": "Check if layer norm parameters are ordered as beta-gamma instead of gamma-beta. Also scan for gamma-like blocks at specific offsets.",
+  "commands": [
+    {
+      "keystrokes": "cat > /app/diag5.c << 'CEOF'\n#include<stdio.h>\n#include<stdlib.h>\n#include<math.h>\nint main(int argc,char**argv){\nFILE*f=fopen(argv[1],\"rb\");fseek(f,0,SEEK_END);long sz=ftell(f);fseek(f,0,SEEK_SET);\nfloat*W=malloc(sz);fread(W,1,sz,f);fclose(f);\nlong base=39383808;\n/* Check
+[tr-stream call-0026:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  if ln1_b then ln1_g */\nprintf(\"@base (maybe ln1_b?): \");\nfor(int i=0;i<8;i++)printf(\"%.4f \",W[base+i]);printf(\"\\n\");\nfloat a=0;for(int i=0;i<768;i++)a+=W[base+i]*W[base+i];printf(\"  rms: %.4f\\n\",sqrtf(a/768));\n\nprintf(\"@base+768 (maybe ln1_g?): \");\nfor(int i=0;i<8;i++)printf(\"%.4f
+[tr-stream call-0026:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  \",W[base+768+i]);printf(\"\\n\");\na=0;for(int i=0;i<768;i++)a+=fabsf(W[base+768+i]);printf(\"  avg|v|: %.4f\\n\",a/768);\n\nprintf(\"@base+1536 (maybe c_attn_w start?): \");\nfor(int i=0;i<8;i++)printf(\"%.4f \",W[base+1536+i]);printf(\"\\n\");\n\n/* Check all 2
+[tr-stream call-0026:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 4 possible ln positions (2 per layer * 12 layers) */\n/* If beta,gamma order: beta at base, gamma at base+768 */\n/* Per layer = 7087872 floats */\nlong ls=7087872;\nfor(int l=0;l<12;l++){\n  long lb=base+l*ls;\n  float a0=0,a1=0;\n  for(int i=0;i<768;i++){a0+=fabsf(W[lb+i]);a1+=fabsf(W[lb+768+i]);}\n 
+[tr-stream call-0026:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  printf(\"Layer %d: offset0 avg|v|=%.4f, offset768 avg|v|=%.4f\\n\",l,a0/768,a1/768);\n}\n\n/* Check ln_f at end */\nlong lnf=base+12*ls;\nfloat af0=0,af1=0;\nfor(int i=0;i<768;i++){af0+=fabsf(W[lnf+i]);af1+=fabsf(W[lnf+768+i]);}\nprintf(\"ln_f: offset0 avg|v|=%.4f
+[tr-stream call-0026:worker:xiaomi/mimo-v2.5-pro-ultraspeed] , offset768 avg|v|=%.4f\\n\",af0/768,af1/768);\n\nreturn 0;}\nCEOF\ngcc -O3 -o /app/diag5 /app/diag5.c -lm 2>&1 && /app/diag5 gpt2-124M.ckpt 2>&1\n",
+      "duration": 10.0
+    }
+  ]
+}
+
+[tr-stream call-0026:worker:xiaomi/mimo-v2.5-pro-ultraspeed] worker.done finish=stop cost_microdollars=64398
+[tr-stream call-0026:xiaomi/mimo-v2.5-pro-ultraspeed] The scan found almost no layer-norm-gamma-like blocks in the file. The values at the expected offset look like biases (near 0), not gammas (near 1.0). This suggests the weight layout within each layer may have bias-before-gamma ordering. Let me investigate.
+
+{
+  "analysis": "The values at offset 39383808 (expected layer 0 ln1_g) have avg 0.0147, looking like biases not gammas. The layer norm gamma (should be ~1.0) might come after the bias. I need to check offset +768 to see if that's where gamma is.",
+  "plan": "Check if layer norm parameters are ordered as beta-gamma instead of gamma-beta. Also scan for gamma-like blocks at specific offsets.",
+  "commands": [
+    {
+      "keystrokes": "cat > /app/diag5.c << 'CEOF'\n#include<stdio.h>\n#include<stdlib.h>\n#include<math.h>\nint main(int argc,char**argv){\nFILE*f=fopen(argv[1],\"rb\");fseek(f,0,SEEK_END);long sz=ftell(f);fseek(f,0,SEEK_SET);\nfloat*W=malloc(sz);fread(W,1,sz,f);fclose(f);\nlong base=39383808;\n/* Check if ln1_b then ln1_g */\nprintf(\"@base (maybe ln1_b?): \");\nfor(int i=0;i<8;i++)printf(\"%.4f \",W[base+i]);printf(\"\\n\");\nfloat a=0;for(int i=0;i<768;i++)a+=W[base+i]*W[base+i];printf(\"  rms: %.4f\\n\",sqrtf(a/768));\n\nprintf(\"@base+768 (maybe ln1_g?): \");\nfor(int i=0;i<8;i++)printf(\"%.4f \",W[base+768+i]);printf(\"\\n\");\na=0;for(int i=0;i<768;i++)a+=fabsf(W[base+768+i]);printf(\"  avg|v|: %.4f\\n\",a/768);\n\nprintf(\"@base+1536 (maybe c_attn_w start?): \");\nfor(int i=0;i<8;i++)printf(\"%.4f \",W[base+1536+i]);printf(\"\\n\");\n\n/* Check all 24 possible ln positions (2 per layer * 12 layers) */\n/* If beta,gamma order: beta at base, gamma at base+768 */\n/* Per layer = 7087872 floats */\nlong ls=7087872;\nfor(int l=0;l<12;l++){\n  long lb=base+l*ls;\n  float a0=0,a1=0;\n  for(int i=0;i<768;i++){a0+=fabsf(W[lb+i]);a1+=fabsf(W[lb+768+i]);}\n  printf(\"Layer %d: offset0 avg|v|=%.4f, offset768 avg|v|=%.4f\\n\",l,a0/768,a1/768);\n}\n\n/* Check ln_f at end */\nlong lnf=base+12*ls;\nfloat af0=0,af1=0;\nfor(int i=0;i<768;i++){af0+=fabsf(W[lnf+i]);af1+=fabsf(W[lnf+768+i]);}\nprintf(\"ln_f: offset0 avg|v|=%.4f, offset768 avg|v|=%.4f\\n\",af0/768,af1/768);\n\nreturn 0;}\nCEOF\ngcc -O3 -o /app/diag5 /app/diag5.c -lm 2>&1 && /app/diag5 gpt2-124M.ckpt 2>&1\n",
+      "duration": 10.0
+    }
+  ]
+}

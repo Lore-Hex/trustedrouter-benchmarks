@@ -1,0 +1,78 @@
+
+[tr-stream call-0190:socrates:trustedrouter/socrates-pro-plus-1.0] socrates.started
+
+[tr-stream call-0190:worker:xiaomi/mimo-v2.5-pro-ultraspeed] worker.started
+[tr-thinking call-0190:worker:xiaomi/mimo-v2.5-pro-ultraspeed] Still crashing at R_InitData with PC=0x0. This is a regression from the vsnprintf changes. Let me think about what could cause this.
+
+The BSS clearing should still work - the symbols are there. But wait - the binary size changed from the previous working version. Let me check if the _print_itoa function is broken by the changes.
+
+Actually, wait - looking more carefully at the output, R_InitData is a function that loads sprites and textures from the WAD. It's crashing immediately with PC=0x0 which suggests a null function pointer call.
+
+The vsnprintf changes might have introduced a subtle bug. Let me check the _print_itoa function -
+[tr-thinking call-0190:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  the issue might be with the return value or buffer overflow.
+
+Actually, the issue might be more fundamental. The previous working build had the sprite warnings going through, which means R_InitData completed. Now it crashes immediately. What changed?
+
+The only change was to my_stdlib.c (vsnprintf precision handling). Could the changed code be overflowing a buffer or corrupting memory?
+
+Wait - I should check if the heap is being cleared properly. The BSS includes the heap buffer. After clearing, the heap should be all zeros which is correct. But with -O0, maybe the compiler is placing something differently?
+
+Let me try rebuilding
+[tr-thinking call-0190:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  with the previous working vsnprintf to confirm the regression, then debug from there.
+
+Actually, I bet the issue is that the precision changes are consuming extra stack space in vsnprintf (adding 2 more local variables per format specifier), and the stack is overflowing. The MIPS VM has a fixed stack at 0x7FFFFFFC. With 32MB heap in BSS, plus all the doom globals, the data section is huge. The stack might be at a very high address and running into the heap.
+
+Wait, let me check the memory layout. The linker script puts everything at 0x400000:
+-
+[tr-thinking call-0190:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  .text starts at 0x400000
+- .rodata follows
+- .data follows  
+- .bss follows, with 32MB heap
+- _bss_end at 0x024c7b00 (about 33.5MB from start = 0x400000 + 33.5MB ≈ 0x24C7B00)
+
+The stack starts at 0x7FFFFFFC (set in VM constructor). So there's about 0x7FFFFFFC - 0x24C7B00 = 0x5B38500 ≈ 91MB of
+[tr-thinking call-0190:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  space between BSS end and stack. That should be plenty.
+
+Hmm, but the crash is at R_InitData which calls lots of W_Read and Z_Malloc. Maybe it's not a stack issue.
+
+Let me think again - what exactly changed? The vsnprintf now has extra local variables. With -O0, these are all on the stack. But that shouldn't be a problem.
+
+Wait - I just realized something. The crash might be because the heap (8MB->32MB change) is now in BSS and takes longer to clear. But the __start BSS clearing loop is slow - it's
+[tr-thinking call-0190:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  a byte-by-byte loop. With 32MB + all other BSS, that's ~60MB to clear byte by byte. That's fine, it just takes time.
+
+Actually, let me reconsider. The binary size went from 1.9MB to 1.66MB. That's smaller, which is expected with -O0 actually no, -O0 should make it larger. Wait, we changed to -O0 earlier. The size difference might be from removing debug code.
+
+Let me check: is the R_InitData crash happening because the function itself is corrupt? Or is it because something it
+[tr-thinking call-0190:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  calls is corrupt?
+
+PC=0x0 means a jump to address 0. This usually happens with:
+1. A null function pointer call
+2. A corrupted return address on the stack
+
+Let me try a different approach - instead of debugging further, let me just remove the debug code from w_wad.c and r_things.c, and also revert the vsnprintf changes to see if we get back to the working state.
+
+Actually wait - the issue might be even simpler. When we changed -O2 to -O0, the code size changed significantly. Maybe some function that was being inlined at -O2 is now a real function call, and the call target is wrong.
+
+Let me try going
+[tr-thinking call-0190:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  back to -O2 and see if it works.
+[tr-stream call-0190:worker:xiaomi/mimo-v2.5-pro-ultraspeed] {
+  "analysis": "R_InitData crash with PC=0x0 is a regression. The vsnprintf changes or -O0 compilation might be causing issues. Let me try reverting to -O2 first to check if that fixes the regression.",
+  "plan": "Switch back to -O2, rebuild, and test.",
+  "commands": [
+    {"keystrokes": "sed -i 's|-O0|-O2|' /app/doomgeneric/doomgeneric/Makefile.mips\n", "duration": 0.1},
+    {"keystrokes": "cd /app/doomgeneric/doomgeneric && make -f Make
+[tr-stream call-0190:worker:xiaomi/mimo-v2.5-pro-ultraspeed] file.mips clean >/dev/null 2>&1 && make -f Makefile.mips -j4 2>&1 | grep 'error:' | head -3\n", "duration": 60.0},
+    {"keystrokes": "cp /app/doomgeneric/doomgeneric/doomgeneric_mips /app/ && cd /app && timeout 30 node vm.js 2>&1 | grep -a 'R_Init\\|termin\\|Executed\\|frame.bmp' | head -10\n", "duration": 35.0}
+  ]
+}
+
+[tr-stream call-0190:worker:xiaomi/mimo-v2.5-pro-ultraspeed] worker.done finish=stop cost_microdollars=185965
+[tr-stream call-0190:xiaomi/mimo-v2.5-pro-ultraspeed] {
+  "analysis": "R_InitData crash with PC=0x0 is a regression. The vsnprintf changes or -O0 compilation might be causing issues. Let me try reverting to -O2 first to check if that fixes the regression.",
+  "plan": "Switch back to -O2, rebuild, and test.",
+  "commands": [
+    {"keystrokes": "sed -i 's|-O0|-O2|' /app/doomgeneric/doomgeneric/Makefile.mips\n", "duration": 0.1},
+    {"keystrokes": "cd /app/doomgeneric/doomgeneric && make -f Makefile.mips clean >/dev/null 2>&1 && make -f Makefile.mips -j4 2>&1 | grep 'error:' | head -3\n", "duration": 60.0},
+    {"keystrokes": "cp /app/doomgeneric/doomgeneric/doomgeneric_mips /app/ && cd /app && timeout 30 node vm.js 2>&1 | grep -a 'R_Init\\|termin\\|Executed\\|frame.bmp' | head -10\n", "duration": 35.0}
+  ]
+}

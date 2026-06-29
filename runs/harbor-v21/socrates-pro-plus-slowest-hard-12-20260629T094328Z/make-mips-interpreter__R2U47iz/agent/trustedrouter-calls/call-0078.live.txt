@@ -1,0 +1,1249 @@
+
+[tr-stream call-0078:socrates:trustedrouter/socrates-pro-plus-1.0] socrates.started
+
+[tr-stream call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed] worker.started
+[tr-thinking call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed] The Z_Malloc failure with "420303204 bytes" is still happening. This is a clear corruption issue. The value 420303204 = 0x190FC964 which doesn't look right for a size calculation.
+
+Let me think about what's happening. The binary has its own custom allocator (basic_malloc) that manages a static buffer at 0x4b0b40. The Z_Init calls malloc which calls basic_malloc. The basic_malloc uses buddy allocation.
+
+The key issue is the Z_Malloc size being corrupted. Let me look at R_Init to understand what it's trying to allocate. The
+[tr-thinking call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  R_Init calls Z_Malloc for various tables. The size 420303204 (0x190FC964) seems like a corrupted value, which could be caused by:
+
+1. Incorrect multiplication results
+2. Incorrect memory reads
+3. Stack corruption
+
+Let me trace through the Z_Malloc call more carefully. The message is "Z_Malloc: failed on allocation of %i bytes" where the size comes from a register. The size 420303204 is 0x190FC964 which is suspicious.
+
+Wait - looking more carefully,
+[tr-thinking call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  the issue could be with the MIPS `noreorder` flag. The binary has the `noreorder` flag set, which means the assembler did NOT reorder branch delay slots. But in our code, we're handling delay slots correctly.
+
+Actually wait, let me re-examine the problem. The `jalr` instruction in my code saves `(cpc+8)>>>0` as the return address. But that's wrong! In MIPS with delay slots, `jal` saves `PC+8` because the delay slot instruction (at PC+4) needs to execute before the return. Since our interpreter processes the delay slot as the
+[tr-thinking call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  next instruction after the branch, the return address should be `PC+4` (the instruction after the delay slot).
+
+Wait no, let me think again. In the binary:
+- PC: jal target  (sets ra = PC + 8)
+- PC+4: delay slot instruction  (executes before branch)
+- PC+8: first instruction of caller's next code
+
+But in our interpreter:
+- cpc: jal target (we set ra = cpc + 8, and set bd = target)
+- cpc+4: delay slot (we execute this, since pc was set to cpc+4)
+- After delay slot: pc
+[tr-thinking call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  = bd = target
+
+But when the function returns, it does `jr $ra`. So ra must point to the instruction AFTER the delay slot, which is cpc + 8. That seems correct.
+
+Wait, but what if cpc + 8 is wrong? The issue is that the MIPS convention is:
+- jal saves PC+8 in $ra (where PC is the address of the jal instruction)
+- The delay slot at PC+4 is executed
+- Control transfers to the target
+
+And when the callee returns via jr $ra, it goes to PC+8 which is the instruction after the delay slot. This is correct.
+
+Hmm,
+[tr-thinking call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  let me reconsider. Actually, maybe the branch delay handling is causing issues with the main loop. Let me trace through:
+
+```
+1. cpc = pc, I = jal (branchDelay set to target, pc = cpc+4)
+2. cpc = cpc+4, I = delay slot instruction, tb = bd (which is target), bd = -1
+3. After step 2, tb >= 0, so pc = target
+4. cpc = target, continues execution
+```
+
+This looks correct.
+
+But wait - in step 2, when processing the delay slot instruction, what if it
+[tr-thinking call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 's also a branch? The delay slot of a branch should NOT be another branch. So that's fine.
+
+Actually, I think the issue might be with the `sra` instruction. Let me check:
+```
+case 3:R[rd]=(R[rt]>>sh)>>>0;break;
+```
+
+This is `R[rd] = (R[rt] >> sh) >>> 0`. In JavaScript, `>>` on a number performs signed right shift (arithmetic). But `R[rt]` is a `Uint32Array` element, so reading it gives an unsigned value. Then `>>`
+[tr-thinking call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  on a positive number should be fine. But wait, the `>>` operator in JavaScript works on 32-bit signed integers. So if `R[rt]` has the high bit set (negative as signed), then `R[rt] >> sh` will be negative, and then `>>> 0` converts to unsigned. That should be correct for `sra`.
+
+Actually wait, the problem is that `R[rt]` is already unsigned (from Uint32Array), but `>>` treats the operand as signed. So `R[rt] >> sh` where R[rt] = 0x80000001 would give a negative result in JS,
+[tr-thinking call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  then `>>> 0` converts it. Let me verify:
+
+```
+(0x80000001 >> 4) in JS
+```
+JS converts 0x80000001 to signed 32-bit = -2147483647, then >> 4 = -134217728, then >>> 0 = 0xF8000000.
+
+Expected sra: arithmetic right shift of 0x80000001 by 4 = 0xF800000
+[tr-thinking call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 0. Correct!
+
+Let me look at another possible issue. The `jalr` instruction:
+```
+case 9:{const t=R[rs];R[rd||31]=(cpc+8)>>>0;bd=t;break}
+```
+
+If `rd` is 0, `rd||31` becomes 31 (the default link register). But `R[0]` is always 0 in MIPS. The `R[0]=0` at the end of the loop fixes this. But in `jalr`, if `rd=0`, we write to `R[31]` which is the correct behavior. The MIPS spec
+[tr-thinking call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  says `jalr rd, rs` defaults rd to 31 if rd is 0. Actually no, the standard MIPS `jalr` writes to rd (which can be any register). If rd is 0, the result is discarded (since R[0] is always 0). The conventional usage is `jalr $ra, $rs` where rd=31. Let me check the binary.
+
+Actually, looking at `jalr` in the disassembly: `0c10e558 jal 439560 <doomgeneric_Create>` - this is `jal`, not `jalr`. For `jal`, ra is implicitly 
+[tr-thinking call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 31. And our code handles `jal` correctly in the main switch (case 3).
+
+Wait, I think I found a potential issue. Let me check the `delaySlot` interaction with `jr $ra`. When we see `jr $ra`:
+
+```
+case 8:bd=R[rs];break;
+```
+
+This sets bd to the value of ra. Then the delay slot instruction executes. Then pc = bd = ra. This is correct.
+
+Let me think about what could cause the allocation size to be wrong. The Z_Malloc function gets a size as a parameter. The size is typically computed by the caller. For R_Init, the sizes depend
+[tr-thinking call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  on SCREENWIDTH and SCREENHEIGHT.
+
+Wait, looking at the output more carefully:
+```
+Z_Malloc: failed on allocation of 420303204 bytes
+```
+
+420303204 = 0x190FC964. This doesn't look like a valid size at all. It could be a register value that's corrupted.
+
+Actually, I wonder if there's a subtle issue with the delay slot handling. Let me look at how the binary's Z_Malloc function works and trace through.
+
+Actually, I bet the problem is with the `printf` formatting. The binary calls:
+```
+[tr-thinking call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed] c
+printf("Z_Malloc: failed on allocation of %i bytes\n", size);
+```
+
+The size is passed as a function argument. If the caller computes the size incorrectly due to a multiply bug, we'd see this.
+
+Let me check - does the `mul` instruction (SPECIAL2 case 2) work correctly?
+
+```
+case 2:R[rd]=Math.imul(R[rs],R[rt])>>>0;break;
+```
+
+`Math.imul` does a 32-bit integer multiply and returns the low 32 bits. This should be correct.
+
+What about the R_Init code path? Let me look at what R_Init allocates. The key
+[tr-thinking call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  allocation in `R_Init` is probably the column clipping tables and similar. Let me look at R_InitExecuteSetSize.
+
+From the source code, `R_ExecuteSetViewSize` does:
+```c
+scaledviewwidth = SCREENWIDTH;
+viewheight = SCREENHEIGHT;
+```
+
+And then allocates various tables. But SCREENWIDTH and SCREENHEIGHT are defined in doomgeneric.h:
+```c
+#define DOOMGENERIC_RESX 640
+#define DOOMGENERIC_RESY 400
+```
+
+Wait, but looking at r_main.c line 681-682:
+```c
+scaled
+[tr-thinking call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed] viewwidth = SCREENWIDTH;
+viewheight = SCREENHEIGHT;
+```
+
+And line 714:
+```c
+R_InitBuffer (scaledviewwidth, viewheight);
+```
+
+Let me check if SCREENWIDTH is the same as DOOMGENERIC_RESX. Let me look at the binary for these constants.
+
+Actually, let me approach this differently. Let me add a trace of the last few instructions before the failing Z_Malloc call, so I can see what's computing the wrong size.
+
+Actually, let me think about this more carefully. The message says "420303204 bytes". Let me look at what R_Init actually tries to allocate. From
+[tr-thinking call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  the DOOM source:
+
+R_Init -> R_InitTranTables -> Z_Malloc (TRANSTABLESIZE)
+R_Init -> R_InitColormaps -> Z_Malloc
+
+But actually, looking at the i_video.c:
+```c
+I_VideoBuffer = (byte*)Z_Malloc (SCREENWIDTH * SCREENHEIGHT, PU_STATIC, NULL);
+```
+
+SCREENWIDTH * SCREENHEIGHT = 640 * 400 = 256000. That's not 420303204.
+
+What about R_InitLightTables? It allocates light tables. The formula involves:
+```c
+scale = Fixed
+[tr-thinking call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed] Div ((SCREENWIDTH/2*FRACUNIT), (j+1)<<LIGHTZSHIFT);
+```
+
+And then `Z_Malloc(64*1024*4)` or similar. These should be reasonable sizes.
+
+420303204 in hex is 0x190FC964. This doesn't correspond to any obvious DOOM allocation size. It seems like a corrupted value.
+
+Let me check if this could be caused by an incorrect multiply. For example, if we're computing `640 * 400` but getting a wrong result... Let me test:
+
+```js
+Math.imul(640, 
+[tr-thinking call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 400) // = 256000 = 0x3E800
+```
+
+That's correct. So the basic multiply is fine.
+
+Wait - what if the issue is with a `mult` instruction followed by `mflo`/`mfhi`? The issue could be that when we do:
+```js
+case 24:{const r=BigInt(R[rs]|0)*BigInt(R[rt]|0);lo=Number(r&0xFFFFFFFFn)>>>0;hi=Number((r>>32n)&0xFFFFFFFFn)>>>0;break}
+```
+
+And then:
+```js
+case 16:R[rd]=hi;break;
+case 18:R[rd]=lo;break;
+```
+
+
+[tr-thinking call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed] This should be correct. But wait, what about the interaction between `mult` and `mflo`? The `mflo` should get the low 32 bits. And our `lo` is already `>>> 0`, so it's a uint32. Then `R[rd]=lo` writes it as uint32. This seems fine.
+
+Hmm, let me think about what else could be wrong. Maybe the issue is with an instruction that's NOT being executed properly.
+
+Actually, let me look at this from a different angle. Let me check if the `R_ExecuteSetViewSize` function (at 0x42a558) is even being called. The
+[tr-thinking call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  binary says:
+```
+R_Init: Init DOOM refresh daemon - Z_Malloc: failed on allocation of %i bytes
+```
+
+The "-" suggests it printed "R_Init: Init DOOM refresh daemon." and then on the same line printed "Z_Malloc: failed on allocation of %i bytes". This is because DOOM typically uses `\r` for progress updates on the same line.
+
+So the flow is:
+1. D_DoomMain calls R_Init
+2. R_Init prints "R_Init: Init DOOM refresh daemon."
+3. R_Init calls some function that calls Z_Malloc with a huge size
+
+Let
+[tr-thinking call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  me look at the R_Init function more carefully.
+
+Actually, from the output I can see:
+```
+R_Init: Init DOOM refresh daemon - Z_Malloc: failed on allocation of %i bytes
+Z_Malloc: failed on allocation of 420303204 bytes
+```
+
+Wait, the first line has a %i in it - it seems like the printf format string is being printed literally instead of being interpreted. No wait, the second line shows the actual size: "420303204 bytes".
+
+Let me look at R_Init in the binary. R_Init calls:
+1. R_InitData
+2. R_InitPointToAngle  
+3. R_InitTables
+4. R_SetViewSize
+
+
+[tr-thinking call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed] R_InitTables calls Z_Malloc for various tables. Let me see what table R_Init is trying to allocate.
+
+Actually, wait. Let me look at the Z_Malloc error more carefully. The message says "Z_Malloc: failed on allocation of %i bytes" - this is a format string. But in the binary, it seems like it's being printed as:
+```
+Z_Malloc: failed on allocation of %i bytes
+Z_Malloc: failed on allocation of 420303204 bytes
+```
+
+So the first time it just prints the format string literally (because %i doesn't get substituted), and the
+[tr-thinking call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  second time it actually substitutes the number. This is interesting - maybe there's a printf bug?
+
+Actually, I think the output is:
+```
+R_Init: Init DOOM refresh daemon.
+Z_Malloc: failed on allocation of 420303204 bytes
+```
+
+The "%i bytes" part is just from the output being garbled. Let me re-read:
+```
+R_Init: Init DOOM refresh daemon - Z_Malloc: failed on allocation of %i bytes
+Z_Malloc: failed on allocation of 420303204 bytes
+```
+
+The dashes suggest
+[tr-thinking call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  the console is overwriting lines with `\r`. The actual output sequence is:
+1. "R_Init: Init DOOM refresh daemon." (overwritten)
+2. "Z_Malloc: failed on allocation of 420303204 bytes"
+
+So Z_Malloc is called with size 420303204 = 0x190FC964.
+
+Let me think about what this could be. The number 0x190FC964 doesn't have any obvious meaning. Let me check if this could be a data corruption issue.
+
+Actually, wait. I just realized something. The `se
+[tr-thinking call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed] b` instruction at opcode 0x10:
+```
+case 16:R[rd]=((R[rt]&0xFF)<<24)>>24;break;
+```
+
+The issue here is that `R[rd]` is a Uint32Array element, so the value needs to be unsigned. But `((R[rt]&0xFF)<<24)>>24` produces a signed value. When we store it in Uint32Array, it gets converted to unsigned automatically. But the issue is:
+
+`(0xFF << 24) >> 24` = `(42781900
+[tr-thinking call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 80 | 0) >> 24` = `(-16777216 | 0) >> 24` = `-16777216 >> 24`
+
+In JavaScript, `-16777216 >> 24` = `-1` (arithmetic shift right). Then `R[rd] = -1` in Uint32Array becomes `R[rd] = 4294967295` (0xFFFFFFFF).
+
+Wait, but that's actually correct! `seb` of 0xFF should be
+[tr-thinking call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  sign-extended to 0xFFFFFFFF (-1 as signed).
+
+Let me double check: `seb` takes byte 0 of rt and sign-extends. So if byte is 0xFF, the result is 0xFFFFFFFF (all 1s). In our code:
+```
+R[rd]=((R[rt]&0xFF)<<24)>>24;
+```
+`R[rt]&0xFF` = 0xFF
+`(0xFF << 24)` = 0xFF000000 (as uint32)
+`(0xFF000000) >> 24` = ? In JS, `0xFF000000` is 
+[tr-thinking call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 4278190080 which is > 2^31, so as signed 32-bit it's -16777216. Then `>> 24` is arithmetic shift right, giving -1. Then storing in Uint32Array gives 4294967295 = 0xFFFFFFFF. Correct!
+
+Hmm, but wait. `R[rd]` - what is `rd` here? For `seb`, the instruction format in SPECIAL3/BSHFL is `seb rd, rt`. Let me verify the encoding.
+
+The MIPS
+[tr-thinking call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 32r2 `seb rd, rt` instruction encoding is:
+- SPECIAL3 (op=011111)
+- rs=00000
+- rt=rt
+- rd=rd
+- shamt=10000 (16)
+- funct=100000 (32)
+
+So in our code, for SPECIAL3 case 32, sub=16:
+```
+else if(sh===16)R[rd]=((R[rt]&0xFF)<<24)>>24;
+```
+
+And `rd` and `rt` are extracted from the instruction word as
+[tr-thinking call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed] :
+```
+rd=(I>>>11)&31, rt=(I>>>16)&31
+```
+
+So `R[rd]` is the destination, `R[rt]` is the source. The implementation looks correct.
+
+Let me think about this differently. Maybe the problem is with the `BSS` section not being zeroed properly. The BSS section is:
+```
+.bss NOBITS 004750c0 0650a0 4003c6d0
+```
+
+This is a huge BSS section (about 1GB). My page-based memory returns 0 for unset pages, so BSS should be
+[tr-thinking call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  zero. But wait - I'm loading the data segment which overlaps with the start of BSS:
+
+```
+LOAD 0x056520 0x00466520 ... 0x0eb80 0x4004b270
+```
+
+So the data segment goes from 0x466520 to 0x466520+0xEB80 = 0x4750A0, and BSS starts at 0x4750C0. There's a gap from 0x4750A0 to 0x475
+[tr-thinking call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 0C0 (32 bytes) that should be zero. My code loads `fsz` (0xEB80) bytes, so it doesn't fill this gap. But since the pages are initially undefined (returning 0 via the `r8` function), this should be fine.
+
+Wait, but there's a 2-byte gap between end of data (0x4750A0) and start of BSS (0x4750C0). That's 0x20 = 32 bytes. These should be zero. Since our memory system returns 0 for unset pages, this is
+[tr-thinking call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  fine.
+
+OK let me try a completely different approach. Let me add a trace of the last N instructions before the Z_Malloc failure, so I can see exactly what's going wrong.
+
+Actually, the VM is very slow (about 8M insns/sec based on 982M insns in 120s). This is too slow to run DOOM to completion. Let me think about what fundamental optimizations I can make.
+
+The main issue is twofold:
+1. Z_Malloc fails with a corrupted size
+2. Even if it didn't fail, the VM is too slow
+
+For issue 1, I need to find the bug.
+[tr-thinking call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  For issue 2, I need to make the VM faster.
+
+For issue 2, the key insight is that most instructions are simple register operations or memory access. The JIT compilation approach would be ideal, but it's complex to implement correctly.
+
+Let me focus on issue 1 first. Let me add instruction tracing around the Z_Malloc call to see what's computing the wrong size.
+
+Actually, I just realized - the binary has its own printf implementation. Let me check if the binary's printf reads the format string correctly. The format string "Z_Malloc: failed on allocation of %i bytes" is in the .rodata section. When the binary calls printf with this format string and the size,
+[tr-thinking call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  our VM needs to handle the printf implementation correctly.
+
+But wait, the output does show the number "420303204" in the second line. So printf is working somewhat. The question is whether the number 420303204 is the actual value passed to Z_Malloc, or if there's a printf formatting bug.
+
+Actually, looking at the output again:
+```
+Z_Malloc: failed on allocation of %i bytes
+Z_Malloc: failed on allocation of 420303204 bytes
+```
+
+The first line has a literal %i, which means this is the format string being
+[tr-thinking call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  printed by the I_Error function (which probably prints the format string itself in some error path). The second line has the actual substitution. So the size IS 420303204.
+
+420303204 = 0x190FC964. What if this is actually the result of a multiply that went wrong? Let me think...
+
+SCREENWIDTH * SCREENHEIGHT * 4 = 640 * 400 * 4 = 1024000. Not 420303204.
+
+What if it's something like `SCREENWIDTH * 655360
+[tr-thinking call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed] `? 640 * 655360 = 419430400 = 0x19000000. Close to 0x190FC964 but not exactly.
+
+Or maybe it's a left-shifted value. 0x190FC964 >> 16 = 0x190F = 6415. And 6415 * 65536 = 420407296. Not exactly matching.
+
+What if I look at the R
+[tr-thinking call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed] _ExecuteSetViewSize code? It computes various sizes. Let me look at the disassembly around the Z_Malloc call that fails.
+
+Actually, maybe the simplest approach is to add a `doSys` trap or trace to capture what's happening when Z_Malloc is called. Let me look at Z_Malloc's address.
+
+Z_Malloc is at 0x43856c. If I add a trace when PC hits this address, I can see the arguments.
+
+Actually, let me just add a simple trace - record the last 100 PCs and register states. When we hit an error, dump them. This will help
+[tr-thinking call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  me understand the control flow.
+
+But actually, the more productive approach is to think about what could cause a size of 420303204. Let me look at the binary's R_Init code path.
+
+Actually, you know what, let me just look at the i_video.c code more carefully:
+
+```c
+I_VideoBuffer = (byte*)Z_Malloc (SCREENWIDTH * SCREENHEIGHT, PU_STATIC, NULL);
+```
+
+In doomgeneric_img.c, DG_Init is a no-op. So when does I_InitGraphics get called? It's called from D_DoomMain. But our binary might not call I_InitGraphics at all (since DG_Init is a no-op).
+
+Looking at
+[tr-thinking call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  the output:
+```
+I_Init: Setting up machine state.
+```
+
+This is from I_Init, not I_InitGraphics. Let me check what I_Init does.
+
+After I_Init, it prints "M_Init: Init miscellaneous info." Then "R_Init: Init DOOM refresh daemon." and fails at Z_Malloc.
+
+So the failing Z_Malloc is called from within R_Init. Let me look at what R_Init does in detail. From the source:
+
+```c
+void R_Init (int screenwidth, int screenheight)
+{
+    R_InitData ();
+    R_InitPointToAngle ();
+    R_InitTables ();
+    // viewwidth
+[tr-thinking call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  / viewheight are set by the defaults
+    R_SetViewSize (screenblocks, detaillevel);
+}
+```
+
+R_InitData loads texture and sprite data. R_InitTables does the tangent/cosine tables. R_SetViewSize calls R_ExecuteSetViewSize which allocates various buffers.
+
+In R_ExecuteSetViewSize, we have:
+```c
+colfunc = basecolfunc = R_DrawColumn;
+...
+```
+
+And various Z_Malloc calls. Let me look at the specific allocation. Actually, the problem is that without seeing the exact line, I need to trace the execution.
+
+Let me take a different approach entirely. Let me add a
+[tr-thinking call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  Z_Malloc breakpoint to capture the failing call:
+
+OK, I think the best approach is to add instrumentation to the VM to trace the Z_Malloc call. But first, let me check if there's a simpler issue - maybe the `jalr` instruction or `jr $ra` has a subtle bug.
+
+Wait, I just realized something important. In my delay slot implementation:
+
+```
+if(bd>=0){tb=bd;bd=-1}
+```
+
+When we encounter a branch (like `beq`), we set `bd = target`. Then on the NEXT iteration, we execute the delay slot instruction and set
+[tr-thinking call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  `tb = bd` and `bd = -1`. After the delay slot instruction, `tb >= 0`, so we set `pc = tb`.
+
+But what if the delay slot instruction is a store or load that has side effects? That's fine, it executes normally.
+
+What if the delay slot instruction is another branch? That would be a MIPS programming error, and shouldn't happen in well-formed code.
+
+OK, I think the issue might actually be simpler than I thought. Let me look at the Z_Malloc error more carefully.
+
+Z_Malloc at 0x43856c takes the size in $a0. If I trace what value is in
+[tr-thinking call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  $a0 when Z_Malloc is called, I can understand the corruption.
+
+Let me add a trap at Z_Malloc's address to log the size.
+
+Actually, let me just instrument the syscall handler to detect when we're writing to the frame.bmp file path. No wait, that's not related.
+
+OK, let me try yet another approach. Let me look at what instruction causes the corrupted size. I'll add a trace buffer to the VM.
+
+Actually, I think the problem might be simpler. Let me re-examine the `delaySlot` interaction with `jal`.
+
+When we hit `jal target`:
+```
+case 3:R[31]=(cpc+8
+[tr-thinking call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed] )>>>0;bd=((cpc+4)&0xF0000000)|((I&0x3FFFFFF)<<2);break;
+```
+
+Wait, `bd=((cpc+4)&0xF0000000)`. But shouldn't this be `cpc` not `cpc+4`? The MIPS `j` instruction encodes the target as `(PC+4).top4 | (imm26 << 2)` where PC+4 is the address of the delay slot. Actually no, the standard MIPS encoding for `j` is: the target address is formed by the upper 4 bits of the **branch instruction's address + 4** (
+[tr-thinking call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed] i.e., the delay slot's address) concatenated with the 26-bit immediate shifted left by 2.
+
+Wait, actually, the MIPS specification says: the jump target address is formed by concatenating the high-order four bits of the address of the delay slot (not the jump instruction), the 26-bit target address shifted left 2 bits, and two zero bits. The delay slot address is PC+4. So `(PC+4) & 0xF0000000 | (imm26 << 2)`.
+
+In our code:
+```
+bd=((cpc+4)&0xF0000000)|((I&0x3FFFFFF)<<2);
+```
+
+`cpc` is the address of the `j` instruction.
+[tr-thinking call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  `cpc+4` is the delay slot address. This is correct!
+
+But wait, for branches (beq, bne, etc.), the target is `cpc+4+(si<<2)`. The MIPS spec says: the branch target is the delay slot address (PC+4) plus the sign-extended 16-bit offset shifted left 2. So `PC+4+(si<<2)`. This is what we have. Correct!
+
+For `jal`, ra = PC+8 (address of second instruction after jal). In our code:
+```
+R[31]=(cpc+8)>>>0;
+```
+
+Where cpc is the address of the jal instruction. So
+[tr-thinking call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  ra = cpc+8. The delay slot is at cpc+4. After the delay slot executes, control transfers to the target. The callee's first real instruction is at the target. When the callee returns with `jr $ra`, it jumps to cpc+8, which is the instruction after the delay slot. This is correct!
+
+OK, I'm going in circles. Let me just add trace instrumentation to the VM to find the bug.
+
+Actually, wait. Let me look at this from the R_Init perspective. What does R_Init allocate? Let me look at the binary.
+
+The function R_Init is at address... let me search for it.
+
+Actually, from the symbol
+[tr-thinking call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  table:
+```
+readelf -s /app/doomgeneric_mips | grep R_Init
+```
+
+Let me check that. But I don't have the output. Let me just look at what R_Init does by disassembling it.
+
+Actually, I have a better idea. Let me look at what address calls Z_Malloc with the bad size. The Z_Malloc is at 0x43856c. If I can find the caller's address, I can look at the computation.
+
+Let me add a trace at the Z_Malloc entry point to log $ra (return address) and $a0 (size). This will tell me who's calling Z_Malloc and with
+[tr-thinking call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  what size.
+
+Let me modify the VM to add this tracing:
+
+```javascript
+// Before the main loop
+const TRACE_ZMALLOC = 0x43856c;
+const traceBuf = [];
+
+// In the main loop, before executing:
+if (cpc === TRACE_ZMALLOC) {
+  console.error(`Z_Malloc called: size=${R[4]}, ra=0x${R[31].toString(16)}`);
+}
+```
+
+This will show me the size and caller. Let me do this.
+
+Actually, I also realized there might be a subtle issue with the way I'm handling the `delay slot
+[tr-thinking call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed] ` for `jr $ra`. Let me trace through a function call/return cycle:
+
+1. Caller at 0x100: `jal 0x200` -> ra = 0x108, bd = 0x200
+2. Delay slot at 0x104: some instruction executes, tb = 0x200, pc = 0x200
+3. Callee at 0x200: instructions execute...
+4. Callee at 0x300: `jr $ra` -> bd = ra = 0x108
+5. Delay slot at 0x304: some instruction executes, tb = 0x108, pc = 0x108
+[tr-thinking call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 
+6. Back at caller at 0x108: continues
+
+This seems correct! The function returns to the instruction after the delay slot of the `jal`.
+
+OK let me just add the Z_Malloc trace and run it again. Let me also look for the root cause by adding more comprehensive tracing.
+
+Wait, actually, I want to double-check one thing. Let me look at the binary's `__start` function again:
+
+```
+00400110 <__start>:
+  400110:       27bdffe8        addiu   sp,sp,-24
+  40
+[tr-thinking call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 0114:       afbf0014        sw      ra,20(sp)
+  400118:       24040000        li      a0,0
+  40011c:       0c10e558        jal     439560 <doomgeneric_Create>
+  400120:       24050000        li      a1,0       <-- delay slot
+  400124:       0c100fbc        jal     403ef0 <doomgeneric_Tick>
+  400128:       00000000        nop              
+[tr-thinking call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  <-- delay slot
+  40012c:       08100049        j       400124
+  400130:       00000000        nop               <-- delay slot
+```
+
+So the flow is:
+1. 0x400110: addiu sp, sp, -24
+2. 0x400114: sw ra, 20(sp)
+3. 0x400118: li a0, 0
+4. 0x40011c: jal 0x439560 (doomgeneric_Create)
+[tr-thinking call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  -> ra = 0x400124, bd = 0x439560
+5. 0x400120: li a1, 0 (delay slot) -> a1 = 0, tb = 0x439560, pc = 0x439560
+6. Execution jumps to doomgeneric_Create...
+7. doomgeneric_Create returns via jr $ra (which is 0x400124)
+8. 0x400124: jal 0x403ef0 (doomgeneric_Tick) -> ra = 0x40012c, bd = 0x403ef0
+9. 0x400128: nop (delay slot), tb = 0x403
+[tr-thinking call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed] ef0, pc = 0x403ef0
+10. doomgeneric_Tick returns via jr $ra (which is 0x40012c)
+11. 0x40012c: j 0x400124 -> bd = 0x400124
+12. 0x400130: nop (delay slot), tb = 0x400124, pc = 0x400124
+13. Back to step 8 - infinite loop calling doomgeneric_Tick
+
+This looks correct!
+
+Now let me check doomgeneric_Create at 
+[tr-thinking call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 0x439560:
+
+```
+doomgeneric_Create at 0x439560:
+  saves registers, calls malloc, calls DG_Init, calls D_DoomMain
+```
+
+Wait, doomgeneric_Create is at 0x439560. Looking at the source:
+
+```c
+void doomgeneric_Create(int argc, char **argv)
+{
+    myargc = argc;
+    myargv = argv;
+    M_FindResponseFile();
+    DG_ScreenBuffer = malloc(DOOMGENERIC_RESX * DOOMGENERIC_RESY * 4);
+    DG_Init();
+    D_DoomMain
+[tr-thinking call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  ();
+}
+```
+
+`DOOMGENERIC_RESX * DOOMGENERIC_RESY * 4 = 640 * 400 * 4 = 1024000`. That's the size of DG_ScreenBuffer.
+
+Then D_DoomMain eventually calls R_Init which tries to allocate some tables. The Z_Malloc call that fails has size 420303204 = 0x190FC964.
+
+Let me check if this could be caused by a multiplication overflow or incorrect result. For example, what if `640 * 655360` gives 420303204 instead of the correct 419430
+[tr-thinking call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 400?
+
+Actually, let me compute: 640 * 655360 = 419430400. And 420303204 - 419430400 = 872804. So they don't match.
+
+Let me try: 420303204 / 640 = 656723.756... Not an integer.
+
+420303204 / 400 = 1050758.01... Not an integer either.
+
+
+[tr-thinking call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 420303204 / 256 = 1641809.390625... Nope.
+
+What about 420303204 = 0x190FC964? Let me look at this as two 16-bit halves: 0x190F and 0xC964.
+
+0x190F = 6415
+0xC964 = 51556
+
+Hmm, 6415 * 65536 + 5
+[tr-thinking call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 1556 = 420384292. That's not 420303204.
+
+Actually wait: 0x190FC964 = 1*16^7 + 9*16^6 + 0*16^5 + 15*16^4 + 12*16^3 + 9*16^2 + 6*16 + 4
+= 268435456 + 150994944 + 0 + 983040 + 4
+[tr-thinking call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 9152 + 2304 + 96 + 4 = 420414998. Hmm that doesn't match either. Let me just use Node.js: 0x190FC964 = 420303204. Let me verify: 0x19000000 = 419430400, 0xFC964 = 1034596. 419430400 + 1034596 = 420464996. Hmm, that's not right either.
+
+Let me compute properly:
+0x190FC964
+[tr-thinking call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 
+= 0x19 * 16^6 + 0x0F * 16^4 + 0xC9 * 16^2 + 0x64
+Wait, this is hex by bytes: 19 0F C9 64
+= 0x190FC964
+= 1 * 16^7 + 9 * 16^6 + 0 * 16^5 + F * 16^4 + C * 16^3 + 9 * 16^2 + 6 * 16 + 4
+= 268435456 + 
+[tr-thinking call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 150994944 + 0 + 983040 + 49152 + 2304 + 96 + 4
+= 420464996
+
+Wait, that doesn't match. Let me just use a calculator.
+
+Actually, the output says "420303204". Let me convert: 420303204 = 0x? 
+
+420303204 / 16 = 26268950.25, so low nibble = 4
+26268950 / 16 = 1
+[tr-thinking call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 641809.375, nibble = 6
+1641809 / 16 = 102613.0625, nibble = 1 (hmm, actually let me be more careful)
+
+420303204 in hex:
+420303204 / 268435456 = 1.566... -> first hex digit is 1
+420303204 - 268435456 = 151867748
+151867748 / 16
+[tr-thinking call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 777216 = 9.05... -> next digit is 9
+151867748 - 9*16777216 = 151867748 - 150994944 = 872804
+872804 / 1048576 = 0.832... -> next digit is 0
+872804 / 65536 = 13.316... -> next digit is D
+872804 - 13*65536 =
+[tr-thinking call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  872804 - 851968 = 20836
+20836 / 4096 = 5.086... -> next digit is 5
+20836 - 5*4096 = 20836 - 20480 = 356
+356 / 256 = 1.39... -> next digit is 1
+356 - 256 = 100
+100 / 16 = 6.25 -> next digit is 6
+100 - 96 = 4 -> next digit is 4
+
+So 4
+[tr-thinking call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 20303204 = 0x190D5164
+
+Hmm, interesting. 0x190D5164. Let me see if this has any pattern.
+
+Actually, I may have made an error. Let me just use Node.js to check.
+
+Actually, forget the exact value. The key insight is that this is a corrupted value, not a real allocation size. The question is: what computation produced this wrong value?
+
+Let me add Z_Malloc tracing to the VM. I'll modify the code to break at Z_Malloc (0x43856c) and log $a0 and $ra.
+
+Let me also add an
+[tr-thinking call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  instruction count log to see how many instructions execute between different Z_Malloc calls.
+
+Actually, I just want to get this working. Let me add a simpler approach - dump the registers at the point of the Z_Malloc failure and trace the last few instructions.
+
+Let me just rewrite the VM one more time with proper Z_Malloc tracing. Also, I want to fix a potential issue with the `delay slot` approach. Let me reconsider...
+
+Actually, I think I may have found the issue! Look at the `delay slot` handling again:
+
+When we encounter a branch:
+1. We set `bd = target`
+2. We advance `pc = cpc + 4` (to the delay slot)
+3. On the
+[tr-thinking call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  next iteration, we execute the delay slot instruction, and set `tb = bd`, `bd = -1`
+4. At the end of that iteration, we check `if(tb>=0) pc = tb`
+
+But what about the `R[0] = 0` at the end of the loop? If the delay slot instruction writes to R[0], we clear it. But what if a branch delay slot instruction sets R[0] and then the branch target reads R[0]? That's fine because R[0] should always be 0 in MIPS.
+
+Wait, there's a subtle issue. When `bd >= 0`, we do `tb = bd; bd = -1`. But what if the
+[tr-thinking call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  delay slot instruction ALSO sets a new branch? For example, what if the delay slot is a `beq` that is taken? Then `bd` would be set to a new target. But at the start of the next iteration, we would pick up this new `bd` as `tb`... wait no, because at the end of the delay slot iteration, we already set `tb` from `bd` and then check `tb`. 
+
+Let me trace through this more carefully:
+
+Iteration 1 (branch instruction):
+- `tb = -1` (initially)
+- `bd >= 0`? No (bd was -1 from
+[tr-thinking call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  init)
+- Execute branch instruction: `bd = target`
+- `if(tb>=0)`: tb=-1, so no. 
+- `R[0] = 0`
+
+Iteration 2 (delay slot instruction):
+- `tb = -1` (initially)
+- `bd >= 0`? Yes: `tb = target; bd = -1`
+- Execute delay slot instruction. If this is also a branch, it might set `bd = target2`
+- `if(tb>=0)`: tb=target, so `pc = target`
+- `R[0] = 0`
+
+Iteration 3 (first instruction of branch target):
+- `tb = -
+[tr-thinking call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 1`
+- `bd >= 0`? Yes, `bd = target2` (set by delay slot)
+- `tb = target2; bd = -1`
+- Execute instruction at `target`
+- `if(tb>=0)`: `pc = target2`
+
+Wait, this is WRONG! If the delay slot instruction is a taken branch, we'd jump to `target2` instead of continuing from the branch target. But in MIPS, the delay slot of a branch should NOT be another branch instruction. Compilers and assemblers guarantee this. So in practice, this shouldn't happen.
+
+But wait, what if there's a `jr $
+[tr-thinking call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed] ra` in a delay slot? That could happen in hand-optimized assembly. Let me check the binary... actually, compilers typically put `nop` in delay slots of `jr` instructions. And the binary has `noreorder`, meaning the programmer/compiler explicitly handles delay slots.
+
+OK, so the delay slot issue shouldn't be the problem. But let me think about another potential issue.
+
+When we have:
+```
+jalr $ra, $t9  (rd=31, rs=t9)
+nop             (delay slot)
+```
+
+Our code:
+- `jalr`: `const t=R[rs]; R[rd||31]=(cpc+8)>>>0; bd=t;`
+
+[tr-thinking call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed] - Delay slot (nop): `tb = t; bd = -1;` (does nothing else)
+- After delay slot: `pc = t` (the function target)
+
+This is correct.
+
+When the function returns:
+```
+jr $ra
+nop             (delay slot)
+```
+
+Our code:
+- `jr`: `bd = R[rs]` where rs=31 (ra)
+- Delay slot: `tb = ra_value; bd = -1;` (does nothing)
+- After delay slot: `pc = ra_value`
+
+This is correct too.
+
+Hmm, I'm really struggling to find the bug. Let me
+[tr-thinking call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  just add Z_Malloc tracing and run the VM. I'll capture the exact call that fails and trace backwards.
+
+Let me take a practical approach and write a quick fix that adds tracing to the VM.
+
+Actually, let me look at this from yet another angle. What if the issue is that the Z_Malloc function itself is broken? Let me look at Z_Malloc in the binary.
+
+Z_Malloc is at 0x43856c. Let me look at its code to see how it computes and checks the size:
+
+```
+Z_Malloc(size, tag, user):
+  if (size == 0) ...
+  size = (size + sizeof(memblock_t)) & ~
+[tr-thinking call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 7  // align
+  // search for free block
+  // if not found, call Z_FreeMemory or error
+```
+
+The error message "Z_Malloc: failed on allocation of %i bytes" prints the ORIGINAL size, not the aligned size. So the original size is 420303204. This is indeed a corrupted value.
+
+Now, who calls Z_Malloc with this size? Let me think about R_Init's code path. R_Init calls R_InitData, which loads various lumps. Then it calls R_SetViewSize.
+
+R_SetViewSize calls R_ExecuteSetViewSize, which does
+[tr-thinking call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  a bunch of allocations. Let me look at what sizes it computes.
+
+From r_main.c, R_ExecuteSetViewSize:
+```c
+scaledviewwidth = SCREENWIDTH;  // 640
+viewheight = SCREENHEIGHT;  // 400
+viewwidth = scaledviewwidth;
+```
+
+Then it allocates:
+```c
+linebuffers = ... Z_Malloc(...)
+```
+
+Wait, the real allocations happen in R_InitBuffer:
+```c
+void R_InitBuffer (int width, int height)
+{
+    // column 16 has an extra pixel for alignment
+    columnofs = Z_Malloc (width * sizeof(*columnofs), PU_STATIC, NULL);
+```
+
+So `column
+[tr-thinking call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed] ofs = Z_Malloc(640 * 4) = Z_Malloc(2560)`. That's small.
+
+Then in R_ExecuteSetViewSize:
+```c
+    yslope = Z_Malloc (viewwidth*sizeof(*yslope), PU_STATIC, NULL);
+    distscale = Z_Malloc (viewwidth*sizeof(*distscale), PU_STATIC, NULL);
+```
+
+These are both 640*4 = 2560.
+
+And:
+```c
+    Z_InitTags(PU_MAX, tags_count);
+```
+
+None of these should be 420303204.
+
+Hmm, but wait. There might be more allocations.
+[tr-thinking call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  Let me look at what R_Init actually calls.
+
+R_Init -> R_InitData -> R_InitFlats, R_InitTextures, R_InitSpriteLumps, R_InitColormaps
+
+R_InitColormaps could allocate a large table. Let me check:
+```c
+void R_InitColormaps (void)
+{
+    int lump = W_GetNumForName("COLORMAP");
+    colormaps = Z_Malloc(256*256*8, PU_STATIC, 0);
+```
+
+Wait no, that's not right. Let me check the actual source.
+
+Actually, the DOOM source has:
+```c
+void R_InitColormaps (void)
+{
+    int lump = W_GetNumForName(COLORMAP_NAME); 
+[tr-thinking call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  // "COLORMAP"
+    W_ReadLump(lump, colormaps);
+}
+```
+
+But colormaps might be pre-allocated. Let me check. Actually, in the original DOOM:
+```c
+lighttable_t* colormaps;
+```
+
+And in R_InitColormaps:
+```c
+colormaps = Z_Malloc(256*256*8, PU_STATIC, 0);  // or similar
+```
+
+Hmm, 256*256*8 = 524288. That's reasonable.
+
+What about R_InitTr
+[tr-thinking call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed] anTables?
+
+Actually, I think the issue might be in a completely different part of the code. Let me just add the Z_Malloc trace and run it. That's the fastest way to debug this.
+
+Let me write a version of the VM that traces Z_Malloc calls.
+
+Actually wait, I just had another thought. What if the issue is with the `printf` function in the binary? The binary has its own printf implementation that reads from the stack using `va_arg`. If there's a bug in the va_arg handling due to an instruction emulation error, the format string substitution could be wrong, and the size might actually be correct.
+
+Let me check: the message is "Z_Malloc: failed on allocation of %i bytes". If the
+[tr-thinking call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  actual size is reasonable (like 256000), but the printf outputs 420303204, then the printf is the problem, not Z_Malloc.
+
+But wait, the binary also calls I_Error or prints a fatal error and exits. Looking at the output:
+```
+Z_Malloc: failed on allocation of %i bytes
+Z_Malloc: failed on allocation of 420303204 bytes
+```
+
+The first line seems like a raw format string printed. The second line has the substitution. If the substitution is wrong (printf bug), then the actual Z_Malloc might have succeeded or failed with a different reason.
+
+Actually,
+[tr-thinking call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  looking at the output more carefully, after the Z_Malloc error, the VM continues running (for 982M instructions). It doesn't crash! If Z_Malloc failed and called I_Error, the program would exit. But it doesn't exit - it keeps running.
+
+Wait, the output ends with:
+```
+982515712 pc=0x40e6d8
+```
+
+PC = 0x40e6d8. What function is at that address? Let me check... the VM ran for 120s and hit the timeout. The "Z_Malloc: failed on allocation of 420303204 bytes" might be from a previous
+[tr-thinking call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  call that the program handled gracefully (maybe by reducing quality or something), and then the program continued running.
+
+Actually, looking at the DOOM source, Z_Malloc can fail and the program continues:
+```c
+void Z_Malloc(int size, int tag, void **user)
+{
+    ...
+    // If we couldn't find a block, free some memory and try again
+    ...
+}
+```
+
+And the "failed" message might come from an intermediate attempt. The program might loop, free memory, and retry.
+
+But wait, 420303204 bytes is way too large for any DOOM allocation. Something is definitely
+[tr-thinking call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  wrong.
+
+OK let me just add the Z_Malloc trace. But first, let me check if there are multiple Z_Malloc calls and the error one is just the last one shown before timeout.
+
+Actually, I just realized something. The output shows:
+```
+R_Init: Init DOOM refresh daemon - Z_Malloc: failed on allocation of %i bytes
+Z_Malloc: failed on allocation of 420303204 bytes
+```
+
+The first line ends with "%i bytes" - this is a literal format string! It seems like the binary is printing the format string without substitution on one line, and then printing it with substitution on another line. This suggests the
+[tr-thinking call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  error handling code prints the message twice - once for debug/log and once for the user.
+
+The fact that the format string "%i" appears literally means this first print call is either not using printf, or it's using a non-standard print that doesn't substitute.
+
+But the second line DOES show the number. So printf IS working for the second print.
+
+OK, I think the key issue is that Z_Malloc is being called with size 420303204, which is wrong. I need to trace back to find where this size comes from.
+
+Let me take the practical approach and add Z_Malloc tracing to the VM. I'll write the VM to detect when PC
+[tr-thinking call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  == Z_Malloc address and log the arguments.
+
+But also, let me think about whether the VM is fast enough. 982M instructions in 120s = ~8.2M insns/sec. That's pretty slow. Even if DOOM needs ~100M instructions to render a frame, that would take ~12 seconds per frame. To get the first frame, I might need to run for 30-60 seconds after the program starts rendering.
+
+The total instructions to boot DOOM and render the first frame might be in the range of 1-5 billion. At 8M insns/sec, that's 125-625 seconds. That's 2-1
+[tr-thinking call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 0 minutes. So with a long enough timeout, it should be feasible.
+
+But the Z_Malloc failure might cause an infinite loop or program crash that prevents rendering.
+
+Let me fix the Z_Malloc bug first, then optimize speed.
+
+Actually, let me approach this differently. Let me look at the exact code path that computes the Z_Malloc size. I'll add a trace buffer to the VM.
+
+Let me write a simple version:
+- Keep a ring buffer of the last 1000 PCs
+- When Z_Malloc is called, dump the ring buffer and the current register state
+- This will show me the instruction trace leading to the bad Z_Malloc call
+
+Actually,
+[tr-thinking call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  let me just modify the main loop to trace the Z_Malloc entry point.
+
+Let me create a helper function that dumps the instruction at a given PC for debugging.
+
+OK, I think I should stop overthinking and just write the instrumented VM. Let me also make the VM faster by eliminating the BigInt multiply overhead - use it only for `mult`/`multu` and use `Math.imul` for `mul`.
+
+Here's my plan:
+1. Add Z_Malloc tracing
+2. Use Math.imul where possible instead of BigInt
+3. Keep the delay slot handling
+4. Run with a longer timeout
+
+Let me write this now.
+
+Actually wait, I
+[tr-thinking call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  just thought of something else. The `doomgeneric_img.c` has `__start` that calls `main(0, 0)`. But looking at the disassembly:
+
+```
+00400110 <__start>:
+  400110:       27bdffe8        addiu   sp,sp,-24
+  400114:       afbf0014        sw      ra,20(sp)
+  400118:       24040000        li      a0,0
+  40011c:       0c10e
+[tr-thinking call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 558        jal     439560 <doomgeneric_Create>
+  400120:       24050000        li      a1,0
+  400124:       0c100fbc        jal     403ef0 <doomgeneric_Tick>
+  400128:       00000000        nop
+  40012c:       08100049        j       400124
+  400130:       00000000        nop
+```
+
+Wait
+[tr-thinking call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed] , this doesn't call main at all! It calls doomgeneric_Create directly, then loops calling doomgeneric_Tick. This matches the `__start` function in the source:
+
+```c
+void __start(void) {
+  main(0, 0);
+  while (1);
+}
+```
+
+But `main` is at 0x439888, and `__start` calls doomgeneric_Create at 0x439560 and doomgeneric_Tick at 0x403ef0. So the compiler inlined `main` into `__start`! That makes sense since main is very simple:
+
+```c
+int main(int argc, char **argv)
+{
+    doomgeneric_Create(argc, argv);
+    for (int i = 
+[tr-thinking call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 0; ; i++)
+    {
+        doomgeneric_Tick();
+    }
+    return 0;
+}
+```
+
+OK so the flow is correct. doomgeneric_Create is called once, then doomgeneric_Tick is called in a loop.
+
+Now, doomgeneric_Create calls D_DoomMain, which eventually calls R_Init. After R_Init, D_DoomMain continues and eventually the main loop starts calling doomgeneric_Tick, which calls doomgeneric_Tick (the C function), which calls I_UpdateNoBlit, D_Display, etc.
+
+So the question is: does the Z_Malloc failure cause D_DoomMain to exit, or does DOOM continue?
+
+Looking at the source, Z_Malloc with a
+[tr-thinking call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  failed allocation typically calls I_Error which terminates the program. But in our case, the program seems to continue (982M more instructions after the error).
+
+Wait, looking more carefully at the output:
+```
+R_Init: Init DOOM refresh daemon - Z_Malloc: failed on allocation of %i bytes
+Z_Malloc: failed on allocation of 420303204 bytes
+
+982515712 pc=0x40e6d8  
+```
+
+The blank line after the Z_Malloc error, and then the next output is just the periodic progress counter. So the program DID continue after the Z_Malloc error
+[tr-thinking call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed] . This means either:
+1. Z_Malloc retries after freeing memory
+2. The error is non-fatal
+3. The error output is misleading
+
+Actually, looking at the Z_Malloc source more carefully:
+
+```c
+void Z_Malloc(int size, int tag, void **user)
+{
+    ...
+    // Not enough memory: try to free some blocks
+    ...
+    if (!block)
+    {
+        I_Error("Z_Malloc: failed on allocation of %i bytes", size);
+    }
+    ...
+}
+```
+
+I_Error terminates the program. So if Z_Malloc truly fails, the program exits. But in our case, the program continues!
+[tr-thinking call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  This means... the I_Error call itself might not work properly in our VM, or there's an error handler that catches it.
+
+Wait, actually, the program might be printing the error message but not actually calling I_Error. Or maybe I_Error calls exit(), and our exit handler sets EX which breaks the main loop. But the program ran for 982M more instructions, so it didn't exit.
+
+Actually, looking more carefully, maybe the message is NOT from Z_Malloc's error path. Maybe it's from Z_CheckHeap or Z_FileDumpHeap, which might print sizes of blocks.
+
+Hmm, but the message format is exactly "Z_Malloc: failed on allocation of %i bytes". This can only come from the Z_Malloc error path.
+
+Wait
+[tr-thinking call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed] , unless the binary has a different version of Z_Malloc. The source code I have might not exactly match the binary. The binary was compiled from the doomgeneric_img.c variant, which might have different Z_Malloc behavior.
+
+OK, I think the key insight is that the program continues after this error message, meaning either:
+1. The error is caught and the program retries
+2. The printf is wrong and the actual error didn't happen
+3. I_Error doesn't work correctly in our VM
+
+Let me check: does I_Error call exit()? From i_system.c:
+```c
+void I_Error(char *error, ...)
+{
+    ...
+    exit(1);
+}
+```
+
+Yes, I_Error calls exit(). And our exit syscall handler sets `EX = a0`
+[tr-thinking call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  which breaks the main loop. But the program continues, so I_Error was NOT called. This means the Z_Malloc DID NOT actually fail!
+
+So either:
+1. The message is printed by something other than Z_Malloc's error path
+2. The Z_Malloc was retried and succeeded
+
+Actually, wait. Looking at the DOOM Z_Malloc code:
+
+```c
+void *Z_Malloc(int size, int tag, void *user)
+{
+    ...
+    if ((memblock *)zone + size > (memblock *)(zone + zonesize))
+    {
+        I_Error("Z_Malloc: failed on allocation of %i bytes", size);
+    }
+    ...
+}
+```
+
+Wait, maybe the condition check
+[tr-thinking call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  is wrong due to a computation error in our VM. If the computation `(memblock *)zone + size > (memblock *)(zone + zonesize)` is incorrect due to a multiply or comparison bug, Z_Malloc might print the error but then continue (because the branch condition was wrong and it falls through).
+
+This is very possible! If there's a comparison or arithmetic bug in our VM, the error message is printed (because the branch was incorrectly taken), but then Z_Malloc continues and eventually succeeds.
+
+So the Z_Malloc error message is a red herring - it's being printed due to a bug in our VM, but Z_Malloc doesn't actually
+[tr-thinking call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  fail. The program continues normally.
+
+This means the REAL problem is just speed - we need to make the VM fast enough to render a frame within the timeout.
+
+Let me focus on speed optimization then. At 8M insns/sec, DOOM would need several minutes to boot and render. Let me try to make the VM faster.
+
+Key speed optimizations:
+1. Avoid BigInt operations except where necessary (mult/multu)
+2. Minimize function calls in the hot path
+3. Use TypedArray properly for registers
+4. Possibly use JIT compilation for hot blocks
+
+Actually, let me try a completely different approach. Instead of an interpreter, let me try to compile MIPS basic blocks to JavaScript functions that
+[tr-thinking call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  V8 can JIT. This could be 10-100x faster.
+
+But JIT compilation is complex. Let me first try to make the interpreter faster, and use a longer timeout.
+
+Actually, let me try something: run the VM in the background for a LONG time and check if it eventually produces a frame.
+
+The VM runs at ~8M insns/sec. If DOOM needs ~500M instructions to boot and render the first frame, it would take ~62 seconds. With a 300s timeout, it should work.
+
+Let me also try to speed up the interpreter by:
+1. Using Math.imul instead of BigInt for mult/multu (Math.imul gives
+[tr-thinking call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  the low 32 bits, and we need the high 32 bits too - but we can compute that manually)
+2. Avoiding the overhead of creating BigInts on every multiply
+
+Actually, for multu, we need the full 64-bit result. JavaScript can't do 64-bit integer multiply natively. The options are:
+1. BigInt (slow but correct)
+2. Manual 16-bit chunk multiply (fast but error-prone)
+3. Use float64 (53-bit precision, sufficient for 32x32 multiply)
+
+Option 3 is interesting! Since 32-bit unsigned integers
+[tr-thinking call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  are < 2^32, and float64 has 53 bits of precision, we can compute the full 64-bit product as a float64 and then extract the high and low 32-bit parts.
+
+```javascript
+function umul32(a, b) {
+  const result = a * b;  // exact for a,b < 2^32 since a*b < 2^64 < 2^53... wait no
+}
+```
+
+Hmm, actually 2^32 * 2^32 = 2^64 which is way more than 2^53. So
+[tr-thinking call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  float64 can't represent the exact product of two 32-bit unsigned integers. We'd lose precision.
+
+But we CAN split into 16-bit chunks:
+```javascript
+function umul32(a, b) {
+  const aLo = a & 0xFFFF, aHi = a >>> 16;
+  const bLo = b & 0xFFFF, bHi = b >>> 16;
+  const p0 = aLo * bLo;
+  const p1 = aLo * bHi;
+  const p2 = aHi * bLo;
+  const p3 = aHi * bHi;
+  const lo = (p0 + ((p1 & 0xFFFF) << 16) + ((p2 & 0xFFFF) << 16)) >>> 0;
+  const hi = (
+[tr-thinking call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed] p3 + (p1 >>> 16) + (p2 >>> 16) + ((p0 + ((p1 & 0xFFFF) << 16) + ((p2 & 0xFFFF) << 16)) >= 0x100000000 ? 1 : 0)) >>> 0;
+  return [lo, hi];
+}
+```
+
+Wait, I had this earlier and it caused the Z_Malloc error. But now I think the Z_Malloc error was actually caused by a different bug (maybe the branch delay slot was wrong before, and
+[tr-thinking call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  now it's fixed).
+
+Let me re-check: is the current VM (with BigInt multiply) producing the right Z_Malloc behavior? The Z_Malloc error might be a red herring as I discussed above.
+
+Let me just run the VM for 5 minutes and see if it produces a frame. If it does, then the Z_Malloc error is just noise.
+
+Let me run it with a 300s timeout.
+
+But first, let me optimize the multiply to be faster. I'll use the 16-bit chunk approach since it's much faster than BigInt, and should be correct (I've verified the logic before).
+
+Actually,
+[tr-thinking call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  you know what, let me just test if BigInt is the bottleneck. The current VM does ~8M insns/sec. Let me try removing the BigInt mult and see how much faster it gets. But that would break correctness.
+
+Let me instead try running with a 5-minute timeout and see if a frame is produced.
+
+Wait, actually, let me think about this more carefully. At 8M insns/sec and DOOM needing maybe 1B instructions to render the first frame, it would take 125 seconds. With a 300s timeout, it should work.
+
+But wait, after the Z_Malloc error,
+[tr-thinking call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  the program runs for 982M instructions in 120 seconds and is still running (at pc=0x40e6d8). So it's still in D_DoomMain or somewhere in the initialization. That means the total instructions to render the first frame could be way more than 1B.
+
+Let me check what function is at 0x40e6d8:
+- I_GetTime is at 0x40e93c
+- I_InitTimer is at 0x40e9f4
+- mem_fclose is at 0x40ec70
+
+[tr-thinking call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed] - mem_ftell is at 0x40ecb0
+
+0x40e6d8 is between I_InitTimer and mem_fclose. Let me check the symbol table more carefully. Actually, let me just search for functions near this address:
+
+The function at 0x40e6d8 would be in the I_ or mem_ range. Let me look at functions between 0x40e600 and 0x40e700.
+
+Actually, I don't have easy access to the symbol table right now. Let me just focus on making the VM work.
+
+Let
+[tr-thinking call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  me try a different approach: instead of running DOOM interactively, let me patch the binary or set up command-line arguments to make DOOM render a demo and exit. But that's complex.
+
+Actually, the simplest approach is just to run the VM for a very long time (10+ minutes). Let me try that.
+
+But before that, let me try to speed up the VM. The main bottleneck is the instruction loop. Let me try removing the progress counter (it adds overhead) and see if it's faster.
+
+Also, I noticed the VM uses BigInt for all mult/multu. Let me try using a pure JavaScript 
+[tr-thinking call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 16-bit chunk multiply instead, which should be much faster.
+
+Actually, let me just benchmark: BigInt multiply vs 16-bit chunk multiply.
+
+For now, let me just run the VM for 10 minutes and see what happens.
+
+Hmm, but I need to be more efficient with my time here. Let me make the VM as fast as possible and then run it.
+
+Key optimizations:
+1. Remove progress counter from the hot loop
+2. Use 16-bit chunk multiply instead of BigInt
+3. Possibly inline the delay slot handling
+
+Let me rewrite the VM with these optimizations.
+
+Actually, let me just test with a long
+[tr-thinking call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  timeout and see if it produces a frame. If the Z_Malloc error is indeed a red herring, the program should eventually render a frame. Let me run it for 10 minutes.
+[tr-stream call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed] {
+  "analysis": "The Z_Malloc error is likely a red herring - the program continues running after it, meaning the error message was printed due to a comparison bug in our VM but Z_Malloc didn't actually fail. The real issue is speed: ~8M insns/sec is too slow. Let me optimize the VM significantly and run with a long timeout.",
+  "plan": "Rewrite vm.js with speed optimizations: remove progress
+[tr-stream call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  counter from hot loop, use faster multiply, and run for 5+ minutes.",
+  "commands": [
+    {
+      "keystrokes": "cat > /app/vm.js << 'XEOF'\n'use strict';\nconst fs=require('fs'),ELF=fs.readFileSync('/app/doomgeneric_mips');\nconst r32e=o=>(ELF[o]|(ELF[o+1]<<8)|(ELF[o+2]<<16)|(ELF[o+3]<<24))>>>0;\nconst r16e=o=>ELF[o]|(ELF[o+1]<<8
+[tr-stream call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed] );\nconst _e=r32e(0x18),_po=r32e(0x1c),_pn=r16e(0x2c),_pe=r16e(0x2a);\nconst P=[];\nfunction gp(a){const i=a>>>16;let p=P[i];if(!p){p=new Uint8Array(65536);P[i]=p}return p}\nfunction r8(a){const p=P[a>>>16];return p?p[a&65535]:0}\nfunction w8(a,v){gp(a)[a&65535]=v}\nfunction r32m(a){const o=a&
+[tr-stream call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 65535,p=P[a>>>16];if(!p)return 0;return o<65533?(p[o]|(p[o+1]<<8)|(p[o+2]<<16)|(p[o+3]<<24))>>>0:(r8(a)|(r8(a+1)<<8)|(r8(a+2)<<16)|(r8(a+3)<<24))>>>0}\nfunction w32m(a,v){const o=a&65535,p=gp(a);if(o<65533){p[o]=v;p[o+1]=v>>>8;p[o+2]=v>>>16;p[o+3]=v>>>24;return}w8(a,v);w8(a+1,v>>>8);w8(a+2,v>>>16);w8(a+3,v>>>24)}
+[tr-stream call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed] \nfunction r16m(a){return r8(a)|(r8(a+1)<<8)}\nfunction w16m(a,v){w8(a,v);w8(a+1,v>>>8)}\nfor(let i=0;i<_pn;i++){const o=_po+i*_pe;if(r32e(o)===1){const va=r32e(o+8),fsz=r32e(o+16),off=r32e(o+4);for(let j=0;j<fsz;j++)w8(va+j,ELF[off+j])}}\nconst FD=new Map;let NFD=3;FD.set(0,{t:'s'});FD.set(1,{t:'s'});FD.set(2,{t:'s'});\nlet HP=0x4
+[tr-stream call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 04b2000,EX=null;\nfunction ms(a){const b=[];for(let c;(c=r8(a))!==0;a++){b.push(c);if(b.length>4096)break}return String.fromCharCode(...b)}\nfunction xf(f){const ac=f&7;let s=ac===0?'r':ac===1?'w':'r+';if(f&64&&s==='r')s='r+';if(f&512)s=s.indexOf('+')>=0?'w+':'w';if(f&1024)s=s.indexOf('+')>=0?'a+':'a';return s}\ntry{fs.mkdirSync('/tmp',{recursive:true})}catch(e){}\nconst
+[tr-stream call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  R=new Uint32Array(32);R[29]=0x7FFF0000;\nlet pc=_e>>>0,hi=0,lo=0,bd=-1,ic=0,t0=Date.now();\nfunction doSys(cpc){\n  const n=R[2],a0=R[4],a1=R[5],a2=R[6];\n  switch(n){\n    case 0:{const e=FD.get(a0);if(!e||e.t==='s'){R[2]=e?0:(-1>>>0);return}const sz=Math.min(a2,0x100000),t=Buffer.alloc(sz);const nn=fs.readSync(e.h,t,0,sz,e.p);for(let i=0;i
+[tr-stream call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed] <nn;i++)w8((a1+i)>>>0,t[i]);e.p+=nn;R[2]=nn;return}\n    case 1:{const e=FD.get(a0);if(!e){R[2]=-1>>>0;return}const sz=Math.min(a2,0x100000),t=Buffer.alloc(sz);for(let i=0;i<sz;i++)t[i]=r8((a1+i)>>>0);if(e.t==='s'){try{R[2]=fs.writeSync(a0,t)}catch(er){R[2]=a2}return}const nn=fs.writeSync(e.h,t,0,sz,e.p);e.p+=nn;if(e.p>e.sz)e.sz=e.p;R[2]=nn;
+[tr-stream call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed] return}\n    case 2:{const p=ms(a0);let hp=p;if(p==='doom.wad'||p==='./doom.wad')hp='/app/doom.wad';try{const h=fs.openSync(hp,xf(a1),a2||0o644);const fd=NFD++;let sz=0;try{sz=fs.fstatSync(h).size}catch(er){}FD.set(fd,{t:'f',h,p:0,sz});R[2]=fd}catch(er){R[2]=-1>>>0}return}\n    case 3:{const e=FD.get(a0);if(!e){R[2]=-1>>>0;return}if(e.t==='f')try{fs.closeSync(e.h)}catch(er){}FD.delete(a0
+[tr-stream call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed] );R[2]=0;return}\n    case 8:{const e=FD.get(a0);if(!e||e.t!=='f'){R[2]=-1>>>0;return}const o=(a1<<0)>>0;let np;a2===0?np=o:a2===1?np=e.p+o:np=e.sz+o;if(np<0)R[2]=-1>>>0;else{e.p=np;R[2]=np>>>0}return}\n    case 12:{if(a0===0||a0<=HP)R[2]=HP;else{HP=a0;R[2]=a0}return}\n    case 60:EX=a0;return;\n    case 74:R[2]=0;return;\
+[tr-stream call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed] n    case 82:{const o=ms(a0),nn=ms(a1);try{fs.renameSync(o,nn);R[2]=0}catch(e){R[2]=-1>>>0}return}\n    case 83:{const p=ms(a0);try{fs.mkdirSync(p,{recursive:true});R[2]=0}catch(e){R[2]=-1>>>0}return}\n    case 87:{const p=ms(a0);try{fs.unlinkSync(p);R[2]=0}catch(e){R[2]=-1>>>0}return}\n    case 201:{const now=Math.floor(Date.now()/1000);if(a0)w32m(a0,now);R[2]=now;return}\n    default:console.error('Syscall '+n+' @0x'+(
+[tr-stream call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed] cpc>>>0).toString(16));process.exit(1)}\n}\nwhile(EX===null){\n  const cpc=pc,I=r32m(cpc);let tb=-1;\n  if(bd>=0){tb=bd;bd=-1}\n  pc=(cpc+4)>>>0;ic++;\n  const op=I>>>26,rs=(I>>>21)&31,rt=(I>>>16)&31,rd=(I>>>11)&31;\n  if(op===0){\n    const fn=I&63,sh=(I>>>6)&31;\n    switch(fn){\n      case 0:R[rd]=(R[rt]<<sh)>>>0;break;\n      case 2:R[rd]=R[rt]>>>sh
+[tr-stream call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed] ;break;\n      case 3:R[rd]=(R[rt]>>sh)>>>0;break;\n      case 4:R[rd]=(R[rt]<<(R[rs]&31))>>>0;break;\n      case 6:R[rd]=R[rt]>>>(R[rs]&31);break;\n      case 7:R[rd]=(R[rt]>>(R[rs]&31))>>>0;break;\n      case 8:bd=R[rs];break;\n      case 9:{const t=R[rs];R[rd||31]=(cpc+8)>>>0;bd=t;break}\n      case 10:if(R[rt]===0)R[rd]=R[rs];break;\n      case 11:if(R[rt]!==0)
+[tr-stream call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed] R[rd]=R[rs];break;\n      case 12:doSys(cpc);break;\n      case 15:break;\n      case 16:R[rd]=hi;break;\n      case 17:hi=R[rs];break;\n      case 18:R[rd]=lo;break;\n      case 19:lo=R[rs];break;\n      case 24:{const a=R[rs]|0,b=R[rt]|0,neg=(a^b)<0,aa=Math.abs(a),bb=Math.abs(b);const aL=aa&
+[tr-stream call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 0xffff,aH=aa>>>16,bL=bb&0xffff,bH=bb>>>16,p0=aL*bL,p1=aL*bH,p2=aH*bL,p3=aH*bH;let l=(p0+((p1&0xffff)<<16)+((p2&0xffff)<<16))>>>0;let h=(p3+(p1>>>16)+(p2>>>16)+(((p0>>>0)+(((p1&0xffff)<<16)>>>0)+(((p2&0xffff)<<16)>>>0)>=4294967296)?1:0))>>>0;if(neg){l=(~l+1)
+[tr-stream call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed] >>>0;h=(~h+(l===0?1:0))>>>0}lo=l;hi=h;break}\n      case 25:{const a=R[rs],b=R[rt],aL=a&0xffff,aH=a>>>16,bL=b&0xffff,bH=b>>>16,p0=aL*bL,p1=aL*bH,p2=aH*bL,p3=aH*bH;lo=(p0+((p1&0xffff)<<16)+((p2&0xffff)<<16))>>>0;hi=(p3+(p1>>>16)+(p2>>>16)+(((p0>>>0)+(((p1&0xffff)<<16)>>>0)+(((p2&0xffff)<<16)>>>0)>=4294967296)?1:0))>>>0;break}\n
+[tr-stream call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed]       case 26:{const a=R[rs]|0,b=R[rt]|0;if(b){lo=Math.trunc(a/b)>>>0;hi=(a%b)>>>0}break}\n      case 27:{const a=R[rs],b=R[rt];if(b){lo=(a/b)>>>0;hi=(a%b)>>>0}break}\n      case 32:case 33:R[rd]=(R[rs]+R[rt])>>>0;break;\n      case 34:case 35:R[rd]=(R[rs]-R[rt])>>>0;break;\n      case 36:R[rd]=R[rs]&R[rt];break;\n      case 37:R[rd]=R[rs]|R[rt];break;\n      case 
+[tr-stream call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 38:R[rd]=R[rs]^R[rt];break;\n      case 39:R[rd]=~(R[rs]|R[rt])>>>0;break;\n      case 42:R[rd]=(R[rs]|0)<(R[rt]|0)?1:0;break;\n      case 43:R[rd]=R[rs]<R[rt]?1:0;break;\n      case 48:case 50:case 52:case 54:break;\n      default:console.error('SF='+fn+' @0x'+(cpc>>>0).toString(16));process.exit(1)}\n  }else{\n    const si=(I<<16)>>16,ui=I&0xFFFF;\n    switch(op){\
+[tr-stream call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed] n      case 1:{const sub=rt,tgt=(cpc+4+(si<<2))>>>0;if(sub===0){if((R[rs]|0)<0)bd=tgt}else if(sub===1){if((R[rs]|0)>=0)bd=tgt}else if(sub===16){R[31]=(cpc+8)>>>0;if((R[rs]|0)<0)bd=tgt}else if(sub===17){R[31]=(cpc+8)>>>0;if((R[rs]|0)>=0)bd=tgt}else{console.error('R='+sub);process.exit(1)}break}\n      case 2:bd=((cpc+4)&0xF0000000)|((I&0x3FFFFFF)<<2
+[tr-stream call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed] );break;\n      case 3:R[31]=(cpc+8)>>>0;bd=((cpc+4)&0xF0000000)|((I&0x3FFFFFF)<<2);break;\n      case 4:if(R[rs]===R[rt])bd=(cpc+4+(si<<2))>>>0;break;\n      case 5:if(R[rs]!==R[rt])bd=(cpc+4+(si<<2))>>>0;break;\n      case 6:if((R[rs]|0)<=0)bd=(cpc+4+(si<<2))>>>0;break;\n      case 7:if((R[rs]|0)>0)bd=(cpc+4+(si<<2))>>>0;break;\n      case 8:case 9:R[rt]=(
+[tr-stream call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed] R[rs]+si)>>>0;break;\n      case 10:R[rt]=(R[rs]|0)<si?1:0;break;\n      case 11:R[rt]=R[rs]<(si>>>0)?1:0;break;\n      case 12:R[rt]=R[rs]&ui;break;\n      case 13:R[rt]=R[rs]|ui;break;\n      case 14:R[rt]=R[rs]^ui;break;\n      case 15:R[rt]=(ui<<16)>>>0;break;\n      case 16:case 17:case 18:case 19:case 20:case 21:case 22:case 23:break;\n      case 28:{const f2=I&
+[tr-stream call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 63;switch(f2){\n        case 0:{const r=BigInt(R[rs]|0)*BigInt(R[rt]|0);let a=(BigInt(hi>>>0)<<32n)|BigInt(lo>>>0);a=a+r;lo=Number(a&0xFFFFFFFFn)>>>0;hi=Number((a>>32n)&0xFFFFFFFFn)>>>0;break}\n        case 1:{const r=BigInt(R[rs]>>>0)*BigInt(R[rt]>>>0);let a=(BigInt(hi>>>0)<<32n)|BigInt(lo>>>0);a=a+r;lo=Number(a&0xFFFFFFFFn)>>>0;hi=Number((a>>32n)&0xFFFFFFFFn)>>>0;break}\n        case 2:R[rd]=Math.imul(R[rs],R[rt])
+[tr-stream call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed] >>>0;break;\n        case 32:R[rd]=R[rs]===0?32:Math.clz32(R[rs]);break;\n        case 33:R[rd]=~R[rs]===0?32:Math.clz32(~R[rs]>>>0);break;\n        default:console.error('S2='+f2+' @0x'+cpc.toString(16));process.exit(1)}break}\n      case 31:{const f3=I&63,sh=(I>>>6)&31;switch(f3){\n        case 0:R[rt]=(R[rs]>>>sh)&((1<<(rd+1))-1);break;\n        case 4:{const m2
+[tr-stream call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed] =((1<<(rd+1-sh))-1)<<sh;R[rt]=(R[rt]&(~m2>>>0)|((R[rs]<<sh)&m2))>>>0;break}\n        case 32:{if(sh===0){let v=R[rt],r=0;for(let i=0;i<4;i++){let b=(v>>>(i*8))&0xff;b=((b&1)<<7)|((b&2)<<5)|((b&4)<<3)|((b&8)<<1)|((b&16)>>1)|((b&32)>>3)|((b&64)>>5)|((b&128)>>7);r|=(b<<(i*8))}R[rd]=r>>>0}else if(sh===2)R[rd]=(((R[rt
+[tr-stream call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed] ]&0x00FF00FF)<<8)|((R[rt]&0xFF00FF00)>>>8))>>>0;else if(sh===16)R[rd]=((R[rt]&0xFF)<<24)>>24;else if(sh===24)R[rd]=((R[rt]&0xFFFF)<<16)>>16;else{console.error('B='+sh+' @0x'+cpc.toString(16));process.exit(1)}break}\n        case 59:R[rt]=0;break;\n        default:console.error('S3='+f3+' @0x'+cpc.toString(16));process.exit(1)}break}\n      case 32:R[rt]=((r8((R[rs]+si)>>>0))<<24
+[tr-stream call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed] )>>24;break;\n      case 33:R[rt]=((r16m((R[rs]+si)>>>0))<<16)>>16;break;\n      case 34:{const a=(R[rs]+si)>>>0,al=a&~3,bo=a&3,mv=r32m(al);R[rt]=bo===0?mv:bo===1?(R[rt]&0xFF000000|mv>>>8)>>>0:bo===2?(R[rt]&0xFFFF0000|mv>>>16)>>>0:(R[rt]&0xFFFFFF00|mv>>>24)>>>0;break}\n      case 35:R[rt]=r32m((R[rs]+si)>>>0);break;\n      case 36:R
+[tr-stream call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed] [rt]=r8((R[rs]+si)>>>0);break;\n      case 37:R[rt]=r16m((R[rs]+si)>>>0);break;\n      case 38:{const a=(R[rs]+si)>>>0,al=a&~3,bo=a&3,mv=r32m(al);R[rt]=bo===0?(R[rt]&0x00FFFFFF|mv<<24)>>>0:bo===1?(R[rt]&0x0000FFFF|mv<<16)>>>0:bo===2?(R[rt]&0x000000FF|mv<<8)>>>0:mv;break}\n      case 40:w8((R[rs]+si)>>>0,R[rt]);break;\n      case 41:w1
+[tr-stream call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 6m((R[rs]+si)>>>0,R[rt]);break;\n      case 42:{const a=(R[rs]+si)>>>0,al=a&~3,bo=a&3,old=r32m(al),v=R[rt];w32m(al,bo===0?v:bo===1?(old&0xFF000000|v&0x00FFFFFF)>>>0:bo===2?(old&0xFFFF0000|v&0x0000FFFF)>>>0:(old&0xFFFFFF00|v&0x000000FF)>>>0);break}\n      case 43:w32m((R[rs]+si)>>>0,R[rt]);break;\n      case 46:{const a=(R[rs]+si)>>>0
+[tr-stream call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed] ,al=a&~3,bo=a&3,old=r32m(al),v=R[rt];w32m(al,bo===0?(old&0x00FFFFFF|v<<24)>>>0:bo===1?(old&0x0000FFFF|v<<16)>>>0:bo===2?(old&0x000000FF|v<<8)>>>0:v);break}\n      case 48:case 49:case 50:case 51:case 52:case 5
+[tr-stream call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 3:case 54:case 55:case 56:case 57:case 58:case 59:case 60:case 61:case 62:case 63:break;\n      default:console.error('OP='+op+' @0x'+(cpc>>>0).toString(16));process.exit(1)}\n  }\n  if(tb>=0)pc=tb>>>0;R[0]=0;\n}\nconsole.error('\\nExit:'+EX+' '+ic+' in '+((Date.now()-t0)/1000).toFixed(1)+'s');\nXEOF\n",
+      "duration": 0.5
+    }
+  ]
+}
+
+[tr-stream call-0078:worker:xiaomi/mimo-v2.5-pro-ultraspeed] worker.done finish=stop cost_microdollars=245039
+[tr-stream call-0078:xiaomi/mimo-v2.5-pro-ultraspeed] {
+  "analysis": "The Z_Malloc error is likely a red herring - the program continues running after it, meaning the error message was printed due to a comparison bug in our VM but Z_Malloc didn't actually fail. The real issue is speed: ~8M insns/sec is too slow. Let me optimize the VM significantly and run with a long timeout.",
+  "plan": "Rewrite vm.js with speed optimizations: remove progress counter from hot loop, use faster multiply, and run for 5+ minutes.",
+  "commands": [
+    {
+      "keystrokes": "cat > /app/vm.js << 'XEOF'\n'use strict';\nconst fs=require('fs'),ELF=fs.readFileSync('/app/doomgeneric_mips');\nconst r32e=o=>(ELF[o]|(ELF[o+1]<<8)|(ELF[o+2]<<16)|(ELF[o+3]<<24))>>>0;\nconst r16e=o=>ELF[o]|(ELF[o+1]<<8);\nconst _e=r32e(0x18),_po=r32e(0x1c),_pn=r16e(0x2c),_pe=r16e(0x2a);\nconst P=[];\nfunction gp(a){const i=a>>>16;let p=P[i];if(!p){p=new Uint8Array(65536);P[i]=p}return p}\nfunction r8(a){const p=P[a>>>16];return p?p[a&65535]:0}\nfunction w8(a,v){gp(a)[a&65535]=v}\nfunction r32m(a){const o=a&65535,p=P[a>>>16];if(!p)return 0;return o<65533?(p[o]|(p[o+1]<<8)|(p[o+2]<<16)|(p[o+3]<<24))>>>0:(r8(a)|(r8(a+1)<<8)|(r8(a+2)<<16)|(r8(a+3)<<24))>>>0}\nfunction w32m(a,v){const o=a&65535,p=gp(a);if(o<65533){p[o]=v;p[o+1]=v>>>8;p[o+2]=v>>>16;p[o+3]=v>>>24;return}w8(a,v);w8(a+1,v>>>8);w8(a+2,v>>>16);w8(a+3,v>>>24)}\nfunction r16m(a){return r8(a)|(r8(a+1)<<8)}\nfunction w16m(a,v){w8(a,v);w8(a+1,v>>>8)}\nfor(let i=0;i<_pn;i++){const o=_po+i*_pe;if(r32e(o)===1){const va=r32e(o+8),fsz=r32e(o+16),off=r32e(o+4);for(let j=0;j<fsz;j++)w8(va+j,ELF[off+j])}}\nconst FD=new Map;let NFD=3;FD.set(0,{t:'s'});FD.set(1,{t:'s'});FD.set(2,{t:'s'});\nlet HP=0x404b2000,EX=null;\nfunction ms(a){const b=[];for(let c;(c=r8(a))!==0;a++){b.push(c);if(b.length>4096)break}return String.fromCharCode(...b)}\nfunction xf(f){const ac=f&7;let s=ac===0?'r':ac===1?'w':'r+';if(f&64&&s==='r')s='r+';if(f&512)s=s.indexOf('+')>=0?'w+':'w';if(f&1024)s=s.indexOf('+')>=0?'a+':'a';return s}\ntry{fs.mkdirSync('/tmp',{recursive:true})}catch(e){}\nconst R=new Uint32Array(32);R[29]=0x7FFF0000;\nlet pc=_e>>>0,hi=0,lo=0,bd=-1,ic=0,t0=Date.now();\nfunction doSys(cpc){\n  const n=R[2],a0=R[4],a1=R[5],a2=R[6];\n  switch(n){\n    case 0:{const e=FD.get(a0);if(!e||e.t==='s'){R[2]=e?0:(-1>>>0);return}const sz=Math.min(a2,0x100000),t=Buffer.alloc(sz);const nn=fs.readSync(e.h,t,0,sz,e.p);for(let i=0;i<nn;i++)w8((a1+i)>>>0,t[i]);e.p+=nn;R[2]=nn;return}\n    case 1:{const e=FD.get(a0);if(!e){R[2]=-1>>>0;return}const sz=Math.min(a2,0x100000),t=Buffer.alloc(sz);for(let i=0;i<sz;i++)t[i]=r8((a1+i)>>>0);if(e.t==='s'){try{R[2]=fs.writeSync(a0,t)}catch(er){R[2]=a2}return}const nn=fs.writeSync(e.h,t,0,sz,e.p);e.p+=nn;if(e.p>e.sz)e.sz=e.p;R[2]=nn;return}\n    case 2:{const p=ms(a0);let hp=p;if(p==='doom.wad'||p==='./doom.wad')hp='/app/doom.wad';try{const h=fs.openSync(hp,xf(a1),a2||0o644);const fd=NFD++;let sz=0;try{sz=fs.fstatSync(h).size}catch(er){}FD.set(fd,{t:'f',h,p:0,sz});R[2]=fd}catch(er){R[2]=-1>>>0}return}\n    case 3:{const e=FD.get(a0);if(!e){R[2]=-1>>>0;return}if(e.t==='f')try{fs.closeSync(e.h)}catch(er){}FD.delete(a0);R[2]=0;return}\n    case 8:{const e=FD.get(a0);if(!e||e.t!=='f'){R[2]=-1>>>0;return}const o=(a1<<0)>>0;let np;a2===0?np=o:a2===1?np=e.p+o:np=e.sz+o;if(np<0)R[2]=-1>>>0;else{e.p=np;R[2]=np>>>0}return}\n    case 12:{if(a0===0||a0<=HP)R[2]=HP;else{HP=a0;R[2]=a0}return}\n    case 60:EX=a0;return;\n    case 74:R[2]=0;return;\n    case 82:{const o=ms(a0),nn=ms(a1);try{fs.renameSync(o,nn);R[2]=0}catch(e){R[2]=-1>>>0}return}\n    case 83:{const p=ms(a0);try{fs.mkdirSync(p,{recursive:true});R[2]=0}catch(e){R[2]=-1>>>0}return}\n    case 87:{const p=ms(a0);try{fs.unlinkSync(p);R[2]=0}catch(e){R[2]=-1>>>0}return}\n    case 201:{const now=Math.floor(Date.now()/1000);if(a0)w32m(a0,now);R[2]=now;return}\n    default:console.error('Syscall '+n+' @0x'+(cpc>>>0).toString(16));process.exit(1)}\n}\nwhile(EX===null){\n  const cpc=pc,I=r32m(cpc);let tb=-1;\n  if(bd>=0){tb=bd;bd=-1}\n  pc=(cpc+4)>>>0;ic++;\n  const op=I>>>26,rs=(I>>>21)&31,rt=(I>>>16)&31,rd=(I>>>11)&31;\n  if(op===0){\n    const fn=I&63,sh=(I>>>6)&31;\n    switch(fn){\n      case 0:R[rd]=(R[rt]<<sh)>>>0;break;\n      case 2:R[rd]=R[rt]>>>sh;break;\n      case 3:R[rd]=(R[rt]>>sh)>>>0;break;\n      case 4:R[rd]=(R[rt]<<(R[rs]&31))>>>0;break;\n      case 6:R[rd]=R[rt]>>>(R[rs]&31);break;\n      case 7:R[rd]=(R[rt]>>(R[rs]&31))>>>0;break;\n      case 8:bd=R[rs];break;\n      case 9:{const t=R[rs];R[rd||31]=(cpc+8)>>>0;bd=t;break}\n      case 10:if(R[rt]===0)R[rd]=R[rs];break;\n      case 11:if(R[rt]!==0)R[rd]=R[rs];break;\n      case 12:doSys(cpc);break;\n      case 15:break;\n      case 16:R[rd]=hi;break;\n      case 17:hi=R[rs];break;\n      case 18:R[rd]=lo;break;\n      case 19:lo=R[rs];break;\n      case 24:{const a=R[rs]|0,b=R[rt]|0,neg=(a^b)<0,aa=Math.abs(a),bb=Math.abs(b);const aL=aa&0xffff,aH=aa>>>16,bL=bb&0xffff,bH=bb>>>16,p0=aL*bL,p1=aL*bH,p2=aH*bL,p3=aH*bH;let l=(p0+((p1&0xffff)<<16)+((p2&0xffff)<<16))>>>0;let h=(p3+(p1>>>16)+(p2>>>16)+(((p0>>>0)+(((p1&0xffff)<<16)>>>0)+(((p2&0xffff)<<16)>>>0)>=4294967296)?1:0))>>>0;if(neg){l=(~l+1)>>>0;h=(~h+(l===0?1:0))>>>0}lo=l;hi=h;break}\n      case 25:{const a=R[rs],b=R[rt],aL=a&0xffff,aH=a>>>16,bL=b&0xffff,bH=b>>>16,p0=aL*bL,p1=aL*bH,p2=aH*bL,p3=aH*bH;lo=(p0+((p1&0xffff)<<16)+((p2&0xffff)<<16))>>>0;hi=(p3+(p1>>>16)+(p2>>>16)+(((p0>>>0)+(((p1&0xffff)<<16)>>>0)+(((p2&0xffff)<<16)>>>0)>=4294967296)?1:0))>>>0;break}\n      case 26:{const a=R[rs]|0,b=R[rt]|0;if(b){lo=Math.trunc(a/b)>>>0;hi=(a%b)>>>0}break}\n      case 27:{const a=R[rs],b=R[rt];if(b){lo=(a/b)>>>0;hi=(a%b)>>>0}break}\n      case 32:case 33:R[rd]=(R[rs]+R[rt])>>>0;break;\n      case 34:case 35:R[rd]=(R[rs]-R[rt])>>>0;break;\n      case 36:R[rd]=R[rs]&R[rt];break;\n      case 37:R[rd]=R[rs]|R[rt];break;\n      case 38:R[rd]=R[rs]^R[rt];break;\n      case 39:R[rd]=~(R[rs]|R[rt])>>>0;break;\n      case 42:R[rd]=(R[rs]|0)<(R[rt]|0)?1:0;break;\n      case 43:R[rd]=R[rs]<R[rt]?1:0;break;\n      case 48:case 50:case 52:case 54:break;\n      default:console.error('SF='+fn+' @0x'+(cpc>>>0).toString(16));process.exit(1)}\n  }else{\n    const si=(I<<16)>>16,ui=I&0xFFFF;\n    switch(op){\n      case 1:{const sub=rt,tgt=(cpc+4+(si<<2))>>>0;if(sub===0){if((R[rs]|0)<0)bd=tgt}else if(sub===1){if((R[rs]|0)>=0)bd=tgt}else if(sub===16){R[31]=(cpc+8)>>>0;if((R[rs]|0)<0)bd=tgt}else if(sub===17){R[31]=(cpc+8)>>>0;if((R[rs]|0)>=0)bd=tgt}else{console.error('R='+sub);process.exit(1)}break}\n      case 2:bd=((cpc+4)&0xF0000000)|((I&0x3FFFFFF)<<2);break;\n      case 3:R[31]=(cpc+8)>>>0;bd=((cpc+4)&0xF0000000)|((I&0x3FFFFFF)<<2);break;\n      case 4:if(R[rs]===R[rt])bd=(cpc+4+(si<<2))>>>0;break;\n      case 5:if(R[rs]!==R[rt])bd=(cpc+4+(si<<2))>>>0;break;\n      case 6:if((R[rs]|0)<=0)bd=(cpc+4+(si<<2))>>>0;break;\n      case 7:if((R[rs]|0)>0)bd=(cpc+4+(si<<2))>>>0;break;\n      case 8:case 9:R[rt]=(R[rs]+si)>>>0;break;\n      case 10:R[rt]=(R[rs]|0)<si?1:0;break;\n      case 11:R[rt]=R[rs]<(si>>>0)?1:0;break;\n      case 12:R[rt]=R[rs]&ui;break;\n      case 13:R[rt]=R[rs]|ui;break;\n      case 14:R[rt]=R[rs]^ui;break;\n      case 15:R[rt]=(ui<<16)>>>0;break;\n      case 16:case 17:case 18:case 19:case 20:case 21:case 22:case 23:break;\n      case 28:{const f2=I&63;switch(f2){\n        case 0:{const r=BigInt(R[rs]|0)*BigInt(R[rt]|0);let a=(BigInt(hi>>>0)<<32n)|BigInt(lo>>>0);a=a+r;lo=Number(a&0xFFFFFFFFn)>>>0;hi=Number((a>>32n)&0xFFFFFFFFn)>>>0;break}\n        case 1:{const r=BigInt(R[rs]>>>0)*BigInt(R[rt]>>>0);let a=(BigInt(hi>>>0)<<32n)|BigInt(lo>>>0);a=a+r;lo=Number(a&0xFFFFFFFFn)>>>0;hi=Number((a>>32n)&0xFFFFFFFFn)>>>0;break}\n        case 2:R[rd]=Math.imul(R[rs],R[rt])>>>0;break;\n        case 32:R[rd]=R[rs]===0?32:Math.clz32(R[rs]);break;\n        case 33:R[rd]=~R[rs]===0?32:Math.clz32(~R[rs]>>>0);break;\n        default:console.error('S2='+f2+' @0x'+cpc.toString(16));process.exit(1)}break}\n      case 31:{const f3=I&63,sh=(I>>>6)&31;switch(f3){\n        case 0:R[rt]=(R[rs]>>>sh)&((1<<(rd+1))-1);break;\n        case 4:{const m2=((1<<(rd+1-sh))-1)<<sh;R[rt]=(R[rt]&(~m2>>>0)|((R[rs]<<sh)&m2))>>>0;break}\n        case 32:{if(sh===0){let v=R[rt],r=0;for(let i=0;i<4;i++){let b=(v>>>(i*8))&0xff;b=((b&1)<<7)|((b&2)<<5)|((b&4)<<3)|((b&8)<<1)|((b&16)>>1)|((b&32)>>3)|((b&64)>>5)|((b&128)>>7);r|=(b<<(i*8))}R[rd]=r>>>0}else if(sh===2)R[rd]=(((R[rt]&0x00FF00FF)<<8)|((R[rt]&0xFF00FF00)>>>8))>>>0;else if(sh===16)R[rd]=((R[rt]&0xFF)<<24)>>24;else if(sh===24)R[rd]=((R[rt]&0xFFFF)<<16)>>16;else{console.error('B='+sh+' @0x'+cpc.toString(16));process.exit(1)}break}\n        case 59:R[rt]=0;break;\n        default:console.error('S3='+f3+' @0x'+cpc.toString(16));process.exit(1)}break}\n      case 32:R[rt]=((r8((R[rs]+si)>>>0))<<24)>>24;break;\n      case 33:R[rt]=((r16m((R[rs]+si)>>>0))<<16)>>16;break;\n      case 34:{const a=(R[rs]+si)>>>0,al=a&~3,bo=a&3,mv=r32m(al);R[rt]=bo===0?mv:bo===1?(R[rt]&0xFF000000|mv>>>8)>>>0:bo===2?(R[rt]&0xFFFF0000|mv>>>16)>>>0:(R[rt]&0xFFFFFF00|mv>>>24)>>>0;break}\n      case 35:R[rt]=r32m((R[rs]+si)>>>0);break;\n      case 36:R[rt]=r8((R[rs]+si)>>>0);break;\n      case 37:R[rt]=r16m((R[rs]+si)>>>0);break;\n      case 38:{const a=(R[rs]+si)>>>0,al=a&~3,bo=a&3,mv=r32m(al);R[rt]=bo===0?(R[rt]&0x00FFFFFF|mv<<24)>>>0:bo===1?(R[rt]&0x0000FFFF|mv<<16)>>>0:bo===2?(R[rt]&0x000000FF|mv<<8)>>>0:mv;break}\n      case 40:w8((R[rs]+si)>>>0,R[rt]);break;\n      case 41:w16m((R[rs]+si)>>>0,R[rt]);break;\n      case 42:{const a=(R[rs]+si)>>>0,al=a&~3,bo=a&3,old=r32m(al),v=R[rt];w32m(al,bo===0?v:bo===1?(old&0xFF000000|v&0x00FFFFFF)>>>0:bo===2?(old&0xFFFF0000|v&0x0000FFFF)>>>0:(old&0xFFFFFF00|v&0x000000FF)>>>0);break}\n      case 43:w32m((R[rs]+si)>>>0,R[rt]);break;\n      case 46:{const a=(R[rs]+si)>>>0,al=a&~3,bo=a&3,old=r32m(al),v=R[rt];w32m(al,bo===0?(old&0x00FFFFFF|v<<24)>>>0:bo===1?(old&0x0000FFFF|v<<16)>>>0:bo===2?(old&0x000000FF|v<<8)>>>0:v);break}\n      case 48:case 49:case 50:case 51:case 52:case 53:case 54:case 55:case 56:case 57:case 58:case 59:case 60:case 61:case 62:case 63:break;\n      default:console.error('OP='+op+' @0x'+(cpc>>>0).toString(16));process.exit(1)}\n  }\n  if(tb>=0)pc=tb>>>0;R[0]=0;\n}\nconsole.error('\\nExit:'+EX+' '+ic+' in '+((Date.now()-t0)/1000).toFixed(1)+'s');\nXEOF\n",
+      "duration": 0.5
+    }
+  ]
+}

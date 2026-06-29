@@ -1,0 +1,33 @@
+{
+  "id": "chatcmpl-e4bfbacd423aec58383b745e7160e90e",
+  "object": "chat.completion",
+  "created": 1782742402,
+  "model": "xiaomi/mimo-v2.5-pro-ultraspeed",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "{\n  \"analysis\": \"We're close but bucket 1 still fails on cost and p95_latency. Need to optimize shapes and packing further. The high range (1088-2048) has many requests with large gaps between shapes. Need to refine shape selection and gen_len grouping. Also need to ensure the shapes are multiples of 64 and cover both buckets.\",\n  \"plan\": \"1) Try shape sets that cover high range more finely while still covering bucket 2 up to 704. 2) Optimize gen_len tolerance, maybe separate high gen_len requests into own batches. 3) Write script to search over shape sets and parameters, then output final plans.\",\n  \"commands\": [\n    {\n      \"keystrokes\": \"cat > /app/task_file/scripts/optimizer2.py << 'PYEOF'\\n#!/usr/bin/env python3\\nimport json, math, os, sys, itertools\\nfrom collections import defaultdict\\nsys.path.insert(0, os.path.dirname(__file__))\\nfrom cost_model import CostModel, CostConsts, align, HEADS, HIDDEN\\n\\ndef load_requests(path):\\n    reqs = {}\\n    with open(path) as f:\\n        for line in f:\\n            r = json.loads(line)\\n            reqs[r['request_id']] = r\\n    return reqs\\n\\ndef build_plan(reqs, shapes, gen_tol_frac=0.10, gen_tol_abs=8, max_batch=64):\\n    shape_groups = defaultdict(list)\\n    for rid, r in reqs.items():\\n        s = align(r['prompt_len'], 64)\\n        assigned = None\\n        for sh in shapes:\\n            if sh >= s:\\n                assigned = sh\\n                break\\n        if assigned is None:\\n            assigned = shapes[-1]\\n        shape_groups[assigned].append((rid, s, r['gen_len']))\\n\\n    plan = []\\n    bc = 0\\n    for shape_val in sorted(shape_groups.keys()):\\n        group = sorted(shape_groups[shape_val], key=lambda x: x[2])\\n        cur = []\\n        cur_min = None\\n        for item in group:\\n            g = item[2]\\n            if not cur:\\n                cur = [item]; cur_min = g\\n            else:\\n                gmax = max(item[2], max(x[2] for x in cur))\\n                limit = max(cur_min*(1+gen_tol_frac), cur_min+gen_tol_abs)\\n                if gmax <= limit and len(cur) < max_batch:\\n                    cur.append(item)\\n                else:\\n                    bc += 1\\n                    bid = f\\\"b-{bc:04d}\\\"\\n                    for rid2,s2,g2 in cur:\\n                        plan.append({'request_id':rid2,'batch_id':bid,'shape':{'seq_align':shape_val,'heads_align':HEADS,'hidden_align':HIDDEN}})\\n                    cur=[item]; cur_min=g\\n        if cur:\\n            bc += 1\\n            bid = f\\\"b-{bc:04d}\\\"\\n            for rid2,s2,g2 in cur:\\n                plan.append({'request_id':rid2,'batch_id':bid,'shape':{'seq_align':shape_val,'heads_align':HEADS,'hidden_align':HIDDEN}})\\n    return plan\\n\\ndef evaluate(reqs, plan, label=\\\"\\\"):\\n    cm = CostModel(64)\\n    m = cm.plan_metrics(reqs, plan)\\n    shapes = set((p['shape']['seq_align'],p['shape']['heads_align'],p['shape']['hidden_align']) for p in plan)\\n    nb = len(set(p['batch_id'] for p in plan))\\n    return m, len(shapes), nb\\n\\nif __name__ == '__main__':\\n    root = os.path.dirname(os.path.dirname(__file__))\\n    reqs1 = load_requests(os.path.join(root,'input_data','requests_bucket_1.jsonl'))\\n    reqs2 = load_requests(os.path.join(root,'input_data','requests_bucket_2.jsonl'))\\n\\n    # Candidate shape sets (must be multiples of 64, sorted, max 8)\\n    candidates = [\\n        [64,128,256,448,704,1088,1472,2048],\\n        [64,128,192,384,640,1088,1472,2048],\\n        [64,128,192,384,640,1024,1408,2048],\\n        [64,128,192,320,448,704,1152,2048],\\n        [64,128,192,320,448,704,1088,2048],\\n        [64,128,192,320,448,704,1024,2048],\\n        [64,128,192,320,448,704,1024,1600],\\n        [64,128,192,320,448,704,1152,1792],\\n        [64,128,192,320,448,704,1280,2048],\\n    ]\\n    best = None\\n    for shapes in candidates:\\n        for frac, ab in [(0.05,4), (0.03,3), (0.02,2), (0.10,8)]:\\n            plan1 = build_plan(reqs1, shapes, frac, ab, 64)\\n            plan2 = build_plan(reqs2, shapes, frac, ab, 64)\\n            m1, s1, nb1 = evaluate(reqs1, plan1)\\n            m2, s2, nb2 = evaluate(reqs2, plan2)\\n            ok1 = (m1['cost'] < 3.0e11 and m1['pad_ratio'] < 0.055 and m1['p95_latency_ms'] < 2.1e6 and m1['sequential_timecost'] < 2.7e8)\\n            ok2 = (m2['cost'] < 4.8e10 and m2['pad_ratio'] < 0.15 and m2['p95_latency_ms'] < 2.1e5 and m2['sequential_timecost'] < 3.2e7)\\n            score = m1['cost'] + m2['cost']\\n            if best is None or (ok1 and ok2 and score < best['score']) or (not best['ok'] and (ok1 and ok2)):\\n                best = {'shapes':shapes,'frac':frac,'ab':ab,'m1':m1,'m2':m2,'ok':ok1 and ok2,'score':score}\\n                print(f\\\"Candidate: {shapes} frac={frac} abs={ab} => B1 cost={m1['cost']:.4e} pad={m1['pad_ratio']:.4f} p95={m1['p95_latency_ms']:.4e} seq={m1['sequential_timecost']:.4e} B2 cost={m2['cost']:.4e} pad={m2['pad_ratio']:.4f} p95={m2['p95_latency_ms']:.4e} seq={m2['sequential_timecost']:.4e} ok={ok1 and ok2}\\\")\\n    print(f\\\"\\\\nBest: {best['shapes']} frac={best['frac']} abs={best['ab']}\\\")\\n    print(f\\\"  B1: cost={best['m1']['cost']:.4e} pad={best['m1']['pad_ratio']:.4f} p95={best['m1']['p95_latency_ms']:.4e} seq={best['m1']['sequential_timecost']:.4e}\\\")\\n    print(f\\\"  B2: cost={best['m2']['cost']:.4e} pad={best['m2']['pad_ratio']:.4f} p95={best['m2']['p95_latency_ms']:.4e} seq={best['m2']['sequential_timecost']:.4e}\\\")\\nPYEOF\\n\",\n      \"duration\": 0.1\n    },\n    {\n      \"keystrokes\": \"cd /app/task_file && python3 scripts/optimizer2.py 2>&1\\n\",\n      \"duration\": 10.0\n    }\n  ],\n  \"task_complete\": false\n}"
+      },
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": {
+    "completion_tokens": 4133,
+    "completion_tokens_details": {
+      "reasoning_tokens": 2133
+    },
+    "cost_microdollars": 40418,
+    "prompt_tokens": 19890,
+    "prompt_tokens_details": {
+      "cached_tokens": 15616
+    },
+    "total_tokens": 24023
+  },
+  "trustedrouter": {
+    "synth": {
+      "cost_microdollars": 40418
+    }
+  }
+}

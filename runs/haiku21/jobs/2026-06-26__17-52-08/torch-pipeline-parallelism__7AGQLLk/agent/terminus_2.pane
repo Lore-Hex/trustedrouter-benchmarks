@@ -1,0 +1,143 @@
+[?2004hroot@9c4aa64cff41:/app# asciinema rec --stdin /logs/agent/recording.cast
+[?2004l[0;32masciinema: recording asciicast to /logs/agent/recording.cast[0m
+[0;32masciinema: press <ctrl-d> or type "exit" when you're done[0m
+[?2004hroot@9c4aa64cff41:/app# clear
+[?2004l[H[J[3J[?2004hroot@9c4aa64cff41:/app# cat > /app/pipeline_parallel.py << 'EOF'
+[?2004l[?2004h> import torch
+[?2004l[?2004h> import torch.nn.functional as F
+[?2004l[?2004h> import torch.distributed as dist
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> def train_step_pipeline_afab(model, inputs, targets, device, dtype):
+[?2004l[?2004h>     """
+[?2004llse:
+   [?2004h>     Pipeline parallel training with all-forward-all-backward (AFAB) scheduling.
+[?2004l[?2004h>     
+[?2004l[?2004h>     Args:
+[?2004l[?2004h>         model: LlamaForCausalLM instance
+[?2004l[?2004h>         inputs: list of microbatches of input IDs (each a tensor)
+[?2004l[?2004h>         targets: list of corresponding microbatches of target IDs
+[?2004l[?2004h>         device: torch device
+[?2004l[?2004h>         dtype: torch dtype
+[?2004l[?2004h>     """
+[?2004l[?2004h>     rank = dist.get_rank()
+[?2004l[?2004h>     world_size = dist.get_world_size()
+[?2004l[?2004h>     num_microbatches = len(inputs)
+[?2004l[?2004h>     
+[?2004l[?2004h>     # ===== MODEL LAYER PARTITIONING =====
+[?2004l[?2004h>     # Get all transformer layers and distribute them across ranks
+[?2004l[?2004h>     all_layers = list(model.model.layers)
+[?2004l[?2004h>     num_total_layers = len(all_layers)
+[?2004l[?2004h>     
+[?2004l[?2004h>     # Calculate balanced layer distribution
+[?2004l[?2004h>     layers_per_rank = num_total_layers // world_size
+[?2004l[?2004h>     remainder_layers = num_total_layers % world_size
+[?2004l[?2004h>     
+[?2004l[?2004h>     # Determine which layers this rank is responsible for
+[?2004l[?2004h>     layer_start_idx = 0
+[?2004l[?2004h>     for r in range(rank):
+[?2004l[?2004h>         layer_start_idx += layers_per_rank + (1 if r < remainder_layers else 0)
+[?2004l[?2004h>     
+[?2004l[?2004h>     num_layers_this_rank = layers_per_rank + (1 if rank < remainder_layers else 0)
+[?2004l[?2004h>     layer_end_idx = layer_start_idx + num_layers_this_rank
+[?2004l[?2004h>     
+[?2004l[?2004h>     my_layers = all_layers[layer_start_idx:layer_end_idx]
+[?2004l[?2004h>     
+[?2004l[?2004h>     # Move assigned layers to the specified device and dtype
+[?2004l[?2004h>     for layer in my_layers:
+[?2004l[?2004h>         layer.to(device=device, dtype=dtype)
+[?2004l[?2004h>     
+[?2004l[?2004h>     # Move rank-specific model components to device
+[?2004l[?2004h>     if rank == 0:
+[?2004l[?2004h>         model.model.embed_tokens.to(device=device, dtype=dtype)
+[?2004l[?2004h>     
+[?2004l[?2004h>     if rank == world_size - 1:
+[?2004l[?2004h>         model.model.norm.to(device=device, dtype=dtype)
+[?2004l[?2004h>         model.lm_head.to(device=device, dtype=dtype)
+[?2004l[?2004h>     
+[?2004l[?2004h>     # ===== FORWARD PASS: AFAB - ALL FORWARD =====
+[?2004l[?2004h>     # Store inputs to this rank (for gradient computation in backward)
+[?2004l[?2004h>     rank_inputs = {}
+[?2004l[?2004h>     total_loss = None
+[?2004l[?2004h>     
+[?2004l[?2004h>     for mb_idx in range(num_microbatches):
+[?2004l[?2004h>         # Get input IDs and target IDs, move to device
+[?2004l[?2004h>         input_ids = inputs[mb_idx].to(device=device, dtype=torch.long)
+[?2004l[?2004h>         target_ids = targets[mb_idx].to(device=device, dtype=torch.long)
+[?2004l[?2004h>         
+[?2004l[?2004h>         # Get hidden state for this stage
+[?2004l[?2004h>         if rank == 0:
+[?2004l[?2004h>             # First rank: embed the input tokens
+[?2004l[?2004h>             hidden_state = model.model.embed_tokens(input_ids)
+[?2004l[?2004h>             hidden_state = hidden_state.to(dtype=dtype)
+[?2004l[?2004h>         else:
+[?2004l[?2004h>             # Other ranks: receive hidden states from previous rank
+[?2004l[?2004h>             hidden_state = torch.zeros(
+[?2004l[?2004h>                 input_ids.shape[0],
+[?2004l[?2004h>                 input_ids.shape[1],
+[?2004l[?2004h>                 model.config.hidden_size,
+[?2004l[?2004h>                 device=device,
+[?2004l[?2004h>                 dtype=dtype,
+[?2004l[?2004h>                 requires_grad=True
+[?2004l[?2004h>             )
+[?2004l[?2004h>             dist.recv(hidden_state, src=rank - 1)
+[?2004l[?2004h>         
+[?2004l[?2004h>         # Save input to this rank for backward pass
+[?2004l[?2004h>         rank_inputs[mb_idx] = hidden_state
+[?2004l[?2004h>         
+[?2004l[?2004h>         # Forward pass through assigned layers
+[?2004l[?2004h>         for layer in my_layers:
+[?2004l[?2004h>             layer_output = layer(hidden_state, attention_mask=None)
+[?2004l[?2004h>             hidden_state = layer_output[0]
+[?2004l[?2004h>         
+[?2004l[?2004h>         # Send or finalize
+[?2004l[?2004h>         if rank < world_size - 1:
+[?2004l[?2004h>             # Send hidden state to next rank (detached to avoid circular grad computation)
+[?2004l[?2004h>             dist.send(hidden_state.detach().clone(), dst=rank + 1)
+[?2004l[?2004h>         else:
+[?2004l[?2004h>             # Last rank: compute loss
+[?2004l[?2004h>             # Apply final layer norm and LM head
+[?2004l[?2004h>             normalized_hidden = model.model.norm(hidden_state)
+[?2004l[?2004h>             logits = model.lm_head(normalized_hidden)
+[?2004l[?2004h>             
+[?2004l[?2004h>             # Compute cross-entropy loss, scaled by number of microbatches
+[?2004l[?2004h>             microbatch_loss = F.cross_entropy(
+[?2004l[?2004h>                 logits.view(-1, model.config.vocab_size),
+[?2004l[?2004h>                 target_ids.view(-1),
+[?2004l[?2004h>                 reduction='sum'
+[?2004l[?2004h>             ) / num_microbatches
+[?2004l[?2004h>             
+[?2004l[?2004h>             # Accumulate loss
+[?2004l[?2004h>             if total_loss is None:
+[?2004l[?2004h>                 total_loss = microbatch_loss
+[?2004l[?2004h>             else:
+[?2004l[?2004h>                 total_loss = total_loss + microbatch_loss
+[?2004l[?2004h>     
+[?2004l[?2004h>     # ===== BACKWARD PASS: AFAB - ALL BACKWARD =====
+[?2004l[?2004h>     if rank == world_size - 1:
+[?2004l[?2004h>         # Last rank: start backward from accumulated loss
+[?2004l[?2004h>         total_loss.backward()
+[?2004l[?2004h>     else:
+[?2004l[?2004h>         # Non-last ranks: receive gradients from next rank and backprop
+[?2004l[?2004h>         for mb_idx in range(num_microbatches):
+[?2004l[?2004h>             # Receive gradient from next rank
+[?2004l[?2004h>             gradient = torch.zeros_like(rank_inputs[mb_idx])
+[?2004l[?2004h>             dist.recv(gradient, src=rank + 1)
+[?2004l[?2004h>             
+[?2004l[?2004h>             # Backward through this microbatch
+[?2004l[?2004h>             # retain_graph=True for all but the last microbatch to allow multiple backward calls
+[?2004l[?2004h>             rank_inputs[mb_idx].backward(
+[?2004l[?2004h>                 gradient,
+[?2004l[?2004h>                 retain_graph=(mb_idx < num_microbatches - 1)
+[?2004l[?2004h>             )
+[?2004l[?2004h>         
+[?2004l[?2004h>         # Send gradients to previous rank (if not first rank)
+[?2004l[?2004h>         if rank > 0:
+[?2004l[?2004h>             for mb_idx in range(num_microbatches):
+[?2004l[?2004h>                 # The gradient w.r.t. the received hidden state is in rank_inputs[mb_idx].grad
+[?2004l[?2004h>                 input_gradient = rank_inputs[mb_idx].grad
+[?2004l[?2004h>                 dist.send(input_gradient.clone(), dst=rank - 1)
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@9c4aa64cff41:/app# ls -la /app/pipeline_parallel.py
+[?2004l-rw-r--r-- 1 root root 5181 Jun 27 01:04 /app/pipeline_parallel.py
+[?2004hroot@9c4aa64cff41:/app# 

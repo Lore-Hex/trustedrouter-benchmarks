@@ -1,0 +1,266 @@
+
+[tr-stream call-0161:socrates:trustedrouter/socrates-pro-plus-1.0] socrates.started
+
+[tr-stream call-0161:worker:xiaomi/mimo-v2.5-pro-ultraspeed] worker.started
+[tr-thinking call-0161:worker:xiaomi/mimo-v2.5-pro-ultraspeed] The structures look correct:
+- wadinfo_t: 4 + 4 + 4 = 12 bytes (packed)
+- filelump_t: 4 + 4 + 8 = 16 bytes (packed)
+
+PACKEDATTR is `__attribute__((packed))` - this ensures no padding.
+
+The header was read correctly: 49 57 41 44 f0 04 00 00 b4 b7 3f 00
+- identification: 49 57 41 44 = "IWAD" ✓
+- numlumps: f0 04 00 00 = 0x000004
+[tr-thinking call-0161:worker:xiaomi/mimo-v2.5-pro-ultraspeed] f0 = 1264 ✓
+- infotableofs: b4 b7 3f 00 = 0x003fb7b4 = 4175796 ✓
+
+So the header is read correctly. But the error says 9260 >= numlumps. 9260 = 0x242C. Let me think about what could cause this...
+
+The crash happens during R_InitData, specifically W_CacheLumpNum. This suggests that after loading the WAD, some code is trying to access a lump with index 9260, but numlumps should be 1264.
+
+Wait, the issue might be with
+[tr-thinking call-0161:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  the directory read. Let me check:
+- header.infotableofs = 4175796
+- header.numlumps = 1264
+- length = 1264 * sizeof(filelump_t) = 1264 * 16 = 20224 bytes
+
+The W_Read should read 20224 bytes from offset 4175796. If the file seek is wrong, the directory data will be garbage.
+
+Actually, wait. Let me reconsider. The W_Read uses fseek/fread. Let me look at the VM's lseek implementation more carefully. The issue might be that for
+[tr-thinking call-0161:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  cached files (files opened for reading), the VM reads the entire file into memory on open. Then fseek moves the position pointer, and fread reads from that position in the cache.
+
+The problem might be with how the VM handles files that are larger than what fits in memory, or how fseek handles large offsets.
+
+Actually, looking at the VM's lseek code again, it correctly handles SEEK_SET for cached files by just setting fileInfo.position = offset. And fread reads from fileInfo.data starting at fileInfo.position.
+
+But wait - the doom.wad is about 4MB. The VM reads the entire file into memory on open. Let me check if the
+[tr-thinking call-0161:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  VM's file cache can handle this...
+
+Actually, the issue might be more subtle. The header is read correctly, but the directory read might fail because the file cache might not be properly tracking position after the first read.
+
+Let me think about the sequence:
+1. W_Read(wad_file, 0, &header, sizeof(header)) - reads 12 bytes from offset 0
+   - fseek to 0
+   - fread 12 bytes
+   - position now at 12
+2. W_Read(wad_file, header.infotableofs, fileinfo, length) - reads 20224 bytes from offset
+[tr-thinking call-0161:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  4175796
+   - fseek to 4175796
+   - fread 20224 bytes
+
+If fseek is working correctly, this should work. But let me check if there's an issue with the file position after the first read.
+
+Actually, I think the issue might be that after the first W_Read, the position in the VM file cache is at 12. Then when fseek seeks to 4175796, if it's using SEEK_SET, it should set the position to 4175796. Let me verify the VM code handles this correctly.
+
+Looking at the VM code:
+
+[tr-thinking call-0161:worker:xiaomi/mimo-v2.5-pro-ultraspeed] ```
+if (this.fileCache && this.fileCache[fd]) {
+  const fileInfo = this.fileCache[fd];
+  ...
+  switch (whence) {
+    case 0:  // SEEK_SET
+      newPosition = offset;
+      break;
+  }
+  fileInfo.position = newPosition;
+  this.registers[2] = newPosition;
+}
+```
+
+This looks correct. So the issue must be elsewhere.
+
+Actually wait, there's a subtlety. The VM uses Node.js file descriptors, not the fdCounter from the MIPS side. Let me re-read the open syscall:
+
+```javascript
+} else if (syscallNum === 2) { 
+[tr-thinking call-0161:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  // SYS_open
+  ...
+  const fd = fs.openSync(pathname, fsFlags, mode);
+  ...
+  if (fs.fstatSync(fd).isCharacterDevice()) {
+    ...
+  } else {
+    const stats = fs.fstatSync(fd);
+    if (stats.isFile()) {
+      if (accessMode === O_RDONLY) {
+        fileData = Buffer.alloc(stats.size);
+        fs.readSync(fd, fileData, 0, stats.size, 0);
+      }
+    }
+    this.fileCache[fd] = { data: fileData, position: 0, path: pathname, modified: false };
+  }
+  this.reg
+[tr-thinking call-0161:worker:xiaomi/mimo-v2.5-pro-ultraspeed] isters[2] = fd;
+}
+```
+
+Wait, the VM stores the file cache keyed by the actual Node.js fd number, not by the MIPS fd. And it returns the Node.js fd directly. But then in the read syscall:
+
+```javascript
+if (syscallNum === 0) {  // SYS_read
+  const fd = this.fileDescriptors[this.registers[4]];
+```
+
+This maps the MIPS fd through fileDescriptors. But fileDescriptors only has stdin/stdout/stderr at startup. When opening a file, the VM returns the actual Node.js fd directly, which wouldn't be in the fileDescriptors map.
+
+Hmm, but the WAD opening works because
+[tr-thinking call-0161:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  it gets a valid fd. Let me look at the read more carefully...
+
+Actually, the issue is that the MIPS program calls our sys_open wrapper which calls syscall(SYS_OPEN, path, flags, mode). The VM's SYS_open handler returns the Node.js fd directly in $v0. Then our MIPS code stores that fd and uses it for subsequent sys_read/sys_lseek calls.
+
+But the MIPS code calls sys_lseek(fd, offset, whence), which puts fd in $a0, offset in $a1, whence in $a2. The VM's SYS_lseek handler does:
+```
+const fd = this.fileDescriptors[this.registers[4]];
+```
+
+This
+[tr-thinking call-0161:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  looks up the MIPS fd (from $a0 = register 4) in the fileDescriptors map. But for non-stdio files, this map doesn't have the fd! So fd would be undefined, and then accessing this.fileCache[undefined] would fail.
+
+Wait no, let me re-read. Actually the open syscall returns the Node.js fd directly. So the MIPS program receives the Node.js fd. But the lseek syscall uses this.fileDescriptors[this.registers[4]] to get the fd. This would only work if fileDescriptors has a mapping from the Node.js fd to itself.
+
+Actually wait, looking more carefully at the open handler:
+``
+[tr-thinking call-0161:worker:xiaomi/mimo-v2.5-pro-ultraspeed] `
+this.registers[2] = fd;
+```
+
+It returns the Node.js fd directly. But then for non-cached operations (like lseek), it does:
+```
+const fd = this.fileDescriptors[this.registers[4]];
+```
+
+This would fail because fileDescriptors only has entries for 0, 1, 2. For file fd 3 or higher, it would return undefined.
+
+But wait, for cached files (read-only files), it checks this.fileCache[fd]. But fd is from fileDescriptors which is undefined for regular files. So it would fall through to the non-cached path and try to
+[tr-thinking call-0161:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  use the Node.js fd directly.
+
+Hmm, this is getting complicated. Let me look at the code again more carefully...
+
+Actually, I think the issue is different. Looking at the lseek code:
+```
+const fd = this.fileDescriptors[this.registers[4]];          // File descriptor
+```
+
+But the read code:
+```
+const fd = this.fileDescriptors[this.registers[4]];
+```
+
+For regular files opened with SYS_open, the fd is returned directly. But fileDescriptors only has stdin/stdout/stderr. So the lookup would fail.
+
+Wait, but actually for the cached file path, lseek does:
+```
+if (this.fileCache && this.fileCache[fd]) {
+```
+
+If fd is undefined, then file
+[tr-thinking call-0161:worker:xiaomi/mimo-v2.5-pro-ultraspeed] Cache[undefined] would be undefined, so it falls through to the else branch.
+
+In the else branch for lseek:
+```
+const stats = fs.fstatSync(fd);
+```
+
+If fd is undefined, this would throw an error. But we're not seeing lseek errors...
+
+OK let me reconsider. The open handler sets:
+```
+this.registers[2] = fd;  // Returns Node.js fd directly
+```
+
+And for cached files, it stores in:
+```
+this.fileCache[fd] = { data: fileData, position: 0, ... };
+```
+
+So the MIPS program gets fd=3 (or
+[tr-thinking call-0161:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  whatever), and when it calls lseek(3, offset, whence), the VM does:
+```
+const fd = this.fileDescriptors[this.registers[4]];  // this.fileDescriptors[3] = undefined
+```
+
+Then `this.fileCache[undefined]` = undefined, so it falls to the else branch.
+
+In the else branch:
+```
+const stats = fs.fstatSync(fd);  // fstatSync(undefined) - this would crash!
+```
+
+But we're not seeing crashes at lseek. So maybe the file descriptors are being set up somewhere else?
+
+Actually wait, let me re-read the open handler more carefully. Maybe there's a line that sets up the
+[tr-thinking call-0161:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  fileDescriptors mapping.
+
+Let me search for fileDescriptors in the open handler...
+
+Actually, I just realized something. Let me look at the non-cached write path for SYS_write:
+```
+if (this.fileCache[fd]) {
+  // ... cached write
+} else {
+  const bytesWritten = fs.writeSync(fd, buffer, 0, count, null);
+}
+```
+
+Here, `fd` comes from `this.fileDescriptors[this.registers[4]]`. If fileDescriptors doesn't have the entry, fd would be undefined, and fs.writeSync(undefined, ...) would fail.
+
+But we're seeing the doom.wad being opened successfully. So the open must
+[tr-thinking call-0161:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  be returning a Node.js fd that happens to work in subsequent calls. But the fd translation is inconsistent - sometimes using fileDescriptors, sometimes using the raw fd.
+
+Wait, actually, I think the problem might be simpler. Let me look at the read syscall for cached files again:
+
+```
+} else if (syscallNum === 0) {  // SYS_read
+  const fd = this.registers[4];
+  const bufferAddr = this.registers[5];
+  const count = this.registers[6];
+  
+  if (fd === 0) { // stdin
+    ...
+  } else {
+    if (!this.fileCache[fd]) {
+      this.registers[2] = -1
+[tr-thinking call-0161:worker:xiaomi/mimo-v2.5-pro-ultraspeed] ;
+      return;
+    }
+    ...
+  }
+}
+```
+
+Wait, is fd taken from this.fileDescriptors or from this.registers[4] directly? Let me check the actual code.
+
+Actually I don't have the full read handler in view. Let me think about what we know:
+- The header is read correctly
+- The WAD file is opened
+- But numlumps is 9260 somewhere
+
+Maybe the issue is that the directory (fileinfo) is read incorrectly. If the seek doesn't work properly, the directory data would be garbage, and lump positions/sizes would be wrong.
+
+Actually, maybe the issue is simpler. Let me look at the error more
+[tr-thinking call-0161:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  carefully:
+
+`W_CacheLumpNum: 9260 >= numlumps`
+
+This error happens during R_InitData, not during W_AddFile. So the WAD was loaded but some lump is being accessed that doesn't exist. The numlumps value at that point should be the total number of lumps loaded from the WAD.
+
+Actually, the issue might be that numlumps is being read from the fileinfo directory incorrectly. If the directory data is wrong (because fseek failed), then the lumpinfo entries would have garbage values. When R_InitData tries to access lumps by index, it would go out of bounds.
+
+But actually,
+[tr-thinking call-0161:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  numlumps itself is set based on header.numlumps which we confirmed is 1264. So numlumps should be 1264 after W_AddFile. The error says 9260 >= numlumps, meaning lump index 9260 is being accessed. This could mean some lookup is using a garbage value instead of a valid lump index.
+
+Wait, 9260 in hex is 0x242C. Let me check what that could be...
+
+Actually, the issue might be with the lump directory not being read correctly. If the directory read fails or reads garbage, the lump names
+[tr-thinking call-0161:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  and positions would be wrong, and lump name lookups could return garbage indices.
+
+Let me focus on the actual problem: the directory read. After reading the header correctly (12 bytes from offset 0), we need to read the directory from offset 4175796 (header.infotableofs). If the seek doesn't work, we'd be reading from the wrong position.
+
+Hmm, actually I think I might know the issue. The VM's lseek for cached files needs to use the raw fd, not go through fileDescriptors. Let me check...
+
+Actually, let me just verify by adding debug output after the directory read to see the first few entries.
+[tr-stream call-0161:worker:xiaomi/mimo-v2.5-pro-ultraspeed] Let me check how the read syscall gets the fd in the VM:
+
+[tr-stream call-0161:worker:xiaomi/mimo-v2.5-pro-ultraspeed] worker.done finish=stop cost_microdollars=162978
+[tr-stream call-0161:xiaomi/mimo-v2.5-pro-ultraspeed] Let me check how the read syscall gets the fd in the VM:

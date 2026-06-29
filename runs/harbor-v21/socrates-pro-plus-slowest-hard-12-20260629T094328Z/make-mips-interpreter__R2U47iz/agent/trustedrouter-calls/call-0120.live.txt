@@ -1,0 +1,616 @@
+
+[tr-stream call-0120:socrates:trustedrouter/socrates-pro-plus-1.0] socrates.started
+
+[tr-stream call-0120:worker:xiaomi/mimo-v2.5-pro-ultraspeed] worker.started
+[tr-thinking call-0120:worker:xiaomi/mimo-v2.5-pro-ultraspeed] All four replacements were successful and syntax is OK. Now let me also remove the Z_Malloc trace and run the VM. But first, I need to verify my LE lwl/lwr/swl/swr implementations are correct.
+
+For little-endian MIPS:
+- lwl loads the most-significant bytes from an unaligned address
+- lwr loads the least-significant bytes from an unaligned address
+
+Actually wait - I need to think about this more carefully. In a little-endian system, the byte order in memory for a 32-bit value at address A is:
+- A+0: bits [7:0]
+- A+1: bits [15:8]
+- A+2: bits [23:16]
+- A+3: bits [31:24]
+
+For MIPS3
+[tr-thinking call-0120:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 2 LE:
+- lwl addr: Load the bytes from addr through the end of the aligned word, placing them at the LEFT (high) portion of the register
+- lwr addr: Load the bytes from the start of the aligned word through addr, placing them at the RIGHT (low) portion of the register
+
+Actually, for MIPS LE:
+- lwl at address A with byte offset bo (A & 3):
+  - bo=0: load all 4 bytes (same as lw)
+  - bo=1: load 3 bytes from A to A+2 into the high 3 bytes of rt
+  - bo=2: load 2 bytes from A to A+1
+[tr-thinking call-0120:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  into the high 2 bytes of rt
+  - bo=3: load 1 byte from A into the high byte of rt
+
+Wait, I'm confusing myself. Let me think about this differently.
+
+In the MIPS architecture (regardless of endianness):
+- lwl (Load Word Left) loads bytes from memory starting at the byte address to the left boundary of the word, and places them in the most significant bytes of the register
+- lwr (Load Word Right) loads bytes from memory starting at the right boundary of the word to the byte address, and places them in the least significant bytes of the register
+
+But in LE mode
+[tr-thinking call-0120:worker:xiaomi/mimo-v2.5-pro-ultraspeed] , "left" and "right" have different meanings...
+
+Actually, for MIPS in little-endian mode:
+- lwl addr: The effective address determines which bytes to load. For LE, "left" means lower addresses. lwl loads from the address to the end of the aligned word.
+- lwr addr: "right" means higher addresses. lwr loads from the start of the aligned word to the address.
+
+The key thing about lwl/lwr pairs in LE mode:
+
+For LE MIPS, lwl at addr with byte offset bo = addr & 3:
+- bo=0: rt = mem_word(aligned) (
+[tr-thinking call-0120:worker:xiaomi/mimo-v2.5-pro-ultraspeed] load all bytes, same as lw)
+- bo=1: rt[31:8] = mem[aligned+1], mem[aligned+2], mem[aligned+3] (LE: these are the higher address bytes → lower byte positions in register)
+- bo=2: rt[31:16] = mem[aligned+2], mem[aligned+3]
+- bo=3: rt[31:24] = mem[aligned+3]
+
+Hmm, this is getting confusing. Let me look at actual MIPS LE documentation.
+
+Actually, the behavior of lwl/lwr for LE MIPS is different from BE MIPS. The MIPS specification says:
+
+In
+[tr-thinking call-0120:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  little-endian mode:
+- lwl addr: bytes from aligned_word_end down to addr are loaded into the MSB side of the register
+- lwr addr: bytes from addr up to aligned_word_start are loaded into the LSB side of the register
+
+Wait, that's backwards. Let me look at this more carefully.
+
+For LE MIPS:
+- Memory is byte-addressed, with byte at the lowest address being the LSB
+- For a word at address 0x100: byte 0x100 is LSB, byte 0x103 is MSB
+
+lwl (Load Word Left - left meaning lower address):
+- Loads from the
+[tr-thinking call-0120:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  unaligned address to the left (lower) end of the aligned word
+- These bytes go into the LOW bytes of the register (because in LE, low address = low significance)
+
+lwr (Load Word Right - right meaning higher address):
+- Loads from the right (higher) end of the aligned word to the unaligned address
+- These bytes go into the HIGH bytes of the register
+
+Actually, I think I'm overcomplicating this. The MIPS spec defines lwl/lwr differently for LE and BE. Let me just verify by looking at the WAD reading code behavior.
+
+Actually, the simplest approach is to understand that lwl/lwr pairs are always
+[tr-thinking call-0120:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  used to load an unaligned 32-bit word. In LE mode:
+
+For lwl(addr):
+```
+aligned = addr & ~3
+bo = addr & 3
+switch(bo) {
+  case 0: rt = mem32(aligned)                          // all 4 bytes
+  case 1: rt = (rt & 0x000000FF) | (mem32(aligned) & 0xFFFFFF00)  // 3 high bytes from mem, keep 1 low
+  case 2: rt = (rt & 0x0000FFFF) | (mem32(aligned) & 0xFFFF0000)  // 2 high bytes from mem,
+[tr-thinking call-0120:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  keep 2 low
+  case 3: rt = (rt & 0x00FFFFFF) | (mem32(aligned) & 0xFF000000)  // 1 high byte from mem, keep 3 low
+}
+```
+
+For lwr(addr):
+```
+aligned = addr & ~3
+bo = addr & 3
+switch(bo) {
+  case 0: rt = (rt & 0xFFFFFF00) | (mem32(aligned) & 0x000000FF)  // 1 low byte from mem, keep 3 high
+  case 1: rt = (rt & 0xFFFF0000) | (mem32(aligned) & 0
+[tr-thinking call-0120:worker:xiaomi/mimo-v2.5-pro-ultraspeed] x0000FFFF)  // 2 low bytes from mem, keep 2 high
+  case 2: rt = (rt & 0xFF000000) | (mem32(aligned) & 0x00FFFFFF)  // 3 low bytes from mem, keep 1 high
+  case 3: rt = mem32(aligned)                                      // all 4 bytes
+}
+```
+
+This is what my new code does! Let me verify:
+- New lwl bo=0: mv (correct)
+- New lwl bo=1: (mv & 0xFFFFFF00) | (rt & 0xFF) - keep low byte of rt, get high 
+[tr-thinking call-0120:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 3 from mem (correct!)
+- New lwl bo=2: (mv & 0xFFFF0000) | (rt & 0xFFFF) - keep low 2 of rt, get high 2 from mem (correct!)
+- New lwl bo=3: (mv & 0xFF000000) | (rt & 0x00FFFFFF) - keep low 3 of rt, get high 1 from mem (correct!)
+
+And lwr:
+- New lwr bo=3: mv (correct)
+- New lwr bo=2: (rt & 0xFF000000) | (mv & 0x00FFFFFF) - keep high 
+[tr-thinking call-0120:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 1 of rt, get low 3 from mem (correct!)
+- New lwr bo=1: (rt & 0xFFFF0000) | (mv & 0x0000FFFF) - keep high 2 of rt, get low 2 from mem (correct!)
+- New lwr bo=0: (rt & 0xFFFFFF00) | (mv & 0x000000FF) - keep high 3 of rt, get low 1 from mem (correct!)
+
+Good, the LE lwl/lwr are now correct. And similarly for swl/swr.
+
+Now let me also
+[tr-thinking call-0120:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  verify swl and swr:
+
+swl(addr, rt) in LE:
+- bo=0: mem32(aligned) = rt (store all 4)
+- bo=1: mem32(aligned) = (rt & 0xFFFFFF00) | (old & 0x000000FF) - store high 3 bytes of rt to low 3 of mem, keep high byte of mem
+  Wait, that doesn't seem right either.
+
+Actually, for LE:
+swl stores bytes from the MSB side of the register to the aligned word starting from the byte at the aligned address.
+
+
+[tr-thinking call-0120:worker:xiaomi/mimo-v2.5-pro-ultraspeed] Hmm, let me think about this differently. In the MIPS manual:
+
+For LE mode:
+- swl: "stores the most significant part of the register to memory starting at the byte at the effective address and continuing to the right (higher addresses) through the end of the aligned word"
+
+Wait, in LE "right" means higher addresses, which means MORE significant bytes in memory.
+
+Actually, I think the convention in the MIPS manual for LE is:
+- swl(addr): stores bytes from the LEFT (MSB) end of rt into memory starting at addr, going towards the end of the word
+- swr(addr): stores bytes from the RIGHT (LSB) end of rt into memory starting at addr, going towards the beginning of the word
+
+
+[tr-thinking call-0120:worker:xiaomi/mimo-v2.5-pro-ultraspeed] For LE:
+swl at addr, byte offset bo:
+- bo=0: store all 4 bytes (full word)
+- bo=1: store 3 bytes from the HIGH portion of rt into mem[aligned], mem[aligned+1], mem[aligned+2], keep mem[aligned+3]
+  → mem32(aligned) = (old & 0xFF000000) | (rt >>> 8)
+  
+Hmm wait, that doesn't match my implementation either. Let me look at this more carefully.
+
+Actually, for MIPS LE:
+- Memory layout: [B0 B1 B2 B3] where B0 is at
+[tr-thinking call-0120:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  lowest address (aligned) and is the LSB
+- Register: rt = [b0 b1 b2 b3] where b0 is LSB, b3 is MSB
+
+swl (Store Word Left) at address addr with offset bo = addr & 3:
+- This stores bytes from the register starting at the "left" (highest) byte of the register
+- And stores them into memory starting at addr going rightward (higher addresses)
+
+For LE, "left" in the register means MSB (b3), and "right" in memory means higher address.
+
+swl at bo=1 (addr = aligned+1):
+- We
+[tr-thinking call-0120:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 're storing from addr to aligned+3 (3 bytes at higher addresses)
+- We take 3 bytes from the HIGH end of rt: b3, b2, b1
+- Store: mem[aligned+1] = b1, mem[aligned+2] = b2, mem[aligned+3] = b3
+- Keep mem[aligned+0] = old[7:0]
+
+In terms of the word view:
+- mem32(aligned) = (rt << 8) | (old & 0xFF)
+
+Wait, that's for BE. Let me think again for LE...
+
+In LE,
+[tr-thinking call-0120:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  mem32(aligned) byte layout is:
+- mem[aligned+0] = mem32[7:0]  (LSB)
+- mem[aligned+1] = mem32[15:8]
+- mem[aligned+2] = mem32[23:16]
+- mem[aligned+3] = mem32[31:24] (MSB)
+
+swl stores from the left (MSB) of the register to memory.
+- bo=0: Store all 4 bytes. mem32 = rt.
+- bo=1: Store 
+[tr-thinking call-0120:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 3 bytes starting at mem[aligned+1]. 
+  We want mem[1], mem[2], mem[3] to have the 3 most significant bytes of rt.
+  In LE, the 3 MSB bytes of rt are at rt[31:8].
+  mem32 = (rt << 8) ... wait no.
+
+  Actually, swl "left" in MIPS LE mode means the LSB bytes (because left = lower address = less significant in LE).
+
+OK I think I've been confusing myself. Let me look up the actual MIPS spec behavior for LE swl/swr.
+
+From the MIPS32 spec, for little-endian:
+- swl stores
+[tr-thinking call-0120:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  the bytes from the left (least significant) end of the register to memory
+- swr stores the bytes from the right (most significant) end of the register to memory
+
+So for swl at addr with bo = addr & 3:
+- bo=0: store all 4 bytes. mem32 = rt
+- bo=1: store 3 bytes. mem[aligned+0] is the left byte... wait.
+
+Actually, let me try a completely different approach. Let me look at the original code (which was written for BE MIPS) and see if my binary is for LE MIPS.
+
+The ELF header says "2's complement, little endian". So it IS LE MIPS.
+
+For LE MIPS sw
+[tr-thinking call-0120:worker:xiaomi/mimo-v2.5-pro-ultraspeed] l:
+bo=0: mem[aligned..aligned+3] = rt[7:0], rt[15:8], rt[23:16], rt[31:24] → this is a full word store, mem32 = rt
+bo=1: We store 3 bytes of rt starting from LSB (rt[7:0]) into mem[aligned..aligned+2]. Keep mem[aligned+3].
+  mem[aligned] = rt[7:0], mem[aligned+1] = rt[15:8], mem[aligned+2] = rt[23:16]
+  → mem32 = (old & 0xFF000000) | (rt & 0x
+[tr-thinking call-0120:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 00FFFFFF)
+
+Hmm, that doesn't match either of my implementations.
+
+Let me try yet another approach. Let me just test the actual behavior:
+
+For swl in LE MIPS with bo=0:
+  This stores all 4 bytes → mem32 = rt. (My new code: v → correct)
+
+For swl in LE MIPS with bo=1:
+  3 bytes stored: at aligned, aligned+1, aligned+2. We take LSB 3 bytes from rt.
+  mem32 = (old & 0xFF000000) | (rt & 0x00FFFFFF)
+  
+My
+[tr-thinking call-0120:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  new swl bo=1: (v & 0xFFFFFF00) | (old & 0xFF) 
+  This keeps high 3 bytes of v, low byte of old. That stores bytes at positions aligned+1,2,3. Not at positions 0,1,2.
+
+Hmm. I think my original code might have actually been more correct than my new code for LE. Let me re-examine.
+
+Actually, the issue is that the MIPS spec says different things for LE vs BE. My original code was implementing the LE behavior! Let me reconsider.
+
+For LE MIPS swl:
+The "left" byte is the byte at the lowest address, which in LE is the least significant byte.
+
+swl stores starting from the
+[tr-thinking call-0120:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  "left" (lowest address / LSB) of the register to the "right" (higher addresses) in memory, up to the end of the word.
+
+bo=0 (addr = aligned): store from LSB of rt rightward 4 bytes = full word
+bo=1 (addr = aligned+1): store from LSB of rt rightward 3 bytes → mem[1], mem[2], mem[3] = rt[7:0], rt[15:8], rt[23:16]
+  Keep mem[0]
+  mem32 = (rt << 8) | (old & 0xFF) ... wait that's BE.
+
+OK
+[tr-thinking call-0120:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  I'm going in circles. Let me look at this from the implementation perspective of the ORIGINAL code that was in the file and think about whether it was correct.
+
+Original swl (case 42):
+```
+w32(al, bo===0 ? v : bo===1 ? (old&0xFF000000|v&0x00FFFFFF)>>>0 : bo===2 ? (old&0xFFFF0000|v&0x0000FFFF)>>>0 : (old&0xFFFFFF00|v&0x000000FF)>>>0)
+```
+
+bo=0: store full word (v)
+[tr-thinking call-0120:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  ✓
+bo=1: keep MSB of old, store low 3 bytes of v → (old & 0xFF000000) | (v & 0x00FFFFFF) → writes bytes at positions 0,1,2
+bo=2: keep top 2 of old, store low 2 of v → (old & 0xFFFF0000) | (v & 0x0000FFFF) → writes bytes at positions 0,1
+bo=3: keep top 3 of old, store low 1 of v → (old & 0xFFFFFF00) | (v & 0x000000FF) → writes byte at position 0
+
+New swl (
+[tr-thinking call-0120:worker:xiaomi/mimo-v2.5-pro-ultraspeed] case 42):
+bo=0: store full word (v) ✓
+bo=1: keep LSB of old, store top 3 of v → (v & 0xFFFFFF00) | (old & 0xFF) → writes bytes at positions 1,2,3
+bo=2: keep bottom 2 of old, store top 2 of v → (v & 0xFFFF0000) | (old & 0xFFFF) → writes bytes at positions 2,3
+bo=3: keep bottom 3 of old, store top 1 of v → (v & 0xFF000000) | (old & 0x00FFFFFF) → writes byte at position 3
+
+Which is
+[tr-thinking call-0120:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  correct for LE? Let me check what the WAD reading code does. It probably uses a sequence like:
+```
+lwl $v0, offset($reg)
+lwr $v0, offset+3($reg)
+```
+
+For an unaligned read at address A (where A&3 != 0):
+lwl(A): loads the "left" part
+lwr(A+3): loads the "right" part
+
+These should combine to give the original 32-bit value.
+
+For LE, with address A having bo = A&3:
+
+The memory layout for an aligned word at `aligned = A & ~3`:
+Byte 0 (aligned+0): bits [7:0]  (
+[tr-thinking call-0120:worker:xiaomi/mimo-v2.5-pro-ultraspeed] LSB)
+Byte 1 (aligned+1): bits [15:8]
+Byte 2 (aligned+2): bits [23:16]
+Byte 3 (aligned+3): bits [31:24] (MSB)
+
+If we want to load a 32-bit value from unaligned address A:
+- The value spans from address A to address A+3
+- This may span two aligned words
+
+For a read that starts in one aligned word and ends in the next:
+lwl(A): loads from address A to the END of the aligned word
+lwr(A+3): loads
+[tr-thinking call-0120:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  from the START of the next aligned word to address A+3
+
+Wait, for lwr, the convention is different. lwr loads from the START of the word to the address.
+
+For LE:
+lwl(A) with bo=A&3:
+  Loads bytes at addresses A, A+1, ..., aligned+3 into the register
+  For bo=1: loads 3 bytes (aligned+1, aligned+2, aligned+3) into the HIGH portion of rt
+  For LE, high address = high significance, so these go into rt[31:8]
+  rt = (rt & 0x000000FF) | (mem_word & 0xFFFFFF00)
+[tr-thinking call-0120:worker:xiaomi/mimo-v2.5-pro-ultraspeed]   ← original code
+
+Hmm wait. For LE, mem_word stores:
+- mem[aligned] = bits[7:0]
+- mem[aligned+1] = bits[15:8]
+- mem[aligned+2] = bits[23:16]
+- mem[aligned+3] = bits[31:24]
+
+So mem_word = mem[aligned] | (mem[aligned+1]<<8) | (mem[aligned+2]<<16) | (mem[aligned+3]<<24)
+
+If we read the word at aligned, then mem_word & 0xFFFFFF00 = mem[aligned+1]<<8 | mem[aligned+2]<<16 | mem[
+[tr-thinking call-0120:worker:xiaomi/mimo-v2.5-pro-ultraspeed] aligned+3]<<24
+
+But lwl at bo=1 should load bytes from addresses aligned+1, aligned+2, aligned+3.
+These are the bytes that make up bits [31:8] of the word.
+So lwl should set rt[31:8] = mem_word[31:8], keep rt[7:0] unchanged.
+→ rt = (rt & 0x000000FF) | (mem_word & 0xFFFFFF00)
+
+That matches the ORIGINAL code! bo=1: (R[rt] & 0xFF000000) | (mv >>> 8) wait...
+
+Let me re-read the
+[tr-thinking call-0120:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  original code:
+```
+bo===1 ? (R[rt] & 0xFF000000 | mv >>> 8) >>> 0
+```
+This is: (R[rt] & 0xFF000000) | (mv >>> 8)
+
+That means: keep the top byte of rt, and put bits [31:8] of mv into the bottom 3 bytes.
+Result: rt[31:24] unchanged, rt[23:0] = mv[31:8]
+
+That's NOT what we want. We want:
+rt[7
+[tr-thinking call-0120:worker:xiaomi/mimo-v2.5-pro-ultraspeed] :0] unchanged, rt[31:8] = mv[31:8]
+= (rt & 0x000000FF) | (mv & 0xFFFFFF00)
+
+The original code does: (rt & 0xFF000000) | (mv >>> 8) which is (rt & 0xFF000000) | (mv[31:8] in low 24 bits). That doesn't match either.
+
+Hmm, maybe my understanding of LE lwl is wrong. Let me think about what the MIPS LE spec actually says...
+
+
+[tr-thinking call-0120:worker:xiaomi/mimo-v2.5-pro-ultraspeed] From the MIPS32 instruction set reference:
+
+For LE:
+lwl: 
+"Loads the contents of the most significant (left) byte of the word from the specified address, and the contents of the next 3 bytes to form a 32-bit word in a register."
+
+Wait, that says "most significant byte at the specified address". In LE, the byte at the lowest address is the LSB. So "most significant byte" at address A would be byte at address A, but in LE, byte at address A is the LSB... 
+
+OK, I think the MIPS LE manual means: the byte at address A is considered the "leftmost" byte being loaded. And
+[tr-thinking call-0120:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  it goes into the "left" (high) part of the register.
+
+Actually, I found a better reference. In MIPS LE:
+
+lwl loads bytes from memory starting at byte address `addr` through the highest byte of the aligned word (addr | 3). These bytes are placed starting at the lowest byte of the register and going up.
+
+So for lwl with bo=1 (addr = aligned+1):
+- Bytes loaded: mem[aligned+1], mem[aligned+2], mem[aligned+3] (3 bytes)
+- They go into the low 3 bytes of the register
+- So: rt =
+[tr-thinking call-0120:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  (rt & 0xFF000000) | (mv >> 8)
+
+Wait, that's the original code! Let me verify:
+mv = r32(aligned) = mem[0] | (mem[1]<<8) | (mem[2]<<16) | (mem[3]<<24) (LE)
+mv >> 8 = mem[1] | (mem[2]<<8) | (mem[3]<<16)  (sign extended, but >>> 0 fixes it)
+
+So rt[7:0] = mem[1] = mem[aligned+1]
+   rt[15:8] = mem[2] = mem[aligned+2]
+   rt[23:16] = mem[3] = mem[aligned+3]
+
+[tr-thinking call-0120:worker:xiaomi/mimo-v2.5-pro-ultraspeed]    rt[31:24] = unchanged
+
+That puts the 3 loaded bytes into the LOW 3 bytes of the register, keeping the HIGH byte. 
+
+For lwr at addr with bo=3 (addr = aligned+3 of previous word, or addr&~3 = aligned):
+- lwr loads from the lowest byte of the aligned word up to byte address `addr`
+- For bo=3: loads mem[aligned], mem[aligned+1], mem[aligned+2], mem[aligned+3] = all 4 bytes
+
+Wait that doesn't sound right. Let me look at the actual
+[tr-thinking call-0120:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  lwr definition for LE.
+
+lwr in LE:
+Loads bytes from the lowest byte of the aligned word through byte address `addr`. These are placed starting at the byte position in the register corresponding to the position of `addr`.
+
+For LE, lwr at addr with bo:
+- bo=0: loads 1 byte from mem[aligned]. This goes into the HIGH byte of rt.
+  rt = (rt & 0x00FFFFFF) | (mem[aligned] << 24) ← this puts it in the highest byte
+  
+  In my original code: bo=0: (R[rt] & 0x00FFFFFF | mv << 24) >>> 0
+  mv << 24 takes
+[tr-thinking call-0120:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  the LSB of mv (which is mem[aligned]) and puts it at bit 24-31.
+  So rt[31:24] = mem[aligned]. The rest is unchanged. ✓
+
+- bo=1: loads 2 bytes from mem[aligned], mem[aligned+1]. These go into the HIGH 2 bytes of rt.
+  rt = (rt & 0x0000FFFF) | (mv << 16)
+  
+  Original: bo=1: (R[rt] & 0x0000FFFF | mv << 16) >>> 0
+  mv << 16 takes the
+[tr-thinking call-0120:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  low 2 bytes of mv and shifts them up.
+  So rt[31:16] = mv[15:0] = mem[aligned] | (mem[aligned+1]<<8). ✓
+
+So the ORIGINAL code was correct for LE MIPS! My "fix" was wrong!
+
+Let me also verify swl for LE:
+
+swl stores bytes starting from the lowest byte of the register to memory, starting at the byte address, going to the end of the aligned word.
+
+swl at addr, bo:
+- bo=0: stores all 4 bytes (full word)
+- bo=1: stores 3 bytes: rt[7:0]
+[tr-thinking call-0120:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  → mem[aligned+1], rt[15:8] → mem[aligned+2], rt[23:16] → mem[aligned+3]
+  mem[aligned] is unchanged.
+  
+  In word terms: mem32(aligned) = (old & 0xFF000000) | (rt >>> 8)
+  
+  Wait, no. In LE:
+  mem_word = mem[0] | mem[1]<<8 | mem[2]<<16 | mem[3]<<24
+  
+  After storing rt[7:0] → mem[1], rt[15:8] → mem[2], rt[23:16] → mem[3]:
+  mem_word = mem[0] | rt
+[tr-thinking call-0120:worker:xiaomi/mimo-v2.5-pro-ultraspeed] [7:0]<<8 | rt[15:8]<<16 | rt[23:16]<<24
+  = (old & 0x000000FF) | ((rt & 0x00FFFFFF) << 8)
+  
+  Hmm that doesn't match either my old or new code.
+
+Wait, let me reconsider. Actually in MIPS LE, swl stores from the register starting at the byte corresponding to the effective address, NOT from the LSB of the register.
+
+OK I think the confusion is that different sources define "left" differently for LE. Let me just
+[tr-thinking call-0120:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  look at the actual behavior by checking what the WAD reading code expects.
+
+Actually, you know what, let me just test empirically. Let me look at how the WAD reading code uses lwl/lwr and see what produces the correct result.
+
+Looking at the disassembly at 0x437fc0 area (W_ReadLump and nearby), I see that the binary was compiled with the original MIPS LE compiler. The lwl/lwr instructions were generated by the compiler and are expected to work according to MIPS LE spec.
+
+For MIPS LE (which my original code was implementing):
+- lwl: loads bytes from the effective address to the end
+[tr-thinking call-0120:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  of the word, placing them in the LOW portion of the register
+- lwr: loads bytes from the start of the word to the effective address, placing them in the HIGH portion of the register
+
+The ORIGINAL code was:
+lwl (case 34):
+  bo=0: mv (full word)
+  bo=1: (rt & 0xFF000000) | (mv >>> 8) - keep high byte, take bytes 1-3 from mem
+  bo=2: (rt & 0xFFFF0000) | (mv >>> 16) - keep high 2, take bytes 2-3 from mem
+[tr-thinking call-0120:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 
+  bo=3: (rt & 0xFFFFFF00) | (mv >>> 24) - keep high 3, take byte 3 from mem
+
+lwr (case 38):
+  bo=0: (rt & 0x00FFFFFF) | (mv << 24) - keep low 3, take byte 0 from mem
+  bo=1: (rt & 0x0000FFFF) | (mv << 16) - keep low 2, take bytes 0-1
+  bo=2: (rt & 0x000000FF) | (mv << 8) - keep low 1, take bytes 0-2
+  bo=3: mv (full word)
+
+Let me verify with
+[tr-thinking call-0120:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  a concrete example. Suppose we have the value 0x12345678 at unaligned address A=0x1001 (bo=1).
+
+In LE memory:
+  mem[0x1000] = 0x78 (previous word or garbage)
+  mem[0x1001] = 0x12
+  mem[0x1002] = 0x34
+  mem[0x1003] = 0x56
+  mem[0x1004] = 0x78 (next word...
+[tr-thinking call-0120:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  wait that's the value we want)
+
+Actually, the value 0x12345678 is at address 0x1001-0x1004:
+  mem[0x1001] = 0x12 (LSB of the value... wait)
+
+In LE, the LSB is at the lowest address:
+  mem[0x1001] = 0x78 (LSB)
+  mem[0x1002] = 0x56
+  mem[0x1003] = 0x34
+  mem[0x1004] = 0x12 (MSB)
+
+Now lwl(
+[tr-thinking call-0120:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 0x1001): aligned = 0x1000, bo=1
+mv = r32(0x1000) = mem[0x1000] | mem[0x1001]<<8 | mem[0x1002]<<16 | mem[0x1003]<<24
+   = XX | 0x78<<8 | 0x56<<16 | 0x34<<24
+   = XX | 0x7800 | 0x560000 | 0x34000000
+
+[tr-thinking call-0120:worker:xiaomi/mimo-v2.5-pro-ultraspeed]    = 0x345678XX (where XX = mem[0x1000])
+
+lwl bo=1 (original): (rt & 0xFF000000) | (mv >>> 8) = (rt & 0xFF000000) | 0x00345678
+Since rt was 0 initially: rt = 0x00345678
+
+That puts 0x78 at bits 7:0, 0x56 at bits 15:8, 0x34 at bits 23:16. That's the LSB
+[tr-thinking call-0120:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  bytes. ✓
+
+Now lwr(0x1004): aligned = 0x1004, bo=3 (since 0x1004 & 3 = 0, wait)
+
+Actually wait. lwl and lwr are typically used as a pair:
+lwl $v0, 3($t0)   # $t0 = 0x1001
+lwr $v0, 0($t0)   # $t0 = 0x1001
+
+No wait, the standard pairing is:
+lwl $reg, offset($base)
+lwr $reg, offset+3($base)
+
+For loading from
+[tr-thinking call-0120:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  address 0x1001:
+lwl $v0, 0($t0)   # loads from 0x1001 to end of word (0x1003)
+lwr $v0, 3($t0)   # loads from start of word containing 0x1004 to 0x1004
+
+lwl(0x1001): bo=1 (as computed above) → rt = 0x00345678
+lwr(0x1004): aligned = 0x1004, bo=0 (0x1004 & 3 = 0)
+mv = r32(0x
+[tr-thinking call-0120:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 1004) = mem[0x1004] | mem[0x1005]<<8 | mem[0x1006]<<16 | mem[0x1007]<<24
+   = 0x12 | ... 
+   
+lwr bo=0: (rt & 0x00FFFFFF) | (mv << 24) = (0x00345678 & 0x00FFFFFF) | (0x12 << 24)
+         = 0x00345678 | 0x120
+[tr-thinking call-0120:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 00000
+         = 0x12345678 ✓✓✓
+
+The ORIGINAL code was CORRECT! I need to revert my changes!
+
+The problem must be elsewhere. The Z_Malloc size of 0xf4000000 must be coming from a different bug.
+
+Let me revert the lwl/lwr/swl/swr changes and look elsewhere for the bug.
+
+Actually wait, the very first bad allocation has ra=0x4380ac which is inside W_CacheLumpNum. The size is loaded from lumpinfo[i].size at offset 20 (
+[tr-thinking call-0120:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 0x14). Let me trace back how that gets set.
+
+Actually, let me think about this differently. The first bad allocation has size 0xf4000000 = -201326592 (signed). This is the very FIRST call to Z_Malloc during R_Init. It's called from W_CacheLumpNum at 0x4380a4.
+
+W_CacheLumpNum loads:
+```
+43800c: sll at,s1,2     # at = lump_num * 4
+438010: sll v0,s1,5     # v0 = lump_num * 32
+438014: subu s3,v0,at   # s3 = lump_num
+[tr-thinking call-0120:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  * 28
+43801c: lw v0,1476(at)  # v0 = lumpinfo pointer
+438020: addu v1,v0,s3   # v1 = lumpinfo[lump_num]
+438024: lw at,8(v1)     # at = lumpinfo[lump_num].cache (offset 8)
+438028: lw a0,4(at)     # a0 = cache->user (offset 4)
+43802c: beqz a0,438040  # if no user, jump to unc
+[tr-thinking call-0120:worker:xiaomi/mimo-v2.5-pro-ultraspeed] ached path
+```
+
+The uncached path (0x438040):
+```
+438040: lw s2,20(v1)    # s2 = lumpinfo[lump_num].size (offset 20)
+```
+
+So lumpinfo struct has size at offset 20. The lumpinfo array stride is 28 bytes (sll 5 - sll 2 = 32-4=28).
+
+The question is: is lumpinfo populated correctly? W_Init reads the WAD directory and populates lumpinfo. If the lwl/lwr are
+[tr-thinking call-0120:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  correct, then the WAD directory should be read correctly. But the binary doesn't USE lwl/lwr for the WAD directory - it uses regular lw which requires aligned access. Let me check if W_Init uses any unaligned access patterns.
+
+Actually, the real question is: what reads the WAD header/directory? Let me check W_AddFile in the binary. This function reads the WAD header (4 bytes: identification, 4 bytes: numlumps, 4 bytes: infotableofs) and then reads the directory entries.
+
+For a standard DOOM WAD:
+Header: "IWAD" (4 bytes), numlumps (4 bytes LE), infotableofs (4 bytes
+[tr-thinking call-0120:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  LE)
+Each directory entry: filepos (4 bytes), size (4 bytes), name (8 bytes) = 16 bytes
+
+The header is read at the start of the file. The directory is at infotableofs.
+
+The binary opens the file, reads the header with read(), then lseeks to infotableofs and reads all directory entries.
+
+Since these are all aligned 4-byte reads (the directory is read into a contiguous array), lw should work fine. Unless... there's a bug in read() or lseek().
+
+Actually, let me check: does the binary use the original W_AddFile from the
+[tr-thinking call-0120:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  DOOM source? Let me check.
+
+Actually, I already saw the symbols. Let me check W_AddFile.
+[tr-stream call-0120:worker:xiaomi/mimo-v2.5-pro-ultraspeed] Good, the lwl/lwr/swl/swr replacements were successful and syntax is OK. Let me also remove the Z_Malloc trace and test:
+
+{
+  "analysis": "All lwl/lwr/swl/swr instructions were replaced with correct LE implementations. Need to remove the Z_Malloc trace and test. But wait - I need to reconsider whether the original lwl/lwr code was actually correct for LE MIPS. Let me verify by testing both versions.",
+  "plan": "Actually, let me revert the lwl/lwr changes since they may have been correct for LE, and instead trace
+[tr-stream call-0120:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  the actual data corruption.",
+  "commands": [
+    {
+      "keystrokes": "python3 << 'PYEOF'\nwith open('/app/vm.js','r') as f: c=f.read()\n# Add better trace: log read syscall results for fd pointing to doom.wad\nc = c.replace(\n    \"case 0: { const e = FD.get(a0); if (!e || e.t === 's')\",\n    \"case 0: { const e = FD.get(a0); if (e && e.t === 'f' && e.pos < 16) { console.error('read fd='+a0+' pos='+e.pos+' sz='+a2+' hostpos
+[tr-stream call-0120:worker:xiaomi/mimo-v2.5-pro-ultraspeed] ='+e.p); } if (!e || e.t === 's')\"\n)\nc = c.replace(\n    \"case 8: { const e = FD.get(a0); if (!e || e.t !== 'f')\",\n    \"case 8: { const e = FD.get(a0); if (e && e.t === 'f' && e.pos < 100) { console.error('lseek fd='+a0+' off='+((a1<<0)>>0)+' wh='+a2); } if (!e || e.t !== 'f')\"\n)\nwith open('/app/vm.js','w') as f: f.write(c)\
+[tr-stream call-0120:worker:xiaomi/mimo-v2.5-pro-ultraspeed] nprint('Added trace')\nPYEOF\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "node -c /app/vm.js && echo OK\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "timeout 15 node vm.js 2>&1 | grep -E 'read fd=|lseek fd=|Z_Malloc' | head -20\n",
+      "duration": 20.0
+    }
+  ]
+}
+
+[tr-stream call-0120:worker:xiaomi/mimo-v2.5-pro-ultraspeed] worker.done finish=stop cost_microdollars=307796
+[tr-stream call-0120:xiaomi/mimo-v2.5-pro-ultraspeed] Good, the lwl/lwr/swl/swr replacements were successful and syntax is OK. Let me also remove the Z_Malloc trace and test:
+
+{
+  "analysis": "All lwl/lwr/swl/swr instructions were replaced with correct LE implementations. Need to remove the Z_Malloc trace and test. But wait - I need to reconsider whether the original lwl/lwr code was actually correct for LE MIPS. Let me verify by testing both versions.",
+  "plan": "Actually, let me revert the lwl/lwr changes since they may have been correct for LE, and instead trace the actual data corruption.",
+  "commands": [
+    {
+      "keystrokes": "python3 << 'PYEOF'\nwith open('/app/vm.js','r') as f: c=f.read()\n# Add better trace: log read syscall results for fd pointing to doom.wad\nc = c.replace(\n    \"case 0: { const e = FD.get(a0); if (!e || e.t === 's')\",\n    \"case 0: { const e = FD.get(a0); if (e && e.t === 'f' && e.pos < 16) { console.error('read fd='+a0+' pos='+e.pos+' sz='+a2+' hostpos='+e.p); } if (!e || e.t === 's')\"\n)\nc = c.replace(\n    \"case 8: { const e = FD.get(a0); if (!e || e.t !== 'f')\",\n    \"case 8: { const e = FD.get(a0); if (e && e.t === 'f' && e.pos < 100) { console.error('lseek fd='+a0+' off='+((a1<<0)>>0)+' wh='+a2); } if (!e || e.t !== 'f')\"\n)\nwith open('/app/vm.js','w') as f: f.write(c)\nprint('Added trace')\nPYEOF\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "node -c /app/vm.js && echo OK\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "timeout 15 node vm.js 2>&1 | grep -E 'read fd=|lseek fd=|Z_Malloc' | head -20\n",
+      "duration": 20.0
+    }
+  ]
+}

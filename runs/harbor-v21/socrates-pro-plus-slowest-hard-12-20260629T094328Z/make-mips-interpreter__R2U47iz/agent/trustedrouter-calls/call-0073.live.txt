@@ -1,0 +1,330 @@
+
+[tr-stream call-0073:socrates:trustedrouter/socrates-pro-plus-1.0] socrates.started
+
+[tr-stream call-0073:worker:xiaomi/mimo-v2.5-pro-ultraspeed] worker.started
+[tr-thinking call-0073:worker:xiaomi/mimo-v2.5-pro-ultraspeed] The corrupted Z_Malloc allocation size of 420303204 bytes is suspicious. Let me trace through what's happening. The binary is compiled with DOOMGENERIC_RESX=640 and DOOMGENERIC_RESY=400. 
+
+The R_Init function calls R_InitLightTables which does math involving SCREENWIDTH and scale values. The Z_Malloc failure suggests that a multiplication is producing wrong results.
+
+Let me look more carefully at what's happening. The corrupted value 420303204 (0x190D2E24) is suspicious. Let me think
+[tr-thinking call-0073:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  about this...
+
+Actually, let me look at the R_Init code path more carefully. The issue might be in my multiply implementation. Let me test some basic multiply operations to verify correctness.
+
+Actually, the real issue might be simpler - I have a bug in the wsbh (byte swap halfword) instruction. Looking at my code:
+
+```
+else if(sh===2)R[rd]=(((R[rt]&0xFF00FF)<<8)|((R[rt]&0xFF00FF00)>>>8))>>>0;
+```
+
+The mask should be 0x00FF00FF not 0xFF00FF! This is 0x00FF00FF which I
+[tr-thinking call-0073:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  wrote as 0xFF00FF. Wait, let me check:
+- 0xFF00FF = 0x00FF00FF? No! 0xFF00FF = 16711935 while 0x00FF00FF = 16711935. Actually they're the same! 0xFF00FF = 0x00FF00FF. OK that's fine.
+
+Wait, but what about the 32-bit wsbh operation? The correct behavior for wsbh is to swap bytes within each halfword:
+- Input
+[tr-thinking call-0073:worker:xiaomi/mimo-v2.5-pro-ultraspeed] : B3 B2 B1 B0
+- Output: B2 B3 B0 B1
+
+So: ((val & 0x00FF00FF) << 8) | ((val & 0xFF00FF00) >>> 8)
+
+That looks correct.
+
+Let me look at the umul function more carefully. The issue might be in the carry detection:
+
+```javascript
+function um(a,b){
+  const aL=a&0xFFFF,aH=a>>>16,bL=b&0xFFFF,bH=b>>>16;
+  p0=aL*bL,p1=aL*bH,p2=aH*bL,p3=aH*bH
+[tr-thinking call-0073:worker:xiaomi/mimo-v2.5-pro-ultraspeed] ;
+  return[
+    (p0+((p1&0xFFFF)<<16)+((p2&0xFFFF)<<16))>>>0,
+    (p3+(p1>>>16)+(p2>>>16)+(((p0>>>0)+(((p1&0xFFFF)<<16)>>>0)+(((p2&0xFFFF)<<16)>>>0))>=4294967296?1:0))>>>0
+  ]
+}
+```
+
+Wait, there's a problem here. The carry detection uses `>=4294967296` but JavaScript numbers are doubles.
+[tr-thinking call-0073:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  When `(p0>>>0) + (((p1&0xFFFF)<<16)>>>0) + (((p2&0xFFFF)<<16)>>>0)` is computed, each value can be up to ~4.29 billion, and the sum of three such values can be up to ~12.9 billion, which is still representable exactly in a double (up to 2^53). So the carry check should work.
+
+But wait, `p0` is not `>>>0`. `p0 = aL*bL` where aL and bL are both up to 0xFFFF, so p0 can be up to 6
+[tr-thinking call-0073:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 5535*65535 = 4294836225, which fits in a double exactly. But `p0>>>0` converts to unsigned. That should be fine.
+
+Actually, I think the issue might be that `p0`, `p1`, `p2` are not explicitly converted to unsigned. Let me check: `aL*bL` where both are up to 0xFFFF (65535). 65535*65535 = 4294836225. This fits in a JS number. `(4294836225)>>>0`
+[tr-thinking call-0073:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  = 4294836225. OK that's fine.
+
+What about `p1&0xFFFF`? p1 can be up to 65535*65535 = 4294836225. `4294836225 & 0xFFFF = 65025`. Then `65025 << 16 = 4260741120`. And `4260741120 >>> 0 = 4260741120`. OK that should
+[tr-thinking call-0073:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  be fine.
+
+Hmm, let me think about this differently. The actual bug might not be in the multiply but elsewhere. Let me look at what R_Init does.
+
+Actually, let me focus on fixing the most likely issues:
+1. The madd/maddu instructions seem wrong
+2. Memory position could overflow on large reads
+
+Let me think about what allocation of 420303204 could mean. In hex: 420303204 = 0x190D2184. That's very large. What if the multiply in R_Init is computing a wrong scale value?
+
+Let me trace
+[tr-thinking call-0073:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  through the R_Init code. But first, let me check if the smul function is correct by testing a simple case.
+
+Actually, maybe the problem is simpler. Let me check: when the binary calls `Z_Malloc(size, PU_STATIC, NULL)`, the size is computed at runtime. If the multiply is wrong, the size could be corrupted.
+
+Let me add some debugging to the Z_Malloc call to see what's happening. Actually, let me just fix the known potential issues and try again.
+
+Wait - I notice the madd/maddu implementation seems wrong. Let me re-examine:
+
+```
+case 0:{const r=sm(R[rs]|0,R[rt]|0);const a=BigInt(hi>>>0)*0x100000000n+BigInt(lo>>>0)+BigInt(r[
+[tr-thinking call-0073:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 1])*0x100000000n+BigInt(r[0]);
+  const acc=a&0xFFFFFFFFFFFFFFFFn;lo=Number(acc&0xFFFFFFFFn)>>>0;hi=Number(acc>>32n)>>>0;break}
+```
+
+Wait, I'm using `sm()` (my custom function) to compute the product, then converting to BigInt. But `sm()` returns a [lo, hi] pair. Then I add BigInt(r[1])*0x100000000n + BigInt(r[0]). This should be the product. Then I add it to (BigInt(hi)*0x100000000n + BigInt(lo))
+[tr-thinking call-0073:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  which is the accumulator. This seems correct but complex.
+
+Actually, it would be simpler to just use BigInt for madd/maddu:
+```
+case 0: { // madd
+  const r = BigInt(R[rs]|0) * BigInt(R[rt]|0);
+  let acc = (BigInt(hi>>>0) << 32n) | BigInt(lo>>>0);
+  acc = (acc + r) & 0xFFFFFFFFFFFFFFFFn;
+  lo = Number(acc & 0xFFFFFFFFn) >>> 0;
+  hi = Number(acc >> 32n) >>> 0;
+  break;
+}
+```
+
+
+[tr-thinking call-0073:worker:xiaomi/mimo-v2.5-pro-ultraspeed] This is what I had in a previous version. Let me also check if the issue might be in Z_Malloc itself. The corrupted size of 420303204 bytes - let me see if this is a consistent value or changes between runs.
+
+Actually, let me focus on finding the real bug. Let me add debugging around Z_Malloc to print the actual arguments.
+
+Actually, a simpler approach: let me add a print to the syscall that outputs what's happening, or better yet, intercept Z_Malloc. Z_Malloc is at 0x43856c. Let me add a breakpoint there.
+
+Let me just fix the
+[tr-thinking call-0073:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  potential issues I can see and test. The main suspects are:
+1. The `um` function might have issues with the carry bit
+2. The madd/maddu with BigInt mixing
+3. Some issue with sign extension
+
+Let me simplify and use BigInt everywhere for multiply operations, which is guaranteed correct.
+
+Also, I notice my madd implementation might be wrong because I'm using sm() which has the potential carry bug. Let me just use BigInt for all multiply operations.
+
+Wait, actually let me re-read the error more carefully. The allocation that fails is at R_Init. Let me look at what R_Init actually allocates:
+
+From the source: `R_InitLight
+[tr-thinking call-0073:worker:xiaomi/mimo-v2.5-pro-ultraspeed] Tables` does `Z_Malloc(MAXLIGHTZ * LIGHTLEVELS, PU_LEVEL, 0)`. The values are:
+- LIGHTLEVELS = 16
+- MAXLIGHTZ = 128
+- So this is 16*128 = 2048 bytes
+
+But the error says 420303204 bytes. That's way too big. So the multiplication is wrong.
+
+Let me check: `Z_Malloc(size, PU_LEVEL, 0)` - the size is passed in $a0, tag in $a1, user in $a2.
+
+Looking at Z_Malloc, it's at 
+[tr-thinking call-0073:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 0x43856c. Let me see what it does.
+
+Actually, the simpler approach is: let me add a trap when a Z_Malloc call happens with a suspiciously large size, and trace back to see what register holds the bad value.
+
+Actually, let me think about what could cause 420303204. In hex: 420303204 = 0x190D2184. 
+
+MAXLIGHTZ * LIGHTLEVELS should be 128 * 16 = 2048. 
+
+What if the multiply is producing 0x190D2184 instead? Let me think about
+[tr-thinking call-0073:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  what inputs could produce this...
+
+Actually, it's not necessarily MAXLIGHTZ * LIGHTLEVELS. It could be a different allocation. Let me check what R_Init actually calls:
+
+```c
+void R_Init (void)
+{
+    R_InitData ();
+    R_InitPointToAngle ();
+    R_InitTables ();
+    // R_SetViewSize sets things like screenblocks, detailshift, etc.
+    R_SetViewSize (screenblocks, detailLevel);
+}
+```
+
+And R_SetViewSize:
+```c
+void R_ExecuteSetViewSize (void)
+{
+    ...
+    Z_Malloc(MAXLIGHTZ * LIGHTLEVELS, PU_LEVEL, 0);
+    ...
+}
+```
+
+Actually, R_InitLight
+[tr-thinking call-0073:worker:xiaomi/mimo-v2.5-pro-ultraspeed] Tables is called from R_ExecuteSetViewSize. Let me look at it more carefully:
+
+```c
+void R_InitLightTables (void)
+{
+    int		i;
+    int		j;
+    int		level;
+    int		startmap; 	
+    int		scale;
+	
+    // Calculate the light levels to use
+    //  for each level / distance combination.
+    for (i=0 ; i< LIGHTLEVELS ; i++)
+    {
+	startmap = ((LIGHTLEVELS-1-i)*2)*NUMCOLORMAPS/LIGHTLEVELS;
+	for (j=0 ; j<MAXLIGHTZ ; j++)
+	{
+	    scale = FixedDiv ((SCREENWIDTH/2*FRACUNIT), (j+1)<<LIGHTZSHIFT);
+	    scale >>= LIGHT
+[tr-thinking call-0073:worker:xiaomi/mimo-v2.5-pro-ultraspeed] SCALESHIFT;
+	    level = startmap - scale/DISTMAP;
+	    if (level < 0)
+		level = 0;
+	    if (level >= NUMCOLORMAPS)
+		level = NUMCOLORMAPS-1;
+	    ...		
+    }
+}
+```
+
+And R_ExecuteSetViewSize:
+```c
+void R_ExecuteSetViewSize (void)
+{
+    int		i;
+    int		t;
+    fixed_t	cosadj;
+    fixed_t	ds;
+    fixed_t	delta;
+    int		lightlevel;
+
+    setsizeneeded = false;
+
+    if (setblocks == 10)
+    {
+	scaledviewwidth = SCREENWIDTH;
+	viewheight = SCREENHEIGHT;
+    }
+    ...
+
+    R_InitBuffer (
+[tr-thinking call-0073:worker:xiaomi/mimo-v2.5-pro-ultraspeed] scaledviewwidth, viewheight);
+    R_InitTextureMapping ();
+    
+    // psprite scale and step
+    pspritescale = FRACUNIT*viewwidth/SCREENWIDTH;
+    pspriteiscale = FRACUNIT*SCREENWIDTH/viewwidth;
+    
+    // column clipping
+    for (i=0 ; i<viewwidth ; i++)
+    {
+        ...screenheightarray[i] = viewheight;
+    }
+
+    // planes
+    ...
+    
+    R_InitLightTables ();
+    ...
+```
+
+Hmm, let me check what FixedDiv does. It probably does a 64-bit divide. If my mult/div implementation is wrong, this could produce bad results.
+
+Actually, Fixed
+[tr-thinking call-0073:worker:xiaomi/mimo-v2.5-pro-ultraspeed] Div is:
+```c
+fixed_t FixedDiv(fixed_t a, fixed_t b)
+{
+    if ((abs(a) >> 14) >= abs(b))
+        return (a ^ b) < 0 ? MININT : MAXINT;
+    return FixedDiv2(a, b);
+}
+```
+
+And FixedDiv2 is probably:
+```asm
+// 64-bit division
+```
+
+Let me think about this differently. The allocation failure shows `420303204 bytes`. But which allocation in R_ExecuteSetViewSize is this?
+
+Wait - there are multiple Z_Malloc calls in R_ExecuteSetViewSize. The
+[tr-thinking call-0073:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  issue could be in the scaletable allocation. But the specific number 420303204 suggests a multiplication went wrong.
+
+Let me just focus on making the multiply correct. My umul function seems complex and error-prone. Let me replace it with BigInt-based multiply throughout.
+
+Actually, I have a better idea. Let me just add a breakpoint at Z_Malloc (0x43856c) to print the arguments and trace the issue.
+
+Actually wait - the simplest fix might be to check whether my mul functions produce correct results. Let me write a quick test:
+
+umul(128, 16) should be
+[tr-thinking call-0073:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  [2048, 0]
+umul(65535, 65535) should be [4294836225, 0]
+umul(65536, 65536) should be [0, 1]
+
+Let me test these...
+
+Actually, let me just replace the mul implementations with BigInt ones and see if that fixes things. BigInt is slower but guaranteed correct.
+
+Let me write a clean version.
+[tr-stream call-0073:worker:xiaomi/mimo-v2.5-pro-ultraspeed] {
+  "analysis": "The Z_Malloc allocation failure with corrupted size 420303204 bytes indicates a
+[tr-stream call-0073:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  multiply bug. My custom umul/smul functions likely have an edge case. Let me replace them with BigInt-based multiply which is guaranteed correct, and also fix a potential wsbh mask issue.",
+  "plan": "Replace umul/smul with simple BigInt multiply, fix wsbh mask, and test.",
+  "commands": [
+    {
+      "keystrokes": "sed -i 's/function um(a,b){.*}/function um(a,b){const r=BigInt(a>>>0)*BigInt(b>>>0);return[Number(r&0xFFFFFFFFn)>>>0,Number(r>>32n)>>>0]}/' /app/vm.js\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "sed -i 's/function sm(a,b
+[tr-stream call-0073:worker:xiaomi/mimo-v2.5-pro-ultraspeed] ){.*}/function sm(a,b){const r=BigInt(a|0)*BigInt(b|0);return[Number(r&0xFFFFFFFFn)>>>0,Number((r>>32n)&0xFFFFFFFFn)>>>0]}/' /app/vm.js\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "sed -i 's/case 24:{const r=sm(R\\[rs\\]|0,R\\[rt\\]|0);lo=r\\[0\\];hi=r\\[1\\];break}/case 24:{const r=BigInt(R[rs]|0)*BigInt(R[rt]|0);lo=Number(r&0xFFFFFFFFn)>>>
+[tr-stream call-0073:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 0;hi=Number((r>>32n)&0xFFFFFFFFn)>>>0;break}/' /app/vm.js\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "sed -i 's/case 25:{const r=um(R\\[rs\\],R\\[rt\\]);lo=r\\[0\\];hi=r\\[1\\];break}/case 25:{const r=BigInt(R[rs]>>>0)*BigInt(R[rt]>>>0);lo=Number(r&0xFFFFFFFFn)>>>0;hi=Number((r>>32n)&0xFFFFFFFFn)>>>0;break}/' /app/vm.js\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "grep 'case 24:\\
+[tr-stream call-0073:worker:xiaomi/mimo-v2.5-pro-ultraspeed] |case 25:\\|function um\\|function sm' /app/vm.js\n",
+      "duration": 0.1
+    }
+  ]
+}
+
+[tr-stream call-0073:worker:xiaomi/mimo-v2.5-pro-ultraspeed] worker.done finish=stop cost_microdollars=182349
+[tr-stream call-0073:xiaomi/mimo-v2.5-pro-ultraspeed] {
+  "analysis": "The Z_Malloc allocation failure with corrupted size 420303204 bytes indicates a multiply bug. My custom umul/smul functions likely have an edge case. Let me replace them with BigInt-based multiply which is guaranteed correct, and also fix a potential wsbh mask issue.",
+  "plan": "Replace umul/smul with simple BigInt multiply, fix wsbh mask, and test.",
+  "commands": [
+    {
+      "keystrokes": "sed -i 's/function um(a,b){.*}/function um(a,b){const r=BigInt(a>>>0)*BigInt(b>>>0);return[Number(r&0xFFFFFFFFn)>>>0,Number(r>>32n)>>>0]}/' /app/vm.js\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "sed -i 's/function sm(a,b){.*}/function sm(a,b){const r=BigInt(a|0)*BigInt(b|0);return[Number(r&0xFFFFFFFFn)>>>0,Number((r>>32n)&0xFFFFFFFFn)>>>0]}/' /app/vm.js\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "sed -i 's/case 24:{const r=sm(R\\[rs\\]|0,R\\[rt\\]|0);lo=r\\[0\\];hi=r\\[1\\];break}/case 24:{const r=BigInt(R[rs]|0)*BigInt(R[rt]|0);lo=Number(r&0xFFFFFFFFn)>>>0;hi=Number((r>>32n)&0xFFFFFFFFn)>>>0;break}/' /app/vm.js\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "sed -i 's/case 25:{const r=um(R\\[rs\\],R\\[rt\\]);lo=r\\[0\\];hi=r\\[1\\];break}/case 25:{const r=BigInt(R[rs]>>>0)*BigInt(R[rt]>>>0);lo=Number(r&0xFFFFFFFFn)>>>0;hi=Number((r>>32n)&0xFFFFFFFFn)>>>0;break}/' /app/vm.js\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "grep 'case 24:\\|case 25:\\|function um\\|function sm' /app/vm.js\n",
+      "duration": 0.1
+    }
+  ]
+}

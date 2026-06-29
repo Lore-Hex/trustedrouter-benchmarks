@@ -1,0 +1,615 @@
+
+[tr-stream call-0014:socrates:trustedrouter/socrates-pro-plus-1.0] socrates.started
+
+[tr-stream call-0014:worker:xiaomi/mimo-v2.5-pro-ultraspeed] worker.started
+[tr-thinking call-0014:worker:xiaomi/mimo-v2.5-pro-ultraspeed] Let me carefully analyze the pool_sweep code to find the bug. The run-length compression scheme works as follows:
+
+1. Free blocks have a header where `Wosize` encodes the number of *additional* contiguous free blocks that follow (so a value of 0 means just this one free block, 1 means this block plus one more, etc.)
+2. The first field (index 1) of a free block points to the next free block beyond the contiguous run
+3. When allocating, if `Wosize_hp(p) > 0`, the next block gets `POOL_FREE_HEADER(Wosize_hp
+[tr-thinking call-0014:worker:xiaomi/mimo-v2.5-pro-ultraspeed] (p) - 1)` and copies the next pointer
+
+Now let me trace through the sweep code carefully:
+
+In pool_sweep, when we encounter a free block (either existing or freshly freed garbage):
+
+```c
+if (POOL_BLOCK_FREE_HD(hd)) {
+    all_used = 0;
+    if (last_free_block) {
+        // merge check
+        if (last_free_block + (1 + Wosize_hp(last_free_block)) * wh == p) {
+            // merge: increase the run count
+            *last_free_block = POOL_FREE_HEADER(Wosize_hp(last_free_block) + Wosize_hd(hd) + 1);
+        } else {
+            // not adjacent, link via next pointer
+            last_free_block[
+[tr-thinking call-0014:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 1] = (value)p;
+            last_free_block = p;
+        }
+    } else {
+        // first free block
+        a->next_obj = (value*)p;
+        last_free_block = p;
+    }
+    /* add the free blocks following this block, skipping over them */
+    p += wh * Wosize_hd(hd);
+} else {
+    release_to_global_pool = 0;
+}
+p += Whsize_hd(hd);   // Wait... this should be p += wh
+```
+
+Wait, let me look at this more carefully. After the if/else block for free/live blocks, we have:
+```c
+p += Whsize_hd(hd);
+```
+
+Hmm, but `hd` at this point...
+[tr-thinking call-0014:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  Let me trace through carefully.
+
+When a block is garbage:
+1. hd is loaded
+2. It's garbage, so we convert it to a free block: `*p = POOL_FREE_HEADER(0)`
+3. Then we reload hd: `hd = POOL_FREE_HEADER(0)`
+4. Then we enter the `if (POOL_BLOCK_FREE_HD(hd))` branch
+5. At the end: `p += wh * Wosize_hd(hd)` — this adds 0 since Wosize is 0, so we skip 0 additional blocks. Good.
+6. Then: `p += Whsize_hd(hd)` — But wait, Whsize_hd(POOL_FREE_HEADER(0))!
+
+
+[tr-thinking call-0014:worker:xiaomi/mimo-v2.5-pro-ultraspeed] Let me think about this. `POOL_FREE_HEADER(wosize)` is `Make_header(wosize, No_scan_tag, NOT_MARKABLE)`. So `Wosize_hd(hd) = 0` and `Whsize_hd(hd) = Wosize_hd(hd) + 1 = 1`.
+
+So `p += 1` at step 6. That means p advances by 1 word. But it should advance by `wh` words (the sizeclass width) to get to the next block!
+
+Wait, let me re-read the code more carefully:
+
+```c
+      if (POOL_BLOCK_FREE_HD(hd)) {
+        all_used = 0;
+        if( last_free_block ) {
+          if( last_free_block + (1 + Wosize_hp(last_free_block)) * wh == p ) {
+            *last_free_block = POOL_FREE
+[tr-thinking call-0014:worker:xiaomi/mimo-v2.5-pro-ultraspeed] _HEADER(Wosize_hp(last_free_block) + Wosize_hd(hd) + 1);
+          } else {
+            last_free_block[1] = (value)p;
+            last_free_block = p;
+          }
+        } else {
+          a->next_obj = (value*)p;
+          last_free_block = p;
+        }
+        p += wh * Wosize_hd(hd);  // Skip over the contiguous free blocks that follow
+      } else {
+        release_to_global_pool = 0;
+      }
+      p += Whsize_hd(hd);  // Wait, but for a free block, Whsize_hd should be 1 (just the
+[tr-thinking call-0014:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  header word)
+```
+
+Hmm wait, no. For a free block with Wosize_hd(hd) = n, `Whsize_hd(hd) = n + 1`. But the free block header has wosize encoding the number of additional free blocks, NOT the actual wosize of the object.
+
+Wait, I need to understand the encoding. `POOL_FREE_HEADER(wosize)` is `Make_header(wosize, No_scan_tag, NOT_MARKABLE)`. So `Wosize_hd` gives back the `wosize` parameter. For a fresh free block, this is 0.
+
+So `Whsize_hd(hd)` for
+[tr-thinking call-0014:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  a fresh free block is `Wosize_hd(hd) + 1 = 0 + 1 = 1`.
+
+Then `p += Whsize_hd(hd)` means `p += 1`. But we need `p += wh` to advance to the next block.
+
+This is the bug! After the if/else block, the code does `p += Whsize_hd(hd)` but for a free block with the run-length encoding, `Whsize_hd(hd)` is the run count + 1, not the actual word size of the block.
+
+Wait, but what about the earlier part? In the
+[tr-thinking call-0014:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  `if (POOL_BLOCK_FREE_HD(hd))` branch, we do `p += wh * Wosize_hd(hd)` which skips over the additional contiguous free blocks. Then `p += Whsize_hd(hd) = Wosize_hd(hd) + 1`. So the total advance for a free block is:
+
+`p += wh * Wosize_hd(hd) + Wosize_hd(hd) + 1`
+
+But it should be `p += wh * (Wosize_hd(hd) + 1)` = `p += wh * Wosize_hd(hd) + wh`.
+
+The difference is that we advance `Wosize_hd(hd) + 1` instead of `wh`. For the
+[tr-thinking call-0014:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  case where Wosize is 0, we advance 1 instead of `wh`.
+
+Hmm, but wait. Let me look at how the original (non-run-length-compressed) code would work. In the original code, free blocks would just have wosize=0 and be one pool block wide (wh words). The `p += Whsize_hd(hd)` line would give `p += 1` which is wrong.
+
+Wait, actually I'm confused. Let me reconsider.
+
+In the ORIGINAL OCaml (without run-length compression), the free blocks probably had a different format. The POOL_FREE_HEADER would encode the
+[tr-thinking call-0014:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  actual object size... but actually no, all blocks in a pool are the same size class. So a free block header probably had Wosize = 0 and the advance was `p += wh` always.
+
+Hmm, let me look at calc_pool_stats again:
+```c
+while (p + wh <= end) {
+    header_t hd = (header_t)atomic_load_relaxed((atomic_uintnat*)p);
+    if (!POOL_BLOCK_FREE_HD(hd)) {
+      s->pool_live_words += Whsize_hd(hd);
+      s->pool_frag_words += wh - Whsize_hd(hd);
+      s->pool_live_blocks++;
+    } else {
+      p += wh * Wosize_hd(hd); /* skip contiguous free blocks */
+    }
+    p += wh
+[tr-thinking call-0014:worker:xiaomi/mimo-v2.5-pro-ultraspeed] ;
+}
+```
+
+Here, `p += wh` always advances by one block width. And for free blocks, it additionally does `p += wh * Wosize_hd(hd)` to skip the extra contiguous free blocks.
+
+So the total advance for a free block in calc_pool_stats is `wh + wh * Wosize_hd(hd) = wh * (1 + Wosize_hd(hd))`.
+
+Now let me look at pool_sweep again. The advance at the end of the loop is `p += Whsize_hd(hd)`. 
+
+For a **live** block: `hd` is the actual header with the real wosize. `Whsize_hd(hd)
+[tr-thinking call-0014:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  = Wosize_hd(hd) + 1`. But wait, `wh` is the sizeclass width which is >= Whsize_hd(hd). So `p += Whsize_hd(hd)` would advance by the actual object header+data size, not by `wh`. That doesn't seem right either for pool blocks...
+
+Wait, let me re-read the loop. After `p += Whsize_hd(hd)`, we check `p + wh <= end`. In a pool, all blocks are aligned to `wh` word boundaries. So `p` should advance by `wh` each time.
+
+Hmm, but for a
+[tr-thinking call-0014:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  live block: `p += Whsize_hd(hd)` advances by the object's actual size (header + data), which is less than or equal to `wh` (since the sizeclass guarantees `wsize_sizeclass[sz] >= whsize`). But there could be padding. So advancing by `Whsize_hd(hd)` would NOT advance to the next block boundary!
+
+Wait, I think I'm overcomplicating this. Let me look at the actual original `p += wh` at the end:
+
+Actually wait, I see `p += Whsize_hd(hd)` at the end of the do-while loop. But in
+[tr-thinking call-0014:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  the original code before the RLE changes, this was probably `p += wh`. Let me check again...
+
+Actually no. Looking at the code flow more carefully:
+
+```c
+    do {
+      header_t hd = (header_t)atomic_load_relaxed((atomic_uintnat*)p);
+      ...
+      if (Has_status_hd(hd, caml_global_heap_state.GARBAGE)) {
+        ...convert to free block...
+        hd = POOL_FREE_HEADER(0);
+      }
+
+      if (POOL_BLOCK_FREE_HD(hd)) {
+        ...
+        p += wh * Wosize_hd(hd); // for RLE skip
+      } else {
+        release_to_global_pool = 0;
+      }
+      p += Whsize_hd(h
+[tr-thinking call-0014:worker:xiaomi/mimo-v2.5-pro-ultraspeed] d);  // <-- this is the problem!
+    } while (p + wh <= end);
+```
+
+For a **free block** after the RLE changes:
+- `hd = POOL_FREE_HEADER(n)` where n is the number of additional contiguous free blocks
+- In the free branch: `p += wh * n` (skip extra blocks)
+- Then: `p += Whsize_hd(hd) = p += n + 1`
+- Total: `p += wh * n + n + 1`
+
+But it should be: `p += wh * (n + 1)` = `p += wh * n + wh`
+
+So the advance is `wh * n + n + 1` but
+[tr-thinking call-0014:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  should be `wh * n + wh`. This is wrong when `n + 1 != wh`, i.e. when `wh > 1` which is almost always the case.
+
+Wait, but what about for the original code (before RLE changes)? If the original code had `POOL_FREE_HEADER(0)` for all free blocks (no RLE), then:
+- Free block: `hd = POOL_FREE_HEADER(0)` → `Wosize = 0`, `Whsize = 1`
+- `p += wh * 0 = 0`
+- `p += 1`
+- Total: `p += 1`
+
+That's clearly wrong too
+[tr-thinking call-0014:worker:xiaomi/mimo-v2.5-pro-ultraspeed] . So the original code must have been different.
+
+Hmm wait. Actually, maybe the original code was `p += wh` at the end of the loop, and the RLE changes mistakenly changed it to `p += Whsize_hd(hd)` thinking it was like normal OCaml heap traversal.
+
+Let me reconsider. Actually, looking at the calc_pool_stats function which was presumably also modified for RLE:
+
+```c
+while (p + wh <= end) {
+    ...
+    if (!POOL_BLOCK_FREE_HD(hd)) {
+      // live block
+    } else {
+      p += wh * Wosize_hd(hd); /* skip contiguous free blocks */
+    }
+    p += wh;
+}
+```
+
+The calc_pool_stats uses
+[tr-thinking call-0014:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  `p += wh` at the end, which is the correct advance for one block. This was probably the original advance for all blocks.
+
+Now in pool_sweep, the end-of-loop advance is `p += Whsize_hd(hd)` instead of `p += wh`. For a live block, `Whsize_hd(hd)` is the actual header+data size, which could be less than `wh` (the sizeclass width). So this is wrong for live blocks too!
+
+Wait, actually for a live block in a pool, `Whsize_hd(hd)` should be equal to `wh` because... no,
+[tr-thinking call-0014:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  actually `wh = wsize_sizeclass[sz]` which is the sizeclass width, and `Whsize_hd(hd) = Wosize_hd(hd) + 1` which is the actual object size. Due to sizeclass rounding, `wh >= Whsize_hd(hd)`. They're equal only when the object perfectly fills the sizeclass slot.
+
+So `p += Whsize_hd(hd)` for a live block would advance LESS than `wh` when there's fragmentation padding. This means we'd re-read part of the object's fields as if they were a header, causing all sorts of problems!
+
+So
+[tr-thinking call-0014:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  the bug is: `p += Whsize_hd(hd)` should be `p += wh`.
+
+With this fix:
+- For a free block with run count n: total advance = `wh * n + wh = wh * (n + 1)` ✓
+- For a live block: advance = `wh` ✓
+
+This makes sense. The developer changed `p += wh` to `p += Whsize_hd(hd)` as part of the RLE work, probably thinking that the header encodes the size information, but in the free block case the Wosize is used for run-length encoding (count of extra blocks), and for
+[tr-thinking call-0014:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  live blocks, the object doesn't necessarily fill the whole sizeclass slot.
+
+Actually wait, let me reconsider. Maybe the original sweep code was different. Let me think about what the original code might have looked like.
+
+In the original code (without RLE), free blocks would have `POOL_FREE_HEADER(0)` (always wosize=0) and the first field points to the next free block. The sweep would:
+1. For each block, check if it's garbage → convert to free
+2. For free blocks, merge adjacent ones and update the freelist
+3. Advance by `wh` to the next block
+
+With RLE changes,
+[tr-thinking call-0014:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  the developer wanted free blocks to encode how many contiguous free blocks follow, so:
+1. Free block header: `POOL_FREE_HEADER(n)` means this block plus `n` more are free
+2. First field: pointer to next non-contiguous free block (or NULL)
+3. Allocation: decrement the count and advance
+
+The sweep needs to properly merge and skip. The `p += wh * Wosize_hd(hd)` line skips the additional contiguous blocks (n blocks), and then `p += wh` would advance past the current block. So the total should be `wh * (n + 1)`.
+
+But the code has `p += Whsize_hd(hd)` instead of `p += wh`. The
+[tr-thinking call-0014:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  developer likely made a mistake here, confusing the general heap traversal pattern (`p += Whsize_hd(hd)`) with the pool traversal pattern (`p += wh`).
+
+Wait, but there's another issue. For a **live** block, the free branch is NOT taken, so `p += wh * Wosize_hd(hd)` is NOT executed. Then `p += Whsize_hd(hd)` gives the wrong result as I discussed.
+
+But actually, what if for a live block, the developer intended `p += Whsize_hd(hd)` to advance past just the object, and the loop condition `p + wh <= end` handles the rest? No, that doesn't work
+[tr-thinking call-0014:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  because `p` wouldn't be aligned to block boundaries anymore.
+
+Hmm, actually wait. Let me reconsider whether all live blocks in a pool have `Whsize_hd(hd) == wh`. 
+
+In a pool of sizeclass `sz`, each slot is `wh = wsize_sizeclass[sz]` words wide. Objects placed in these slots have `whsize = Wosize + 1 <= wh`. The difference `wh - whsize` is fragmentation. So `Whsize_hd(hd) < wh` is common.
+
+So `p += Whsize_hd(hd)` for a live block advances to the middle of the slot, not to the next block. This is definitely wrong
+[tr-thinking call-0014:worker:xiaomi/mimo-v2.5-pro-ultraspeed] .
+
+The fix should be: change `p += Whsize_hd(hd);` to `p += wh;`
+
+Let me verify by looking at the loop once more:
+
+```c
+    do {
+      header_t hd = ...;
+
+      if (Has_status_hd(hd, caml_global_heap_state.GARBAGE)) {
+        // convert to free
+        *p = POOL_FREE_HEADER(0);
+        hd = POOL_FREE_HEADER(0);
+      }
+
+      if (POOL_BLOCK_FREE_HD(hd)) {
+        all_used = 0;
+        // merge logic...
+        p += wh * Wosize_hd(hd); // skip RLE blocks
+      } else {
+        release_to_global_pool = 0;
+      }
+      p += wh
+[tr-thinking call-0014:worker:xiaomi/mimo-v2.5-pro-ultraspeed] ;  // <-- this should be the fix
+    } while (p + wh <= end);
+```
+
+With this fix:
+- For a newly freed block (RLE count = 0): advance = 0 + wh = wh ✓
+- For a pre-existing free block with RLE count n: advance = wh*n + wh = wh*(n+1) ✓
+- For a live block: advance = wh ✓
+
+This looks correct. Let me also check the `pool_finalise` function to see if there's a similar bug there.
+
+Actually, let me also check if there's a `pool_finalise` function that might have a similar issue.
+
+Actually wait, I
+[tr-thinking call-0014:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  also notice something in the merging logic. When two adjacent free blocks are merged:
+
+```c
+if (last_free_block + (1 + Wosize_hp(last_free_block)) * wh == p) {
+    *last_free_block = POOL_FREE_HEADER(Wosize_hp(last_free_block) + Wosize_hd(hd) + 1);
+}
+```
+
+Let's trace through:
+- `last_free_block` has RLE count `m` (meaning m additional free blocks follow it)
+- The next free block after the run starting at `last_free_block` would be at `last_free_block + (m + 1) * wh`
+- The merge condition checks:
+[tr-thinking call-0014:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  `last_free_block + (1 + Wosize_hp(last_free_block)) * wh == p`
+  - `Wosize_hp(last_free_block) = m` (the RLE count)
+  - So the condition checks: `last_free_block + (1 + m) * wh == p`
+  - This means: is the current block `p` immediately after the run? ✓
+
+For the merged RLE count: `Wosize_hp(last_free_block) + Wosize_hd(hd) + 1 = m + n + 1` where `n` is the RLE count of the current block.
+
+If the
+[tr-thinking call-0014:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  last block had m extra blocks and the current block has n extra blocks, merging means the new run has m + 1 + n = m + n + 1 extra blocks. That's correct! (The "+1" accounts for the current block itself becoming part of the run.)
+
+So the merge logic looks correct. The bug is just in the `p += Whsize_hd(hd)` which should be `p += wh`.
+
+Let me also check `pool_finalise`:
+
+Actually, I should also look at pool_free (around line 290) to check for similar issues.
+
+Looking at pool_free:
+```c
+static void pool_free(struct caml_heap_state* local
+[tr-thinking call-0014:worker:xiaomi/mimo-v2.5-pro-ultraspeed] ,
+                      pool* pool, sizeclass sz)
+{
+    ...
+    while (p + wh <= end) {
+        header_t hd = (header_t)atomic_load_relaxed((atomic_uintnat*)p);
+        if (!POOL_BLOCK_FREE_HD(hd)) {
+            ...
+            p += wh * Wosize_hd(hd); // skip RLE blocks? No, this is for live blocks
+        }
+        p += wh; // This one uses wh!
+    }
+    ...
+}
+```
+
+Wait, pool_free is at line 277, let me look at it more carefully.
+
+Actually looking at my earlier output, lines 280-310:
+
+[tr-thinking call-0014:worker:xiaomi/mimo-v2.5-pro-ultraspeed] ```c
+static void pool_free(struct caml_heap_state* local,
+                      pool* pool, sizeclass sz)
+{
+    ...
+    while (p + wh <= end) {
+        header_t hd = (header_t)atomic_load_relaxed((atomic_uintnat*)p);
+        if (!POOL_BLOCK_FREE_HD(hd)) {
+            ...
+        }
+        p += wh * Wosize_hd(hd); /* skip contiguous free blocks */
+        p += wh;
+    }
+    ...
+}
+```
+
+Wait, I see at line 301: `p += wh * Wosize_hd(hd); /* skip contiguous free
+[tr-thinking call-0014:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  blocks */` and at the end of the loop, `p += wh`. So pool_free uses `p += wh` correctly. But it also has the skip logic.
+
+Actually wait, in pool_free, the condition is `if (!POOL_BLOCK_FREE_HD(hd))` — it's checking for LIVE blocks, not free ones. And the comment says "skip contiguous free blocks". That doesn't make sense. Let me re-read more carefully.
+
+From my earlier output:
+```
+296:    if (!POOL_BLOCK_FREE_HD(hd)) {
+301:      p += wh * Wosize_hd(hd); /* skip contiguous free blocks */
+3
+[tr-thinking call-0014:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 10:/* Initialize a pool and its object freelist */
+```
+
+Hmm, I need to see the full context of pool_free. Let me re-read it later. The key bug is in pool_sweep.
+
+Let me also look at pool_finalise to see if it has the same issue:
+
+From the grep earlier, pool_finalise is declared at line 337:
+```c
+static void pool_finalise(struct caml_heap_state* local, pool**, sizeclass sz);
+```
+
+Let me read it later. For now, the primary bug is clear: in pool_sweep, `p += Whsize_hd(hd)` should be `p += wh`.
+
+Actually, wait. Let me re-examine once more. The
+[tr-thinking call-0014:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  line at the bottom of the loop:
+
+```c
+      p += Whsize_hd(hd);
+```
+
+For a LIVE block: `hd` is the real header. `Whsize_hd(hd) = Wosize_hd(hd) + 1`. Since this is a pool, all slots are `wh` words wide. `Whsize_hd(hd) <= wh` but could be less. So `p += Whsize_hd(hd)` would not advance enough. Bug.
+
+For a FREE block with RLE count 0: `hd = POOL_FREE_HEADER(0)`, `Whsize = 1`. We also did `p += wh * 0 = 0`. Total:
+[tr-thinking call-0014:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  `p += 1`. Should be `p += wh`. Bug.
+
+For a FREE block with RLE count n: `hd = POOL_FREE_HEADER(n)`, `Whsize = n + 1`. We also did `p += wh * n`. Total: `p += wh * n + n + 1`. Should be `p += wh * (n + 1) = wh * n + wh`. Bug (unless n + 1 == wh, which is almost never).
+
+So the fix is: change `p += Whsize_hd(hd)` to `p += wh`.
+
+But wait, there's another thing to
+[tr-thinking call-0014:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  consider. For a live block, should `hd` refer to the original header (before potential modification)? Let me trace through again for a live block:
+
+1. `hd = (header_t)atomic_load_relaxed((atomic_uintnat*)p)` — the actual header
+2. Not garbage, so the garbage branch is skipped
+3. Not free, so the free branch is skipped; `release_to_global_pool = 0`
+4. `p += Whsize_hd(hd)` — advances by object's whsize, not by wh
+
+Yes, the live block path needs `p += wh` too.
+
+OK, I'm confident the fix is to
+[tr-thinking call-0014:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  change `p += Whsize_hd(hd);` to `p += wh;`.
+
+Let me also verify the `pool_free` function and `pool_finalise` function for similar bugs.
+
+Actually, looking at pool_free again at lines 293-305, it does correctly use `p += wh` at the end. But it also has `p += wh * Wosize_hd(hd)` for free blocks to skip RLE. Let me verify this is inside the free block branch or outside:
+
+From the earlier output:
+```
+296:    if (!POOL_BLOCK_FREE_HD(hd)) {
+301:      p += wh * Wosize_hd(hd); /* skip contiguous free blocks */
+```
+
+Hmm, it seems like the skip is inside the
+[tr-thinking call-0014:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  `if (!POOL_BLOCK_FREE_HD(hd))` block, which means it's for NON-free (live) blocks. That doesn't make sense. Let me read the full function.
+
+Actually I think I need to read pool_free more carefully. Let me do that.
+
+Actually, looking at the line numbers more carefully from the earlier grep output:
+```
+63:#define POOL_BLOCK_FREE_HD(hd) \
+65:#define POOL_BLOCK_FREE_HP(p) (POOL_BLOCK_FREE_HD(Hd_hp(p)))
+66:#define POOL_FREE_HEADER(wosize) Make_header(wosize, No_scan_tag, NOT_MARKABLE)
+```
+
+And the grep for
+[tr-thinking call-0014:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  pool_free shows:
+```
+277:/* free the memory of [pool], giving it back to the OS */
+```
+
+Let me look at the full function when I have a chance. But for now, the primary bug to fix is in pool_sweep.
+
+Let me first try to build the compiler and see the crash, then fix the bug.
+
+Actually, let me just go ahead and fix the bug and then build. I'm quite confident this is the issue.
+
+Actually, let me also think about whether there could be another issue. Let me re-read the sweep merge logic one more time:
+
+When a garbage block is converted to free:
+```c
+*p = POOL_FREE_HEADER(0);
+hd = POOL_FREE_HEADER(0);
+```
+
+Then in
+[tr-thinking call-0014:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  the free block handling:
+```c
+if (POOL_BLOCK_FREE_HD(hd)) {
+    all_used = 0;
+    if (last_free_block) {
+        if (last_free_block + (1 + Wosize_hp(last_free_block)) * wh == p) {
+            // merge
+            *last_free_block = POOL_FREE_HEADER(Wosize_hp(last_free_block) + Wosize_hd(hd) + 1);
+        } else {
+            // not adjacent, link
+            last_free_block[1] = (value)p;
+            last_free_block = p;
+        }
+    } else {
+        a->next_obj = (value*)p;
+        last_free_block = p;
+    }
+    p += wh * Wosize_hd(hd
+[tr-thinking call-0014:worker:xiaomi/mimo-v2.5-pro-ultraspeed] );
+}
+```
+
+When we merge, we don't update `last_free_block` to point to `p` (the new free block). The `last_free_block` stays pointing to the previous free block header which now has an increased RLE count. This is correct because we want to keep accumulating the run at the original start.
+
+But there's a subtle issue: when we merge, we do `*last_free_block = POOL_FREE_HEADER(...)`. This updates the header at `last_free_block`, but the first field (`last_free_block[1]`) still points to whatever it pointed to before (the next free block in the chain). For the merged block at position `p`, we don't update
+[tr-thinking call-0014:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  `p[1]` — but that's fine because the run-length encoded block at `last_free_block` covers positions `p` and beyond, and `p[1]` is now just part of the "data" area of the free block (it would be overwritten when allocated).
+
+Wait, actually there's a subtle issue. When merging, the new free block at `p` might have its own next-pointer in `p[1]`. If we're merging an existing free block (not one we just converted from garbage), then `p[1]` could contain a meaningful pointer to the next free block. When we merge, we discard `p[1]` by overwriting `last_free_block`'s header to include `
+[tr-thinking call-0014:worker:xiaomi/mimo-v2.5-pro-ultraspeed] p` in the run. But `last_free_block[1]` still points to whatever it was before — the next free block in the chain.
+
+But wait, if `p` was an existing free block (not garbage we just converted), it had its own RLE chain. When we merge, we incorporate `p` and its RLE followers into `last_free_block`'s run. But `last_free_block[1]` might point to a different chain. We lose `p[1]`'s pointer.
+
+Hmm, but this only happens when the blocks are adjacent. If they're adjacent, then the last
+[tr-thinking call-0014:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  free block at `last_free_block` had a chain that eventually reached... wait, the chain structure is:
+- `last_free_block` → `last_free_block[1]` → next free block in chain
+- If blocks are adjacent, the run at `last_free_block` extends rightward, and `p` is the block right after the run.
+
+If `p` is also free, it means `p` was not reached by `last_free_block`'s chain (otherwise it would have been part of the run). So `last_free_block[1]` points to something beyond `p`, or is NULL.
+
+Wait, that can't be right. The
+[tr-thinking call-0014:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  free list chain links NON-ADJACENT free blocks. If `last_free_block` and `p` are adjacent, they should be linked. Unless... the RLE count at `last_free_block` is wrong, or the list was inconsistent.
+
+Actually, I think the sweep is rebuilding the free list from scratch. The existing free list pointers are being reconstructed during the sweep. So during sweep, we walk every block in the pool sequentially, and for each free block, we either merge it with the previous free block (if adjacent) or link it.
+
+In that case, the merge logic is:
+1. `last_free_block` is the start of the current run of free blocks
+2. `p` is the next free block encountered
+3. If `p` is
+[tr-thinking call-0014:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  adjacent to the end of the current run, merge (extend the run)
+4. If not, link `last_free_block[1] = p` and start a new run at `p`
+
+When we merge, we need to update `last_free_block`'s RLE count to include `p` and its RLE followers. The formula:
+- `last_free_block` had RLE count `m` (m extra blocks after it, covering positions last_free_block+wh through last_free_block+(m+1)*wh - 1)
+- `p` is at position `last_free_block + (m+1)*wh` (the block right after the run)
+- `p`
+[tr-thinking call-0014:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  has RLE count `n` (n extra blocks after it)
+- After merge: `last_free_block` now has RLE count `m + 1 + n` (the original m blocks, plus p itself, plus p's n extra blocks)
+
+So the new count is `m + 1 + n`. The code does:
+```c
+*last_free_block = POOL_FREE_HEADER(Wosize_hp(last_free_block) + Wosize_hd(hd) + 1);
+```
+= `POOL_FREE_HEADER(m + n + 1)` ✓
+
+And we DON'T update `last_free_block` (it stays pointing to the start of the run). ✓
+
+When we
+[tr-thinking call-0014:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  DON'T merge:
+```c
+last_free_block[1] = (value)p;
+last_free_block = p;
+```
+We link the previous run to `p` and start a new run at `p`. ✓
+
+But there's an issue: when we DON'T merge, we set `last_free_block = p`. But `p` already has its own RLE count (from `hd`). Do we need to update it? No, because `hd` was already loaded and `p`'s header is already correct. The `last_free_block` just needs to track where the current run starts.
+
+OK so the merge logic looks correct. The main
+[tr-thinking call-0014:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  bug is `p += Whsize_hd(hd)` which should be `p += wh`.
+
+Let me also check: what happens at the very end of the do-while loop? After all blocks are processed:
+
+```c
+if (!all_used) {
+    last_free_block[1] = 0;
+}
+```
+
+This terminates the last free block's chain. ✓
+
+And then:
+```c
+if (release_to_global_pool) {
+    pool_release(local, a, sz);
+} else {
+    pool** list = all_used ? &local->full_pools[sz] : &local->avail_pools[sz];
+    a->next = *list;
+    *list = a;
+}
+```
+
+This moves the pool to
+[tr-thinking call-0014:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  the appropriate list. ✓
+
+OK, I'm confident the fix is to change `p += Whsize_hd(hd);` to `p += wh;` in pool_sweep.
+
+Wait, but I should also check: is there another issue with the fact that when a block is garbage and we convert it, we set `*p = POOL_FREE_HEADER(0)` and then the first field `p[1]` is NOT initialized? Well, in DEBUG mode, `p[1]` would be `Debug_free_major`. In non-debug mode, it could be anything. But in the sweep function, we're
+[tr-thinking call-0014:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  reconstructing the free list, so we'll be setting `last_free_block[1]` to the correct next pointer. So the initial state of `p[1]` doesn't matter. ✓
+
+Actually wait, there IS an issue. When we encounter the FIRST free block (no last_free_block yet):
+```c
+} else {
+    a->next_obj = (value*)p;
+    last_free_block = p;
+}
+```
+
+We set `a->next_obj = p` and `last_free_block = p`, but we don't set `p[1]` to anything. The next time we encounter a free block, we either merge (which doesn't touch `last
+[tr-thinking call-0014:worker:xiaomi/mimo-v2.5-pro-ultraspeed] _free_block[1]`) or link (which sets `last_free_block[1] = p`). At the very end, we set `last_free_block[1] = 0`. So `p[1]` is eventually set correctly. ✓
+
+OK, but what about the case where there's only ONE free block? Then `last_free_block[1]` is set to 0 at the end. ✓
+
+And the case where the FIRST block is free and has RLE count > 0? The header says there are n extra blocks, but the next pointer `p[1]` hasn't been set yet. When allocating from this pool, the allocator reads `
+[tr-thinking call-0014:worker:xiaomi/mimo-v2.5-pro-ultraspeed] p[1]` if `Wosize_hp(p) == 0` (no more extra blocks). Since we set `last_free_block[1] = 0` at the end, and the first free block is `last_free_block`, this is fine. ✓
+
+Alright, I'm confident. The bug is `p += Whsize_hd(hd)` which should be `p += wh`. Let me fix it and build.
+
+Wait, actually I want to double-check one more thing. Let me look at pool_finalise too.
+[tr-stream call-0014:worker:xiaomi/mimo-v2.5-pro-ultraspeed] Now I have a good picture of the code. Let me read the full
+[tr-stream call-0014:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  pool_sweep function and also pool_finalise to check for similar issues.
+
+```json
+{
+  "analysis": "I can see the sweep code. In pool_sweep (line 543+), there's a do-while loop iterating over blocks in a pool. At the end of the loop, it does `p += Whsize_hd(hd)` to advance to the next block. But in a pool, all blocks are aligned to `wh = wsize_sizeclass[sz]` words. For free blocks, the Wosize encodes the RLE count (number of additional contiguous free blocks), not the actual object size. So `Whsize_hd(hd)` for a free block with
+[tr-stream call-0014:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  RLE count 0 gives just 1, not `wh`. For live blocks, `Whsize_hd(hd)` could be less than `wh` due to sizeclass rounding. This should be `p += wh` like in `calc_pool_stats` which correctly uses `p += wh`.",
+  "plan": "1) Read pool_finalise for similar bugs, 2) Fix the bug in pool_sweep changing `p += Whsize_hd(hd)` to `p += wh`, 3) Build the compiler, 4) Run the basic test suite.",
+  "commands": [
+    {"keystrokes": "
+[tr-stream call-0014:worker:xiaomi/mimo-v2.5-pro-ultraspeed] grep -n 'pool_finalise' /app/ocaml/runtime/shared_heap.c\n", "duration": 0.5},
+    {"keystrokes": "sed -n '540,665p' /app/ocaml/runtime/shared_heap.c\n", "duration": 0.5}
+  ]
+}
+```
+
+[tr-stream call-0014:worker:xiaomi/mimo-v2.5-pro-ultraspeed] worker.done finish=stop cost_microdollars=43408
+[tr-stream call-0014:xiaomi/mimo-v2.5-pro-ultraspeed] Now I have a good picture of the code. Let me read the full pool_sweep function and also pool_finalise to check for similar issues.
+
+```json
+{
+  "analysis": "I can see the sweep code. In pool_sweep (line 543+), there's a do-while loop iterating over blocks in a pool. At the end of the loop, it does `p += Whsize_hd(hd)` to advance to the next block. But in a pool, all blocks are aligned to `wh = wsize_sizeclass[sz]` words. For free blocks, the Wosize encodes the RLE count (number of additional contiguous free blocks), not the actual object size. So `Whsize_hd(hd)` for a free block with RLE count 0 gives just 1, not `wh`. For live blocks, `Whsize_hd(hd)` could be less than `wh` due to sizeclass rounding. This should be `p += wh` like in `calc_pool_stats` which correctly uses `p += wh`.",
+  "plan": "1) Read pool_finalise for similar bugs, 2) Fix the bug in pool_sweep changing `p += Whsize_hd(hd)` to `p += wh`, 3) Build the compiler, 4) Run the basic test suite.",
+  "commands": [
+    {"keystrokes": "grep -n 'pool_finalise' /app/ocaml/runtime/shared_heap.c\n", "duration": 0.5},
+    {"keystrokes": "sed -n '540,665p' /app/ocaml/runtime/shared_heap.c\n", "duration": 0.5}
+  ]
+}
+```
