@@ -1,0 +1,230 @@
+
+[tr-stream call-0103:socrates:trustedrouter/socrates-pro-plus-1.0] socrates.started
+
+[tr-stream call-0103:worker:xiaomi/mimo-v2.5-pro-ultraspeed] worker.started
+[tr-thinking call-0103:worker:xiaomi/mimo-v2.5-pro-ultraspeed] Using double precision for the hit point fixed the bottom-right pixel but not the middle one. The score barely improved. The 50% random checker mismatch is the core problem. 
+
+Let me think about this differently. The sky and sphere match perfectly. But the checker is random. This is very strange. If the projection were wrong, the sphere would also be wrong. 
+
+Wait - maybe the issue is not the world coordinates but how I'm *comparing* checker values. Let me re-examine. The original image has values 67 and 152. My image also has 67 and 152. But the parity is random.
+
+Actually,
+[tr-thinking call-0103:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  let me reconsider the light direction. With light (1,1,1), the ground lighting:
+- dot(N=(0,1,0), ld=norm(1,1,1)) = 1/sqrt(3) ≈ 0.5774
+- diff = 0.5774
+- lighting = 0.2 + 0.8*0.5774 = 0.6619
+- 0.4 * 0.6619 * 255.99 = 67.8 → 67 ✓
+- 0.9 * 0.6619 * 255.99 = 152.4 → 152 ✓
+
+So the
+[tr-thinking call-0103:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  checker colors are correct! The issue is purely which pixels get which color.
+
+Let me think about what could cause 50% random checker mismatch even though the sphere matches perfectly...
+
+Wait - maybe the issue is NOT the checker computation at all but a DIFFERENT sphere shadow. If my shadow is wrong (computing shadow for underground parts of the sphere), that could flip a lot of pixels. At lighting = 0.2 (shadow), 0.4*0.2*255=20.4 and 0.9*0.2*255=45.9. The pixels I thought were checker mismatched (
+[tr-thinking call-0103:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 67 vs 152) are not actually shadow-affected - they're the fully lit pixels.
+
+Hmm, but I see a difference: the check_parity.py only considers pixels where `orig[0]==orig[1]==orig[2]` AND `recon[0]==recon[1]==recon[2]`, and where color < 110 is "dark". Let me think:
+- orig values: 67 (D) and 152 (L)
+- recon values: 67 (D) and 152 (L)
+- But at 50% of pixels, orig=
+[tr-thinking call-0103:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 67 when recon=152 or vice versa
+
+So the checker color assignment is inverted at ~50% of pixels. This is EXACTLY what you'd see if there was a random floating-point difference of ~1 ULP in the world coordinate that crosses the floor() boundary. Since the floor function changes value at integer boundaries, a tiny difference in world coordinates can flip the parity.
+
+But why would this happen in my code but not in the original? Both use float precision. The difference must be in the computation path.
+
+Actually, wait. Let me reconsider. Maybe the issue is that my v coordinate computation is slightly different. Let me look at how the
+[tr-thinking call-0103:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  original computes v:
+
+At 0x296b-0x2993:
+```
+cvtsi2ss xmm0, [rbp-0x12c]   ; float(i) where i is j loop variable
+mov eax, [rbp-0x120]           ; height (1800)
+sub eax, 1                     ; 1799
+cvtsi2ss xmm1, eax
+divss xmm0, xmm1              ; j / (H-1)
+```
+
+Wait, at 0x28db it does:
+```
+cvtsi2ss xmm1, [rbp-0x
+[tr-thinking call-0103:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 12c]    ; j as float
+mulss xmm0, xmm1              ; 100.0 * j (for progress)
+```
+
+And at 0x296b:
+```
+pxor xmm0, xmm0
+cvtsi2ss xmm0, [rbp-0x12c]   ; j
+mov eax, [rbp-0x120]          ; height
+sub eax, 1                    ; height-1
+pxor xmm1, xmm1
+cvtsi2ss xmm1, eax
+divss xmm0, xmm1             ; j/(H
+[tr-thinking call-0103:worker:xiaomi/mimo-v2.5-pro-ultraspeed] -1)
+movss [rbp-0x10c], xmm0      ; store j/(H-1)
+movss xmm0, [0x3174]         ; 1.0
+subss xmm0, [rbp-0x10c]     ; 1.0 - j/(H-1)
+```
+
+So v = 1.0 - j / (H - 1), exactly as I compute it. That's correct.
+
+Then:
+```
+movss xmm2, [0x3178]   ; 0.5
+mulss xmm0, xmm1       ; (
+[tr-thinking call-0103:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 1-j/(H-1)) * ??? 
+```
+
+Wait, at 0x2993-0x29b6:
+```
+movss xmm0, [0x3174]   ; 1.0
+subss xmm0, [rbp-0x10c] ; v = 1 - j/(H-1)
+```
+
+Then at 0x29a4-0x29bb:
+```
+mov rax, [rbp-0xe8]    ; vV.x component
+movss xmm1, [rbp-0xe0] ; vV.z component  
+movaps xmm2, xmm0      ; v
+movq xmm0, rax
+call
+[tr-thinking call-0103:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  vector_multiply    ; vV * v
+```
+
+This is vV * v, then later added to ll to get the target. That's:
+target = ll + u*vU + v*vV
+
+This is exactly what I compute. So the projection is correct.
+
+Hmm, let me think again. The sphere matches perfectly. The sky matches perfectly. The checker is random. 
+
+Could it be that the original uses an unnormalized ray direction for computing the hit point? The ray is normalized before calling trace(), but then trace() calls plane_intersect() with the normalized ray. plane_intersect computes t, then calls ray_at(t) which does origin + t*dir. Since the dir
+[tr-thinking call-0103:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  is normalized, the hit point should be correct.
+
+But wait - what if plane_intersect uses a different ray direction than what I think? Let me look at how trace() calls plane_intersect(). At 0x1df3-0x1e22 in trace():
+```
+lea rsi, [rbp-0x50]     ; result struct
+...
+movd xmm0, eax           ; -1.5 (plane y)
+call plane_intersect      ; plane_intersect(result, ray, -1.5)
+```
+
+And the ray passed to plane_intersect is the same normalized ray. So that's fine.
+
+Actually wait - let me reconsider the
+[tr-thinking call-0103:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  shadow. Maybe the shadow is causing a lot of errors. If the shadow covers a large area, that could explain the max diff of 142 (shadowed = 0.2*color vs lit = 0.662*color, diff for 0.4 checker = |67-20|*3 channels).
+
+Let me try disabling the shadow completely and see what happens to the similarity score. That would tell me how much of the error is from shadow vs checker.
+
+Also, I realize the original might not have a shadow check at all, or might have a different shadow computation. Let me check if the is_in_shadow function in the original even
+[tr-thinking call-0103:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  gets called.
+
+Actually, looking at the trace function in the original, it clearly calls is_in_shadow. And if shadow, diff = 0. Let me try a different approach - just check how much the shadow contributes to the error.
+
+Let me also reconsider: maybe the light direction should be different. Let me try a light direction that's more clearly directional. The binary shows constants that might create the light vector differently.
+
+Actually, I just realized something. Let me re-examine the light setup in main more carefully. At 0x2806:
+```
+mov eax, [0x3130]      ; float 0.0 (this is actually the first 
+[tr-thinking call-0103:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 4 bytes of .rodata float section, which was 0x00000000 = 0.0)
+```
+
+Wait, 0x3130 is 0.0. And 0x31a0 = -5.0, 0x31a4 = -0.5. So vector_create(0.0, -0.5, -5.0) → that's the camera!
+
+Then at 0x2826:
+```
+movss xmm0, [0x3174]   ; 1.0
+
+[tr-thinking call-0103:worker:xiaomi/mimo-v2.5-pro-ultraspeed] movss xmm1, [0x31a8]   ; -1.0
+mov eax, [0x3174]       ; 1.0
+```
+vector_create(1.0, -1.0, 1.0)? No wait, the calling convention: xmm0=x, xmm1=y, xmm2=z. So that's x=1.0, y=1.0, z=-1.0. That's light = (1, 1, -1)!
+
+But I already tested (1,1,-1) and it gave 0.748
+[tr-thinking call-0103:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  while (-1,1,1) gave 0.754 and (1,1,1) gave 0.755.
+
+Actually wait, let me re-read the calling convention. From vector_create:
+```
+movss [rbp-0x24], xmm0   ; x
+movss [rbp-0x28], xmm1   ; y  
+movss [rbp-0x2c], xmm2   ; z
+```
+
+So xmm0 = x, xmm1 = y, xmm2 = z.
+
+At 0x2826-0x284d:
+```
+movss xmm0, [0x3174]   ; 1.0  → x
+movss xmm1, [0x
+[tr-thinking call-0103:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 31a8]   ; -1.0 → y
+mov eax, [0x3174]       ; 1.0
+movd xmm0, eax          ; z = 1.0
+call vector_create
+```
+
+Wait, that's confusing. Let me re-read:
+```
+2826: movss xmm0, [0x3174]   ; xmm0 = 1.0
+282e: movss [rbp-0x34], xmm0 ; store 1.0 to [rbp-0x34]
+2833: movss xmm2, [0x31a8]   ; xmm2 = -1.0
+283b: movss xmm1, [0x3174]   ;
+[tr-thinking call-0103:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  xmm1 = 1.0
+2843: mov eax, [0x3174]       ; eax = 1.0 (as int)
+2849: movd xmm0, eax          ; xmm0 = 1.0
+284d: call vector_create
+```
+
+So vector_create(xmm0=1.0, xmm1=1.0, xmm2=-1.0) → light = (1.0, 1.0, -1.0)
+
+That confirms light = (1, 1, -1). But my test showed (1,1,1) is slightly better. The 0.755 vs
+[tr-thinking call-0103:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  0.748 difference is small and may be due to other factors.
+
+Actually, I bet the problem is entirely the checker phase issue. Let me focus on that. Maybe the original stores the hit point as a struct and the x/z values I'm computing don't match because of how float addition works.
+
+Let me try a completely different approach: forget the checker for now and see what happens if I make the whole ground a single color matching the average. That would give me an upper bound on the non-checker error.
+
+Actually, let me try something simpler: make the ground always 0.65 (the average of 
+[tr-thinking call-0103:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 0.4 and 0.9). That would show how much the checker mismatch contributes to the L2 error.
+
+No wait, I need a different approach entirely. Let me just remove the shadow check and see what happens to the similarity.
+[tr-stream call-0103:worker:xiaomi/mimo-v2.5-pro-ultraspeed] {
+  "analysis": "Let me try a completely different approach. I'll disable shadow completely and see what impact that has on the score. The checker parity issue and shadow together are causing the bulk of the error. I need to isolate which is the bigger contributor.",
+  "plan": "1. Disable shadow and test\n2. Then try different approaches for the checker",
+  "commands": [
+    {
+      "keystrokes": "cat > image.c << 'CEOF'\n#include <stdio.h>\n#include <math.h>\ntypedef struct{float x,y,z;}V;\
+[tr-stream call-0103:worker:xiaomi/mimo-v2.5-pro-ultraspeed] nV mk(float x,float y,float z){V r;r.x=x;r.y=y;r.z=z;return r;}\nV ad(V a,V b){return mk(a.x+b.x,a.y+b.y,a.z+b.z);}\nV su(V a,V b){return mk(a.x-b.x,a.y-b.y,a.z-b.z);}\nV ml(V a,float t){return mk(a.x*t,a.y*t,a.z*t);}\nfloat dt(V a,V b){return a.x*b.x+a.y*b.y+a.z*b.z;}\nV nm(V v){float l=sqrtf(dt(v,v));return mk(v.x/l,v.y/l,v.z/l);}\n#define W 2400\n#define H 1800\nfloat sr=
+[tr-stream call-0103:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 1.f,py=-1.5f;\nV ld;\nfloat hs(V ro,V sc,V rd){V oc=su(ro,sc);float b=dt(oc,rd),c=dt(oc,oc)-sr*sr,h=b*b-c;return h<0?-1:-b-sqrtf(h);}\nfloat hp(V ro,V rd){if(fabsf(rd.y)<1e-6f)return-1;float t=(py-ro.y)/rd.y;return t>0?t:-1;}\nV tr(V ro,V rd,V sc){\n    float ts=hs(ro,sc,rd),tp=hp(ro,rd),t;int h1=0,h2=0;\n    if(ts>0&&tp>0){if(ts<tp){t
+[tr-stream call-0103:worker:xiaomi/mimo-v2.5-pro-ultraspeed] =ts;h1=1;}else{t=tp;h2=1;}}\n    else if(ts>0){t=ts;h1=1;}\n    else if(tp>0){t=tp;h2=1;}\n    else{V n=nm(rd);float a=.5f*(n.y+1.f);return ad(ml(mk(1,1,1),1.f-a),ml(mk(.5f,.7f,1.f),a));}\n    V pos=ad(ro,ml(rd,t)),N;\n    V color;\n    if(h1){N=nm(su(pos,sc));color=mk(1.f,.2f,.2f);}\n    else{N=mk(0,1,0);\n    double px=(double)
+[tr-stream call-0103:worker:xiaomi/mimo-v2.5-pro-ultraspeed] ro.x+(double)t*(double)rd.x;\n    double pz=(double)ro.z+(double)t*(double)rd.z;\n    int cx=(int)floor(px);\n    int cz=(int)floor(pz);\n    int s=(cx+cz)&1;\n    float ck=s?.4f:.9f;color=mk(ck,ck,ck);}\n    float diff=fmaxf(dt(N,ld),0.f);\n    return ml(color,.2f+.8f*diff);\n}\nint main(){\n    ld=nm(mk(1.f,1.f,1.f));\n    V cam={0,-.5f,-5.f};\n    V sc={0,-1.f,0};\n    FILE*f=fopen(\"reconstructed.p
+[tr-stream call-0103:worker:xiaomi/mimo-v2.5-pro-ultraspeed] pm\",\"w\");\n    fprintf(f,\"P3\\n%d %d\\n255\\n\",W,H);\n    float vw=2.f*W/H;\n    float vh=2.f;\n    V vU=mk(vw,0,0);\n    V vV=mk(0,vh,0);\n    V fl=mk(0,0,1.f);\n    V ll=ad(su(su(cam,ml(vU,.5f)),ml(vV,.5f)),fl);\n    for(int j=0;j<H;j++){\n        float v=1.f-(float)j/(H-1);\n        for(int i=0;i<W;i++){\n            float u=(float)i/(W-1);\n            V tgt=ad
+[tr-stream call-0103:worker:xiaomi/mimo-v2.5-pro-ultraspeed] (ad(ll,ml(vU,u)),ml(vV,v));\n            V rd=nm(su(tgt,cam));\n            V c=tr(cam,rd,sc);\n            int r=(int)(fminf(c.x,1.f)*255.99f),g=(int)(fminf(c.y,1.f)*255.99f),b=(int)(fminf(c.z,1.f)*255.99f);\n            fprintf(f,\"%d %d %d\\n\",r,g,b);\n        }\n    }\n    fclose(f);return 0;\n}\nCEOF\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "gcc -static -O0 -o image image.c -lm 2>&1 &&
+[tr-stream call-0103:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  ./image && python3 compare.py\n",
+      "duration": 300.0
+    }
+  ],
+  "task_complete": false
+}
+
+[tr-stream call-0103:worker:xiaomi/mimo-v2.5-pro-ultraspeed] worker.done finish=stop cost_microdollars=255439
+[tr-stream call-0103:xiaomi/mimo-v2.5-pro-ultraspeed] {
+  "analysis": "Let me try a completely different approach. I'll disable shadow completely and see what impact that has on the score. The checker parity issue and shadow together are causing the bulk of the error. I need to isolate which is the bigger contributor.",
+  "plan": "1. Disable shadow and test\n2. Then try different approaches for the checker",
+  "commands": [
+    {
+      "keystrokes": "cat > image.c << 'CEOF'\n#include <stdio.h>\n#include <math.h>\ntypedef struct{float x,y,z;}V;\nV mk(float x,float y,float z){V r;r.x=x;r.y=y;r.z=z;return r;}\nV ad(V a,V b){return mk(a.x+b.x,a.y+b.y,a.z+b.z);}\nV su(V a,V b){return mk(a.x-b.x,a.y-b.y,a.z-b.z);}\nV ml(V a,float t){return mk(a.x*t,a.y*t,a.z*t);}\nfloat dt(V a,V b){return a.x*b.x+a.y*b.y+a.z*b.z;}\nV nm(V v){float l=sqrtf(dt(v,v));return mk(v.x/l,v.y/l,v.z/l);}\n#define W 2400\n#define H 1800\nfloat sr=1.f,py=-1.5f;\nV ld;\nfloat hs(V ro,V sc,V rd){V oc=su(ro,sc);float b=dt(oc,rd),c=dt(oc,oc)-sr*sr,h=b*b-c;return h<0?-1:-b-sqrtf(h);}\nfloat hp(V ro,V rd){if(fabsf(rd.y)<1e-6f)return-1;float t=(py-ro.y)/rd.y;return t>0?t:-1;}\nV tr(V ro,V rd,V sc){\n    float ts=hs(ro,sc,rd),tp=hp(ro,rd),t;int h1=0,h2=0;\n    if(ts>0&&tp>0){if(ts<tp){t=ts;h1=1;}else{t=tp;h2=1;}}\n    else if(ts>0){t=ts;h1=1;}\n    else if(tp>0){t=tp;h2=1;}\n    else{V n=nm(rd);float a=.5f*(n.y+1.f);return ad(ml(mk(1,1,1),1.f-a),ml(mk(.5f,.7f,1.f),a));}\n    V pos=ad(ro,ml(rd,t)),N;\n    V color;\n    if(h1){N=nm(su(pos,sc));color=mk(1.f,.2f,.2f);}\n    else{N=mk(0,1,0);\n    double px=(double)ro.x+(double)t*(double)rd.x;\n    double pz=(double)ro.z+(double)t*(double)rd.z;\n    int cx=(int)floor(px);\n    int cz=(int)floor(pz);\n    int s=(cx+cz)&1;\n    float ck=s?.4f:.9f;color=mk(ck,ck,ck);}\n    float diff=fmaxf(dt(N,ld),0.f);\n    return ml(color,.2f+.8f*diff);\n}\nint main(){\n    ld=nm(mk(1.f,1.f,1.f));\n    V cam={0,-.5f,-5.f};\n    V sc={0,-1.f,0};\n    FILE*f=fopen(\"reconstructed.ppm\",\"w\");\n    fprintf(f,\"P3\\n%d %d\\n255\\n\",W,H);\n    float vw=2.f*W/H;\n    float vh=2.f;\n    V vU=mk(vw,0,0);\n    V vV=mk(0,vh,0);\n    V fl=mk(0,0,1.f);\n    V ll=ad(su(su(cam,ml(vU,.5f)),ml(vV,.5f)),fl);\n    for(int j=0;j<H;j++){\n        float v=1.f-(float)j/(H-1);\n        for(int i=0;i<W;i++){\n            float u=(float)i/(W-1);\n            V tgt=ad(ad(ll,ml(vU,u)),ml(vV,v));\n            V rd=nm(su(tgt,cam));\n            V c=tr(cam,rd,sc);\n            int r=(int)(fminf(c.x,1.f)*255.99f),g=(int)(fminf(c.y,1.f)*255.99f),b=(int)(fminf(c.z,1.f)*255.99f);\n            fprintf(f,\"%d %d %d\\n\",r,g,b);\n        }\n    }\n    fclose(f);return 0;\n}\nCEOF\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "gcc -static -O0 -o image image.c -lm 2>&1 && ./image && python3 compare.py\n",
+      "duration": 300.0
+    }
+  ],
+  "task_complete": false
+}

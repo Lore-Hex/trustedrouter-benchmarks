@@ -1,0 +1,355 @@
+
+[tr-stream call-0080:socrates:trustedrouter/socrates-pro-plus-1.0] socrates.started
+
+[tr-stream call-0080:worker:xiaomi/mimo-v2.5-pro-ultraspeed] worker.started
+[tr-thinking call-0080:worker:xiaomi/mimo-v2.5-pro-ultraspeed] The problem is still 0.754. The main issues seem to be:
+1. Checker phase mismatch at some points
+2. Shadow region differences
+
+Let me think about this differently. The checker diagnostic shows:
+- At row 1000, x=100: s=0, orig=DARK(67). With s?.4f:.9f → s=0→0.9→LIGHT(152). WRONG!
+  - But orig is DARK(67). So s=0 should give DARK.
+
+Wait, the current code has `float ck=s?.4f:.9f;` which means s=1
+[tr-thinking call-0080:worker:xiaomi/mimo-v2.5-pro-ultraspeed] →0.4, s=0→0.9. But the diagnostic shows s=0 points that are DARK. So actually s=0 should map to 0.4 (dark) and s=1 to 0.9 (light)? No, wait...
+
+Let me re-read the checker diagnostic more carefully:
+
+Row 1000:
+x=100: s=0, orig=(67) DARK → s=0 should give DARK (0.4)
+x=300: s=0, orig=(152) LIGHT → s=0 should give LIGHT (0.9)
+
+Wait, s=0 gives
+[tr-thinking call-0080:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  both dark and light? That can't be right...
+
+Oh I see, x=100 at row 1000 has s=0 and DARK, but x=300 at row 1000 also has s=0 and LIGHT. That means my checker analysis in the diagnostic is wrong, or there's a shadow effect.
+
+Actually wait - the values at row 1000 include shadow effects. Looking more carefully:
+- x=100: s=0, DARK(67) → 0.4 * 0.662 = 67, in shadow? No, 0.4*0.662=67.7
+- x=300: s
+[tr-thinking call-0080:worker:xiaomi/mimo-v2.5-pro-ultraspeed] =0, LIGHT(152) → 0.9 * 0.662 = 152. 
+
+So s=0 gives BOTH dark and light squares depending on position. That means... the checker isn't determined by just s = (floor(x)+floor(z)) & 1.
+
+Wait, I'm confused. Let me re-read: at row 1000, both x=100 and x=300 have the same s=0 but different colors. This means my floor computation is wrong for some of them, OR the world positions are different enough.
+
+Actually, looking at the
+[tr-thinking call-0080:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  world positions:
+- x=100: wx=-10.94, fz=3, fx=-11. fx+fz = -11+3 = -8, even, s=0
+- x=300: wx=-8.95, fz=3, fx=-9. fx+fz = -9+3 = -6, even, s=0
+
+Both s=0. But x=100 is DARK and x=300 is LIGHT. This means the checker pattern is NOT just (floor(x)+floor(z))%2. There must be something else going on.
+
+Unless... in the original, floor(-1
+[tr-thinking call-0080:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 0.94) in float = -11 (correct), but floor(-8.95) might be different in float? In single precision, -8.95 might be -8.949999... which floor would give -9. Hmm, but the diagnostic already computed fx=-9.
+
+Wait, I realize the issue: the diagonal samples at x=100,300,500,700 might not actually have the same `s` due to float precision differences in the original program. But even so, -11+3=-8 and -9+3=-6, both even.
+
+OK so maybe the checker formula is
+[tr-thinking call-0080:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  different. Let me look at the original disassembly again more carefully. The key section is:
+```
+floorf(pos.x) + floorf(pos.z)
+```
+
+The original casts the result of floor to int using `cvttsd2si`. The double-precision sum is converted to int. Let me check if there could be different behavior for negative values.
+
+Actually, looking at the assembly:
+```
+floor(pos.x) → double result in xmm0
+floor(pos.z) → double result in xmm0  
+adds double
+cvttsd2si eax, xmm0
+and eax, 1
+test eax, eax
+sete al
+```
+
+So if `sete` (set if
+[tr-thinking call-0080:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  equal to zero) means s is set when the AND result is 0, i.e., when (floor(x)+floor(z)) is EVEN. And that value at [rbp-0xa4] is checked:
+```
+cmp [rbp-0xa4], 0
+je → color = 0.4
+```
+
+So if a4 == 0 (i.e., sum is even), color = 0.4. If a4 != 0 (sum is odd), color = 0.9.
+
+That means:
+- EVEN sum → 0.4 (dark)
+- ODD sum → 0.9 (light)
+
+In my code: `int s=((int)(fx+fz))&1; float ck=s?.4f
+[tr-thinking call-0080:worker:xiaomi/mimo-v2.5-pro-ultraspeed] :.9f;`
+- s=1 (odd) → 0.4
+- s=0 (even) → 0.9
+
+This is INVERTED from what the original does! The original has even→0.4, odd→0.9. My code has even→0.9, odd→0.4.
+
+But the checker analysis showed that s=0 (even) gives BOTH dark and light, which contradicts... Oh wait, my diagnostic computes `s` using `int(fx)+int(fz)` which handles negative numbers differently than `(int)(fx+fz)`.
+
+The issue is with casting: `int(-11)
+[tr-thinking call-0080:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  + int(3) = -8` (even), but `(int)(-11.0+3.0) = (int)(-8.0) = -8` (also even). These should be the same.
+
+But actually, `floor(-10.94) = -11.0` in double. `floor(3.95) = 3.0`. Sum = -8.0. `cvttsd2si(-8.0) = -8`. -8 & 1 = 0. `sete` → a4 = 1. So a4 = 1 means odd
+[tr-thinking call-0080:worker:xiaomi/mimo-v2.5-pro-ultraspeed] ? No...
+
+Let me re-read:
+```
+and eax, 0x1   ; eax = (floor(x)+floor(z)) & 1
+test eax, eax   ; set ZF if eax==0
+sete al         ; al = 1 if ZF=1, i.e., eax was 0
+```
+
+So al = 1 when sum is EVEN, al = 0 when sum is ODD.
+
+Then:
+```
+cmp [rbp-0xa4], 0  ; compare al (stored at -0xa4) with 0
+je 2165             ; jump if al==0 (sum
+[tr-thinking call-0080:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  is ODD) → color = 0.4
+; fall through → color = 0.9
+```
+
+Wait, the disassembly shows:
+```
+2124: cmp [rbp-0xa4], 0
+212b: je 2165       ; if a4==0, jump to 2165
+212d: ... color = 0.9 at 212d
+2165: ... color = 0.4 at 2165
+```
+
+So if a4==0 (sum is ODD), jump to 0.4 color
+[tr-thinking call-0080:worker:xiaomi/mimo-v2.5-pro-ultraspeed] .
+If a4!=0 (sum is EVEN), fall through to 0.9 color.
+
+So:
+- ODD sum → 0.4
+- EVEN sum → 0.9
+
+In my code: `s=1 (odd) → ck=0.4`, `s=0 (even) → ck=0.9`.
+
+This is what I have! So my code is correct for the checker mapping.
+
+But the diagnostic showed that both x=100 and x=300 at row 1000 have s=0 but different colors. That means there's something else going on... maybe the shadow from
+[tr-thinking call-0080:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  the sphere is changing the checker color. Let me check: if a point is in shadow, the lighting is 0.2 instead of 0.662. So 0.9*0.2=0.18 → 46, and 0.4*0.2=0.1 → 26. That doesn't match either.
+
+Wait, looking again at the diagnostic: at row 1000, the sphere should still be there. Let me check: the sphere extends from about row 810 to 1150 based on the edge analysis. At row 1000, the
+[tr-thinking call-0080:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  sphere is between x=1016 and x=1383. The diagnostic samples at x=100,300,500,700 are all OUTSIDE the sphere. So these are ground pixels. But x=100 gives DARK(67) and x=300 gives LIGHT(152), both with s=0.
+
+Hmm, but I said the shadow should make things darker. Let me recalculate:
+- x=100: s=0 (even) → color=0.9 → lighting=0.662 → 
+[tr-thinking call-0080:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 0.9*0.662*255=152. But orig=67.
+- x=300: s=0 (even) → color=0.9 → lighting=0.662 → 0.9*0.662*255=152. And orig=152.
+
+So x=100 should be 152 but is 67 in the original. The checker diagnostic says s=0 for both, but they have different colors. This means my floor computation is wrong for one of them.
+
+Actually, wait - my diagnostic computes floor using Python's math.floor,
+[tr-thinking call-0080:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  but the original C code converts float→double first then floors. For pos.x, this is a float. Let me check: pos.x for x=100, y=1000...
+
+Actually, I think the issue might be simpler: the diagnostic computes `int(fx)+int(fz)` in Python, but the original C code does `(int)(fx+fz)` where fx and fz are doubles from floor. The difference is that `int(-11) + int(3) = -8` and `(int)(-11.0 + 3.0) = (int)(-8.0) = -8`. These are the same.
+
+Unless the float→
+[tr-thinking call-0080:worker:xiaomi/mimo-v2.5-pro-ultraspeed] double conversion introduces slight errors. For example, if pos.x as a float is -10.9375, then `(double)pos.x = -10.9375` and `floor(-10.9375) = -11.0`. That should be fine.
+
+OK, I think the real issue is that I'm not correctly identifying which pixels are ground vs sphere in the diagnostic. Let me look at this differently - maybe the problem is actually in the light direction and there's a different direction that matches better.
+
+Actually, let me step back. I have 0.754 similarity. The max diff is 147 (from checker
+[tr-thinking call-0080:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  mismatch). If I could fix the checker phase issue, I'd gain a lot. Let me think about what's different.
+
+Actually, maybe the issue is that my projection formula is slightly off from the original. The viewport formula creates a slightly different mapping between pixels and world coordinates, which means the checker squares map to different pixels. Let me try a different approach: instead of trying to fix the projection, let me try both checker phases and pick the one that gives better overall similarity.
+
+But I already tried both! s?.4f:.9f gives 0.754 and s?.9f:.4f gives 0.728. So the
+[tr-thinking call-0080:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  current mapping is better.
+
+The problem must be that my projection is slightly off. Let me try adjusting the focal length / viewport parameters.
+
+Actually, looking at the row-averaged diffs, the errors are concentrated in rows 900-1700 (ground and sphere). The sky (rows 0-800) is perfect. So the issue is definitely in the ground/sphere rendering.
+
+Let me think about what could cause a systematic checker mismatch. If the camera position is slightly different, the world coordinates would be different, causing the checker to shift. Let me try adjusting the camera y position slightly, since the
+[tr-thinking call-0080:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  sphere center was at y=-1 instead of y=0.
+
+Actually, I have the right camera (0, -0.5, -5) and sphere (0, -1, 0). Let me verify these by checking the sphere center pixel. The sphere center should be at (0, -1, 0), and from camera (0, -0.5, -5), looking toward +z, the center direction is (0, 0.5, 5). Normalized: (0, 0.0995, 0.995). At the sphere center pixel, the normal is (0, 
+[tr-thinking call-0080:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 0, -1) (pointing toward camera). With light (-1,1,1)/√3 ≈ (-0.577, 0.577, 0.577), dot(N, L) = 0 + 0 + 0.577 > 0. So there IS lighting on the front of the sphere.
+
+But the original shows 51,10,10 at row 900 center, which is 0.2*1.0*255=51 for red. That means lighting=0.2 (ambient only, diff=0). This
+[tr-thinking call-0080:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  can only happen if the normal at the sphere center points AWAY from the light.
+
+With sphere at (0,-1,0), the ray from camera (0,-0.5,-5) through pixel (1200,900) hits the sphere at some point. The normal there points from (0,-1,0) toward the hit point. For the center of the sphere (viewed from camera), the hit point is closest to the camera, which would be (0,-1,-1+something). Wait, let me compute.
+
+Camera at (0,-0.5,-5). Direction toward sphere center is (0, -1-(-0.5), 0-(-5)) = (
+[tr-thinking call-0080:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 0, -0.5, 5). Normalized: (0, -0.0995, 0.995).
+
+The ray from camera in direction (0, -0.0995, 0.995) hits the sphere at (0,-1,0) r=1:
+oc = cam - sc = (0, -0.5-(-1), -5-0) = (0, 0.5, -5)
+b = dot(oc, rd) = 0 + 0.5*(-0.0995) + (-
+[tr-thinking call-0080:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 5)(0.995) = -0.04975 - 4.975 = -5.025
+c = dot(oc,oc) - r² = 0 + 0.25 + 25 - 1 = 24.25
+h = b² - c = 25.25 - 24.25 = 1.0
+t = -b - sqrt(h) = 5.025 - 1 = 4.025
+
+hit_pos = cam + t*rd = (0,
+[tr-thinking call-0080:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  -0.5, -5) + 4.025*(0, -0.0995, 0.995) = (0, -0.5-0.400, -5+4.005) = (0, -0.9, -0.995)
+normal = norm(hit_pos - sc) = norm((0, -0.9-(-1), -0.995-0)) = norm((0, 0.1, -0.995)) ≈ (0, 0.1, -0.995)
+
+Light
+[tr-thinking call-0080:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  direction: norm(-1,1,1) = (-0.577, 0.577, 0.577)
+dot(N, L) = 0 + 0.1*0.577 + (-0.995)*0.577 = 0.0577 - 0.574 = -0.516
+
+diff = max(-0.516, 0) = 0! ✓
+
+So the sphere center DOES have diff=0 with light (-1,1,1). This is consistent with the original image
+[tr-thinking call-0080:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  showing (51,10,10) = 0.2*(1,0.2,0.2)*255.
+
+OK so the light direction (-1,1,1) is correct with sphere at (0,-1,0).
+
+Now the issue is the checker pattern. Let me check if the original uses `(int)floor(pos.x) + (int)floor(pos.z)` or `(int)(floor(pos.x) + floor(pos.z))`. Actually these would give different results for negative values when the sum is between -1 and 0.
+
+For example: floor(-0.3) + floor(0.1) = -1 + 0 = -1. And (int)(floor(-
+[tr-thinking call-0080:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 0.3) + floor(0.1)) = (int)(-1.0) = -1. Same.
+
+But what about (int)floor(-0.3) + (int)floor(0.1) = -1 + 0 = -1? Also same.
+
+What about cases with float precision? Hmm, I don't think this is the issue.
+
+Let me look at the actual code output more carefully. At the diagnostic:
+Row 1000, x=100: fx=-11, fz=3, s=0, orig=DARK(67)
+Row
+[tr-thinking call-0080:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  1000, x=300: fx=-9, fz=3, s=0, orig=LIGHT(152)
+
+Both have s=0 but different colors. This means either:
+1. My world coordinate calculation is wrong (so fx/fz are wrong)
+2. The original uses a different checker formula
+3. There's something else affecting the color (like shadow)
+
+For x=100 at row 1000: I computed wx=-10.94, but what if the original computes slightly different wx? If the original's wx is -10.01 instead of -10.94, then floor
+[tr-thinking call-0080:worker:xiaomi/mimo-v2.5-pro-ultraspeed] (-10.01) = -11. Still the same.
+
+Wait, let me think about this differently. 67/152 = 0.44. And 0.4/0.9 = 0.44. So 67 = 0.4*lighting*255. With lighting=0.662, 0.4*0.662*255=67.6 → 67 ✓.
+
+But what if there's a shadow at x=100? 0.9*0.2*255=46. That doesn't match 67. And 0.4*0.2*255=2
+[tr-thinking call-0080:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 0. Also doesn't match.
+
+So x=100 must be checker=0.4 with full lighting (0.662), giving 0.4*0.662*255 = 67. And x=300 is checker=0.9 with full lighting, giving 0.9*0.662*255 = 152.
+
+But my diagnostic says s=0 for both, which would mean they're the same checker square. So my world coordinate calculation is wrong for at least one of them.
+
+Let me manually verify. The projection is:
+cam = (0, -
+[tr-thinking call-0080:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 0.5, -5)
+vU = (2.667, 0, 0)
+vV = (0, 2, 0)
+fl = (0, 0, 1)
+lower_left = cam - vU/2 - vV/2 + fl = (0-1.333, -0.5-1, -5+1) = (-1.333, -1.5, -4)
+
+For pixel (100, 1000):
+u = 100/2399 = 0.04168
+v = 1 - 
+[tr-thinking call-0080:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 1000/1799 = 0.44413
+
+target = ll + u*vU + v*vV = (-1.333 + 0.04168*2.667, -1.5 + 0.44413*2, -4)
+       = (-1.333 + 0.111, -1.5 + 0.888, -4)
+       = (-1.222, -0.612, -4)
+
+rd = norm(target - cam) = norm((-1.222, -0.1
+[tr-thinking call-0080:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 12, 1))
+l = sqrt(1.222² + 0.112² + 1) = sqrt(1.493 + 0.0125 + 1) = sqrt(2.506) = 1.583
+
+Ground intersection: t = (-1.5 - (-0.5)) / (-0.112/1.583) = -1 / (-0.0707) = 14.14
+wx = 0 + (-1.222/1.583)*14.14 = -0.772*14.14 = -10.91
+wz = -5 + (1/1.583)*
+[tr-thinking call-0080:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 14.14 = -5 + 8.93 = 3.93
+
+So floor(-10.91) = -11, floor(3.93) = 3. Sum = -8, even.
+
+For pixel (300, 1000):
+u = 300/2399 = 0.12505
+target = (-1.333 + 0.12505*2.667, -0.612, -4)
+       = (-1.333 + 0.333, -0.612, -4)  
+       = (-1.00
+[tr-thinking call-0080:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 0, -0.612, -4)
+
+rd = norm((-1.000, -0.112, 1))
+l = sqrt(1 + 0.0125 + 1) = sqrt(2.0125) = 1.419
+
+t = -1 / (-0.112/1.419) = -1 / (-0.0789) = 12.67
+wx = (-1.000/1.419)*12.67 = -0.705*12.67 = -8.93
+wz = -5 + (1/1.419)*12.6
+[tr-thinking call-0080:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 7 = -5 + 8.93 = 3.93
+
+floor(-8.93) = -9, floor(3.93) = 3. Sum = -6, even.
+
+So both are even, s=0. But one is dark and one is light. This means either my projection is wrong, or the original has a different checker formula.
+
+Hmm, wait. The original has the checker pattern but it might use `pos.x` and `pos.z` directly, where pos.x is computed in single precision. The float rounding could change floor results.
+
+Let me think about what float values these would be. In single precision:
+-1
+[tr-thinking call-0080:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 0.91 as float: the nearest float is -10.90999984741211 or something. floor of that is still -11.
+-8.93 as float: the nearest float is -8.930000305175781 or similar. floor of that is -9.
+
+So the floor should be the same. Unless the projection itself computes slightly different world coordinates in float.
+
+Actually, I think the key insight is that I'm using `float` for positions but the original might compute positions in double, or the matrix operations might produce slightly different intermediate values.
+
+
+[tr-thinking call-0080:worker:xiaomi/mimo-v2.5-pro-ultraspeed] Let me try a completely different approach. Since I have 0.754 similarity and need 0.99, the main problem areas are:
+1. Checker phase mismatch (rows 900+)
+2. Shadow regions
+
+Let me try to simply match the original more exactly. What if I just run the original binary and extract its exact scene parameters by examining the output? Let me try tracing the original binary with system calls or by inserting a print in the C code.
+
+Actually, wait - I can try to reconstruct the image using the orig binary but with modified parameters. Let me think of another approach: I'll write a Python script that reads the original image, extracts
+[tr-thinking call-0080:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  the ground truth checker pattern pixel by pixel, and figures out the exact formula.
+
+Actually, let me think more carefully. The checker at x=100 row 1000 should be one way, and x=300 should be the other. My computation says both are even. Maybe the issue is that the projection in the original is slightly different.
+
+What if the original uses `i / W` instead of `i / (W-1)`? Let me check:
+u = 100/2400 = 0.04167 instead of 100/2399 = 0.04168
+That's a
+[tr-thinking call-0080:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  tiny difference, unlikely to change floor values.
+
+What if the original doesn't divide by (H-1) and W-1 but uses the ratio differently?
+
+Actually, let me look at the disassembly more carefully. I know that at 0x296b-0x2993, there's a computation of something like `j / (height - 1)`:
+```
+cvtsi2ss xmm0, j
+mov eax, height-1
+cvtsi2ss xmm1, eax
+divss xmm0, xmm1
+```
+
+And similarly for i. But wait, there could also be a version that
+[tr-thinking call-0080:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  uses `2*i / (W-1) - 1` or `2*(i+0.5)/W - 1` etc.
+
+Actually, looking at the disassembly for the inner loop more carefully, I need to see how `u` is computed. Let me look at the section around 0x2930-0x2970 which computes the progress and the pixel coordinates.
+
+Let me just try changing the projection to use `i/W` and `j/H` instead of `i/(W-1)` and `j/(H-1)`.
+
+Actually, I realize I should look at this from a different angle. Let me try
+[tr-thinking call-0080:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  to directly match the original by writing a parametric test in Python.
+
+Actually, let me try something simpler: compile with the same GCC version and flags as the original binary.
+[tr-stream call-0080:worker:xiaomi/mimo-v2.5-pro-ultraspeed] {
+  "analysis": "The 0.754 similarity is not enough. The main issue is the checker pattern mismatch. Looking at the diagnostic, even though I have the right parameters (camera, sphere, light, checker values), the world coordinate computation produces checker squares at slightly wrong pixel positions. This is likely due to a subtle difference in the projection formula. Let me try the advisor to get help with this high-stakes debugging.",
+  "plan": "1. Ask the advisor for guidance on the projection formula\n2. Then implement
+[tr-stream call-0080:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  the fix and iterate",
+  "commands": [
+    {
+      "keystrokes": "",
+      "duration": 0.1
+    }
+  ],
+  "task_complete": false
+}
+
+[tr-stream call-0080:worker:xiaomi/mimo-v2.5-pro-ultraspeed] worker.done finish=stop cost_microdollars=209666
+[tr-stream call-0080:xiaomi/mimo-v2.5-pro-ultraspeed] {
+  "analysis": "The 0.754 similarity is not enough. The main issue is the checker pattern mismatch. Looking at the diagnostic, even though I have the right parameters (camera, sphere, light, checker values), the world coordinate computation produces checker squares at slightly wrong pixel positions. This is likely due to a subtle difference in the projection formula. Let me try the advisor to get help with this high-stakes debugging.",
+  "plan": "1. Ask the advisor for guidance on the projection formula\n2. Then implement the fix and iterate",
+  "commands": [
+    {
+      "keystrokes": "",
+      "duration": 0.1
+    }
+  ],
+  "task_complete": false
+}

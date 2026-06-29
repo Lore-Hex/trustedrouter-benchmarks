@@ -1,0 +1,256 @@
+[?2004hroot@056effc8add4:/app# cat > /app/parallel_linear.py << 'EOF'
+[?2004l[?2004h> import torch
+[?2004l[?2004h> import torch.nn as nn
+[?2004l[?2004h> import torch.nn.functional as F
+[?2004l[?2004h> import torch.distributed as dist
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> class _AllGather(torch.autograd.Function):
+[?2004l[?2004h>     """All-gather along the last dimension with autograd support."""
+[?2004l[?2004h> 
+[?2004l[?2004h>     @staticmethod
+[?2004l[?2004h>     def forward(ctx, input_):
+[?2004l[?2004h>         world_size = dist.get_world_size()
+[?2004l[?2004h>         tensor_list = [torch.empty_like(input_) for _ in range(world_size)]
+[?2004l[?2004h>         dist.all_gather(tensor_list, input_.contiguous())
+[?2004l[?2004h>         output = torch.cat(tensor_list, dim=-1)
+[?2004l[?2004h>         return output
+[?2004l[?2004h> 
+[?2004l[?2004h>     @staticmethod
+[?2004l[?2004h>     def backward(ctx, grad_output):
+[?2004l[?2004h>         world_size = dist.get_world_size()
+[?2004l[?2004h>         rank = dist.get_rank()
+[?2004l[?2004h>         # Reverse of concatenation is splitting; each rank gets its chunk
+[?2004l[?2004h>         chunks = grad_output.chunk(world_size, dim=-1)
+[?2004l[?2004h>         return chunks[rank].contiguous()
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> class _AllReduce(torch.autograd.Function):
+[?2004l[?2004h>     """All-reduce (sum) with autograd support."""
+[?2004l[?2004h> 
+[?2004l[?2004h>     @staticmethod
+[?2004l[?2004h>     def forward(ctx, input_):
+[?2004l[?2004h>         output = input_.clone()
+[?2004l[?2004h>         dist.all_reduce(output, op=dist.ReduceOp.SUM)
+[?2004l[?2004h>         return output
+[?2004l[?2004h> 
+[?2004l[?2004h>     @staticmethod
+[?2004l[?2004h>     def backward(ctx, grad_output):
+[?2004l[?2004h>         # Gradient of sum-all-reduce is identity on each rank
+[?2004l[?2004h>         return grad_output
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> class ColumnParallelLinear(nn.Module):
+[?2004l[?2004h>     """Linear layer with weight partitioned along the output dimension.
+[?2004l[?2004h> 
+[?2004l[?2004h>     Each rank holds a shard of shape (out_features // world_size, in_features).
+[?2004l[?2004h>     Forward computes the local matmul then all-gathers to produce the full output.
+[?2004l[?2004h>     Bias is sharded the same way as the output dimension.
+[?2004l[?2004h>     """
+[?2004l[?2004h> 
+[?2004l[?2004h>     def __init__(self, in_features, out_features, bias, master_weight):
+[?2004l[?2004h>         super().__init__()
+[?2004l[?2004h>         world_size = dist.get_world_size()
+[?2004l[?2004h>         rank = dist.get_rank()
+[?2004l[?2004h> 
+[?2004l[?2004h>         assert out_features % world_size == 0
+[?2004l[?2004h>         self.out_features_per_rank = out_features // world_size
+[?2004l[?2004h> 
+[?2004l[?2004h>         # master_weight shape: (out_features, in_features)
+[?2004l[?2004h>         # Split along dim=0 (output/features dimension)
+[?2004l[?2004h>         weight_shards = master_weight.chunk(world_size, dim=0)
+[?2004l[?2004h>         self.weight = nn.Parameter(weight_shards[rank].contiguous().clone())
+[?2004l[?2004h> 
+[?2004l[?2004h>         if bias:
+[?2004l[?2004h>             self.bias = nn.Parameter(
+[?2004l[?2004h>                 torch.zeros(
+[?2004l[?2004h>                     self.out_features_per_rank,
+[?2004l[?2004h>                     device=master_weight.device,
+[?2004l[?2004h>                     dtype=master_weight.dtype,
+[?2004l[?2004h>                 )
+[?2004l[?2004h>             )
+[?2004l[?2004h>         else:
+[?2004l[?2004h>             self.bias = None
+[?2004l[?2004h> 
+[?2004l[?2004h>     def forward(self, x):
+[?2004l[?2004h>         # Local matmul: x @ W_local^T + b_local
+[?2004l[?2004h>         output_local = F.linear(x, self.weight, self.bias)
+[?2004l[?2004h>         # All-gather: concatenate partial outputs along last dim
+[?2004l[?2004h>         output = _AllGather.apply(output_local)
+[?2004l[?2004h>         return output
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> class RowParallelLinear(nn.Module):
+[?2004l[?2004h>     """Linear layer with weight partitioned along the input dimension.
+[?2004l[?2004h> 
+[?2004l[?2004h>     Each rank holds a shard of shape (out_features, in_features // world_size).
+[?2004l[?2004h>     The input to forward() is already the local scatter of the full input.
+[?2004l[?2004h>     Forward computes the local matmul then all-reduces (sums) partial outputs.
+[?2004l[?2004h>     Bias is full (not sharded) and applied after the all-reduce.
+[?2004l[?2004h>     """
+[?2004l[?2004h> 
+[?2004l[?2004h>     def __init__(self, in_features, out_features, bias, master_weight):
+[?2004l[?2004h>         super().__init__()
+[?2004l[?2004h>         world_size = dist.get_world_size()
+[?2004l[?2004h>         rank = dist.get_rank()
+[?2004l[?2004h> 
+[?2004l[?2004h>         assert in_features % world_size == 0
+[?2004l[?2004h> 
+[?2004l[?2004h>         # master_weight shape: (out_features, in_features)
+[?2004l[?2004h>         # Split along dim=1 (input dimension)
+[?2004l[?2004h>         weight_shards = master_weight.chunk(world_size, dim=1)
+[?2004l[?2004h>         self.weight = nn.Parameter(weight_shards[rank].contiguous().clone())
+[?2004l[?2004h> 
+[?2004l[?2004h>         if bias:
+[?2004l[?2004h>             self.bias = nn.Parameter(
+[?2004l[?2004h>                 torch.zeros(
+[?2004l[?2004h>                     out_features,
+[?2004l[?2004h>                     device=master_weight.device,
+[?2004l[?2004h>                     dtype=master_weight.dtype,
+[?2004l[?2004h>                 )
+[?2004l[?2004h>             )
+[?2004l[?2004h>         else:
+[?2004l[?2004h>             self.bias = None
+[?2004l[?2004h> 
+[?2004l[?2004h>     def forward(self, x):
+[?2004l[?2004h>         # Local matmul with pre-scattered input (no bias yet)
+[?2004l[?2004h>         output_local = F.linear(x, self.weight)
+[?2004l[?2004h>         # All-reduce: sum partial outputs across ranks
+[?2004l[?2004h>         output = _AllReduce.apply(output_local)
+[?2004l[?2004h>         # Add full bias after reduction
+[?2004l[?2004h>         if self.bias is not None:
+[?2004l[?2004h>             output = output + self.bias
+[?2004l[?2004h>         return output
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@056effc8add4:/app# ls -la /app/
+[?2004ltotal 8
+drwxr-xr-x 1 root root   36 Jun 29 01:49 [0m[01;34m.[0m
+drwxr-xr-x 1 root root   38 Jun 29 01:49 [01;34m..[0m
+-rw-r--r-- 1 root root 4211 Jun 29 01:49 parallel_linear.py
+[?2004hroot@056effc8add4:/app# python3 -c "import ast; ast.parse(open('/app/parallel_linear.py').read()); print('Syntax OK')"
+[?2004lbash: python3: command not found
+[?2004hroot@056effc8add4:/app# which python python3 2>/dev/null; ls /usr/bin/python* 2>/dev/null; ls /usr/local/bin/python* 2>/dev/null
+[?2004l[?2004hroot@056effc8add4:/app# cat /app/parallel_linear.py
+[?2004limport torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.distributed as dist
+
+
+class _AllGather(torch.autograd.Function):
+    """All-gather along the last dimension with autograd support."""
+
+    @staticmethod
+    def forward(ctx, input_):
+        world_size = dist.get_world_size()
+        tensor_list = [torch.empty_like(input_) for _ in range(world_size)]
+        dist.all_gather(tensor_list, input_.contiguous())
+        output = torch.cat(tensor_list, dim=-1)
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        world_size = dist.get_world_size()
+        rank = dist.get_rank()
+        # Reverse of concatenation is splitting; each rank gets its chunk
+        chunks = grad_output.chunk(world_size, dim=-1)
+        return chunks[rank].contiguous()
+
+
+class _AllReduce(torch.autograd.Function):
+    """All-reduce (sum) with autograd support."""
+
+    @staticmethod
+    def forward(ctx, input_):
+        output = input_.clone()
+        dist.all_reduce(output, op=dist.ReduceOp.SUM)
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        # Gradient of sum-all-reduce is identity on each rank
+        return grad_output
+
+
+class ColumnParallelLinear(nn.Module):
+    """Linear layer with weight partitioned along the output dimension.
+
+    Each rank holds a shard of shape (out_features // world_size, in_features).
+    Forward computes the local matmul then all-gathers to produce the full output.
+    Bias is sharded the same way as the output dimension.
+    """
+
+    def __init__(self, in_features, out_features, bias, master_weight):
+        super().__init__()
+        world_size = dist.get_world_size()
+        rank = dist.get_rank()
+
+        assert out_features % world_size == 0
+        self.out_features_per_rank = out_features // world_size
+
+        # master_weight shape: (out_features, in_features)
+        # Split along dim=0 (output/features dimension)
+        weight_shards = master_weight.chunk(world_size, dim=0)
+        self.weight = nn.Parameter(weight_shards[rank].contiguous().clone())
+
+        if bias:
+            self.bias = nn.Parameter(
+                torch.zeros(
+                    self.out_features_per_rank,
+                    device=master_weight.device,
+                    dtype=master_weight.dtype,
+                )
+            )
+        else:
+            self.bias = None
+
+    def forward(self, x):
+        # Local matmul: x @ W_local^T + b_local
+        output_local = F.linear(x, self.weight, self.bias)
+        # All-gather: concatenate partial outputs along last dim
+        output = _AllGather.apply(output_local)
+        return output
+
+
+class RowParallelLinear(nn.Module):
+    """Linear layer with weight partitioned along the input dimension.
+
+    Each rank holds a shard of shape (out_features, in_features // world_size).
+    The input to forward() is already the local scatter of the full input.
+    Forward computes the local matmul then all-reduces (sums) partial outputs.
+    Bias is full (not sharded) and applied after the all-reduce.
+    """
+
+    def __init__(self, in_features, out_features, bias, master_weight):
+        super().__init__()
+        world_size = dist.get_world_size()
+        rank = dist.get_rank()
+
+        assert in_features % world_size == 0
+
+        # master_weight shape: (out_features, in_features)
+        # Split along dim=1 (input dimension)
+        weight_shards = master_weight.chunk(world_size, dim=1)
+        self.weight = nn.Parameter(weight_shards[rank].contiguous().clone())
+
+        if bias:
+            self.bias = nn.Parameter(
+                torch.zeros(
+                    out_features,
+                    device=master_weight.device,
+                    dtype=master_weight.dtype,
+                )
+            )
+        else:
+            self.bias = None
+
+    def forward(self, x):
+        # Local matmul with pre-scattered input (no bias yet)
+        output_local = F.linear(x, self.weight)
+        # All-reduce: sum partial outputs across ranks
+        output = _AllReduce.apply(output_local)
+        # Add full bias after reduction
+        if self.bias is not None:
+            output = output + self.bias
+        return output
+[?2004hroot@056effc8add4:/app# 

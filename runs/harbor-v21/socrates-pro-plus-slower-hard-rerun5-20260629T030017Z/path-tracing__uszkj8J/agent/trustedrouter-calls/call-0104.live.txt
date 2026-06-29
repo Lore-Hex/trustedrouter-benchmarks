@@ -1,0 +1,177 @@
+
+[tr-stream call-0104:socrates:trustedrouter/socrates-pro-plus-1.0] socrates.started
+
+[tr-stream call-0104:worker:xiaomi/mimo-v2.5-pro-ultraspeed] worker.started
+[tr-thinking call-0104:worker:xiaomi/mimo-v2.5-pro-ultraspeed] The checker parity mismatch is the dominant error source, and shadow barely matters (0.7557 without shadow vs 0.7555 with shadow). The 50% random checker mismatch is killing the score.
+
+The problem is that the ground hit point is being computed incorrectly - the floor values are wrong by a tiny epsilon, causing the parity to flip randomly. This means the computed world coordinates x and z at the ground plane are slightly off from the original.
+
+Wait - could the issue be that the original uses a different formula for the ray? Let me look at the trace function's hit point computation again. In my code, I compute:
+``
+[tr-thinking call-0104:worker:xiaomi/mimo-v2.5-pro-ultraspeed] `
+pos = origin + t * normalized_direction
+```
+
+But what if the original stores the ray as a struct { origin, direction } where direction is the UN-normalized vector? Then ray_at would give a different hit point for the same t value. But that wouldn't work because sphere_intersect uses the same formula...
+
+Actually wait - looking at the sphere_intersect code more carefully. The discriminant formula is `h = b*b - c` where:
+- b = dot(oc, rd) 
+- c = dot(oc, oc) - r*r
+
+This is the standard formula for normalized ray directions. If the direction were unnormalized, there would
+[tr-thinking call-0104:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  be a `a = dot(rd, rd)` term. So the direction IS normalized in the sphere intersection.
+
+But wait - in the plane intersection, the hit point is computed as `origin + t * direction` where direction is normalized. This gives the correct position.
+
+Hmm, let me think about this differently. What if the checker issue is because I have the wrong sign of the parity? What if `s=1` should give `0.9` (light) and `s=0` should give `0.4` (dark)?
+
+But I already tried swapping and it gave 0.728, worse than 0.755.
+
+Wait - but
+[tr-thinking call-0104:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  the previous swap test was with a different sphere center! Let me re-verify with the current sphere center (0,-1,0).
+
+Actually, looking more carefully at the diagnostic output:
+- Row 1700: mismatch 33.3% (better than 50%)
+- Row 1500: mismatch 50.0%
+- Row 1300: mismatch 44.4%
+
+At row 1700 (close to camera), mismatch is only 33%. At 1500, it's 50%. This is confusing. If the issue were a systematic
+[tr-thinking call-0104:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  parity flip, we'd expect either ~0% or ~100% mismatch consistently.
+
+The 50% random mismatch suggests the world coordinates computed by my code and the original differ by tiny floating point amounts, causing roughly half the floor() evaluations to produce different integer values.
+
+This is fundamentally a floating point precision issue. The original program was compiled with GCC 13.3.0 on Ubuntu, which uses x86-64 SSE instructions. My code is compiled with the same toolchain. But the optimization level and intermediate precision could differ.
+
+Let me try compiling with `-O2 -ffast-math -mfpmath=sse -
+[tr-thinking call-0104:worker:xiaomi/mimo-v2.5-pro-ultraspeed] msse2` to match the original's likely compilation flags. The original binary likely used `-O2` given its performance (it rendered in seconds). With `-O2`, GCC may use different register allocation and instruction ordering, which could change floating point results.
+
+Actually, I just realized something. I compiled with `-O0` which means NO optimization. But the original was compiled with optimization (likely `-O2`). At `-O0`, every intermediate value is stored to memory and reloaded, which in x87 mode would round to 80 bits then back to 32 bits. But with SSE (which GCC uses by default on x86-64), this shouldn't matter since all operations
+[tr-thinking call-0104:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  are 32-bit.
+
+Wait, actually the issue might be simpler. Let me check: in the original, the ray direction passed to `trace` comes from the `ray_create` function. What if `ray_create` stores the UN-normalized direction, and then `sphere_intersect` and `plane_intersect` each normalize it independently? Let me check...
+
+Looking at `sphere_intersect` at 0x16c4 - does it normalize the ray direction? Let me check the disassembly.
+
+Actually, I don't have that handy. Let me just look at the key function calls in the trace function. At 0x1d
+[tr-thinking call-0104:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 5c-0x1dde, it calls `sphere_intersect` with the ray struct. Then at 0x1df7-0x1e22, it calls `plane_intersect`. Both use the same ray struct.
+
+The ray_create function at 0x15be takes origin and direction and stores them. Then trace passes this ray to the intersection functions. The intersection functions use the direction as-is.
+
+If the direction in the ray struct is NOT normalized, then the sphere intersection formula would need a different form. Let me check the sphere_intersect formula:
+
+At 0x16c4 (sphere_intersect), the discriminant
+[tr-thinking call-0104:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  uses `h = b*b - c` where `b = dot(oc, rd)` and `c = dot(oc,oc) - r*r`. This assumes normalized direction. If the direction is not normalized, we'd need `a = dot(rd, rd)` and `h = b*b - a*c`.
+
+Since the formula doesn't include `a`, the direction must be normalized in the ray struct.
+
+So the direction IS normalized. And my code normalizes it too. The checker parity mismatch must come from something else.
+
+Hmm, let me try something completely different. What if the issue is that the original's plane_intersect function returns a
+[tr-thinking call-0104:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  DIFFERENT t value (e.g., because of a different threshold) and the hit point computation is slightly different?
+
+Or what if the original code computes the checker differently? Let me look at the disassembly again at 0x20c7-0x211f:
+
+```asm
+movss  xmm0, DWORD PTR [rbp-0x2c]    ; pos.x
+cvtss2sd xmm7, xmm0                   ; convert to double
+floor                                 ; floor
+movsd  QWORD PTR [rbp-0xf8], xmm0     ; store floor(pos.x) as double
+movss  xmm0, DWORD PTR [rbp-0x24]    ; pos.z
+cvtss2sd xmm5, xmm0                   ; convert to double
+[tr-thinking call-0104:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 
+floor                                 ; floor
+addsd  xmm0, QWORD PTR [rbp-0xf8]     ; floor(x) + floor(z)
+cvttsd2si eax, xmm0                   ; convert to int (truncate)
+and    eax, 0x1                         ; & 1
+test   eax, eax
+sete   al                              ; set if zero (parity == 0)
+```
+
+So the original code does:
+1. Convert pos.x from float to double
+2. floor() → double
+3. Store result as double
+4. Convert pos.z from float to double
+5. floor() → double
+6. Add the
+[tr-thinking call-0104:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  two double-precision floors
+7. Truncate to int
+8. AND with 1
+9. If result is 0 (even), set flag (which leads to one color; if 1, the other)
+
+The key question is: what is pos.x and pos.z? These are stored at [rbp-0x2c] and [rbp-0x24]. In the trace function, these are the hit point coordinates.
+
+My code computes:
+```c
+double px = (double)ro.x + (double)t * (double)rd.x;
+int cx = (int)floor(px);
+```
+
+The original computes the hit point as a VECT struct
+[tr-thinking call-0104:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  (all float), then extracts pos.x and pos.z from it, converts to double, and applies floor.
+
+The difference: my code uses double for the ENTIRE computation (origin + t*direction), while the original uses float for that (computing pos = ad(ro, ml(rd, t)) in float), THEN converts to double for floor.
+
+This means the hit point coordinates differ slightly! The original's float computation introduces more rounding error than my double computation. This explains the 50% random mismatch - at checker boundaries, the two approaches round to different integers.
+
+So the fix is: compute the hit point in float first, then convert to double for floor.
+
+Let me update the code to
+[tr-thinking call-0104:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  match this behavior:
+```c
+float fpx = ro.x + t * rd.x;  // float computation, like original
+float fpz = ro.z + t * rd.z;
+int cx = (int)floor((double)fpx);  // convert to double for floor
+int cz = (int)floor((double)fpz);
+```
+
+Wait, but that's what my `pos` already is! `pos = ad(ro, ml(rd, t))` computes in float. And then I do `double px = (double)ro.x + (double)t * (double)rd.x;` which is a SEPARATE double
+[tr-thinking call-0104:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  computation. That's the problem! I should use `pos.x` instead!
+
+Let me fix this to use `pos.x` and `pos.z` from the float computation:
+```c
+int cx = (int)floor((double)pos.x);
+int cz = (int)floor((double)pos.z);
+```
+
+This should match the original's behavior exactly!
+[tr-stream call-0104:worker:xiaomi/mimo-v2.5-pro-ultraspeed] {
+  "analysis": "I found the bug! In my checker code, I'm computing the hit point in DOUBLE precision separately, while the original uses the FLOAT hit point `pos` (computed as origin + t*direction in float) and THEN converts to double for floor(). I need to use `pos.x` and `pos.z` instead of recomputing in double.
+[tr-stream call-0104:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  This explains the 50% random mismatch - the double precision hit point rounds differently than the float one at checker boundaries.",
+  "plan": "1. Fix the checker to use pos.x and pos.z (float hit point) converted to double for floor, matching the original\n2. Re-enable shadow\n3. Recompile and test",
+  "commands": [
+    {
+      "keystrokes": "cat > image.c << 'CEOF'\n#include <stdio.h>\n#include <math.h>\ntypedef struct{float x,y,z;}V;\nV mk(float x,float y,float z){V r;r.x=x;r.y=y;r.z=z;return r;}\nV ad(V a,V b){return mk(a.x+b.x,a.y+b.y,a.z+b.z);
+[tr-stream call-0104:worker:xiaomi/mimo-v2.5-pro-ultraspeed] }\nV su(V a,V b){return mk(a.x-b.x,a.y-b.y,a.z-b.z);}\nV ml(V a,float t){return mk(a.x*t,a.y*t,a.z*t);}\nfloat dt(V a,V b){return a.x*b.x+a.y*b.y+a.z*b.z;}\nV nm(V v){float l=sqrtf(dt(v,v));return mk(v.x/l,v.y/l,v.z/l);}\n#define W 2400\n#define H 1800\nfloat sr=1.f,py=-1.5f;\nV ld;\nfloat hs(V ro,V sc,V rd){V oc=su(ro,sc);float b=dt(oc,rd),c=dt(oc,oc)-sr*sr,h=b
+[tr-stream call-0104:worker:xiaomi/mimo-v2.5-pro-ultraspeed] *b-c;return h<0?-1:-b-sqrtf(h);}\nfloat hp(V ro,V rd){if(fabsf(rd.y)<1e-6f)return-1;float t=(py-ro.y)/rd.y;return t>0?t:-1;}\nV tr(V ro,V rd,V sc){\n    float ts=hs(ro,sc,rd),tp=hp(ro,rd),t;int h1=0,h2=0;\n    if(ts>0&&tp>0){if(ts<tp){t=ts;h1=1;}else{t=tp;h2=1;}}\n    else if(ts>0){t=ts;h1=1;}\n    else if(tp>0){t=tp;h2=
+[tr-stream call-0104:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 1;}\n    else{V n=nm(rd);float a=.5f*(n.y+1.f);return ad(ml(mk(1,1,1),1.f-a),ml(mk(.5f,.7f,1.f),a));}\n    V pos=ad(ro,ml(rd,t)),N;\n    V color;\n    if(h1){N=nm(su(pos,sc));color=mk(1.f,.2f,.2f);}\n    else{N=mk(0,1,0);\n    int cx=(int)floor((double)pos.x);\n    int cz=(int)floor((double)pos.z);\n    int s=(cx+cz)&1;\n    float ck=s?.4f:.9f;color
+[tr-stream call-0104:worker:xiaomi/mimo-v2.5-pro-ultraspeed] =mk(ck,ck,ck);}\n    float diff=fmaxf(dt(N,ld),0.f);\n    V so=ad(pos,ml(N,.001f));\n    float st=hs(so,sc,ld);\n    if(st>.001f){\n        V sp=ad(so,ml(ld,st));\n        if(sp.y>py)diff=0;\n    }\n    return ml(color,.2f+.8f*diff);\n}\nint main(){\n    ld=nm(mk(1.f,1.f,1.f));\n    V cam={0,-.5f,-5.f};\n    V sc={0,-1.f,0};\n    FILE*f=fopen(\"
+[tr-stream call-0104:worker:xiaomi/mimo-v2.5-pro-ultraspeed] reconstructed.ppm\",\"w\");\n    fprintf(f,\"P3\\n%d %d\\n255\\n\",W,H);\n    float vw=2.f*W/H;\n    float vh=2.f;\n    V vU=mk(vw,0,0);\n    V vV=mk(0,vh,0);\n    V fl=mk(0,0,1.f);\n    V ll=ad(su(su(cam,ml(vU,.5f)),ml(vV,.5f)),fl);\n    for(int j=0;j<H;j++){\n        float v=1.f-(float)j/(H-1);\n        for(int i=0;i<W;i++){\n            float u=(float)i/(W-
+[tr-stream call-0104:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 1);\n            V tgt=ad(ad(ll,ml(vU,u)),ml(vV,v));\n            V rd=nm(su(tgt,cam));\n            V c=tr(cam,rd,sc);\n            int r=(int)(fminf(c.x,1.f)*255.99f),g=(int)(fminf(c.y,1.f)*255.99f),b=(int)(fminf(c.z,1.f)*255.99f);\n            fprintf(f,\"%d %d %d\\n\",r,g,b);\n        }\n    }\n    fclose(f);return 0;\n}\nCEOF\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "gcc -static -O2 -o
+[tr-stream call-0104:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  image image.c -lm 2>&1 && ./image && python3 compare.py\n",
+      "duration": 300.0
+    }
+  ],
+  "task_complete": false
+}
+
+[tr-stream call-0104:worker:xiaomi/mimo-v2.5-pro-ultraspeed] worker.done finish=stop cost_microdollars=256455
+[tr-stream call-0104:xiaomi/mimo-v2.5-pro-ultraspeed] {
+  "analysis": "I found the bug! In my checker code, I'm computing the hit point in DOUBLE precision separately, while the original uses the FLOAT hit point `pos` (computed as origin + t*direction in float) and THEN converts to double for floor(). I need to use `pos.x` and `pos.z` instead of recomputing in double. This explains the 50% random mismatch - the double precision hit point rounds differently than the float one at checker boundaries.",
+  "plan": "1. Fix the checker to use pos.x and pos.z (float hit point) converted to double for floor, matching the original\n2. Re-enable shadow\n3. Recompile and test",
+  "commands": [
+    {
+      "keystrokes": "cat > image.c << 'CEOF'\n#include <stdio.h>\n#include <math.h>\ntypedef struct{float x,y,z;}V;\nV mk(float x,float y,float z){V r;r.x=x;r.y=y;r.z=z;return r;}\nV ad(V a,V b){return mk(a.x+b.x,a.y+b.y,a.z+b.z);}\nV su(V a,V b){return mk(a.x-b.x,a.y-b.y,a.z-b.z);}\nV ml(V a,float t){return mk(a.x*t,a.y*t,a.z*t);}\nfloat dt(V a,V b){return a.x*b.x+a.y*b.y+a.z*b.z;}\nV nm(V v){float l=sqrtf(dt(v,v));return mk(v.x/l,v.y/l,v.z/l);}\n#define W 2400\n#define H 1800\nfloat sr=1.f,py=-1.5f;\nV ld;\nfloat hs(V ro,V sc,V rd){V oc=su(ro,sc);float b=dt(oc,rd),c=dt(oc,oc)-sr*sr,h=b*b-c;return h<0?-1:-b-sqrtf(h);}\nfloat hp(V ro,V rd){if(fabsf(rd.y)<1e-6f)return-1;float t=(py-ro.y)/rd.y;return t>0?t:-1;}\nV tr(V ro,V rd,V sc){\n    float ts=hs(ro,sc,rd),tp=hp(ro,rd),t;int h1=0,h2=0;\n    if(ts>0&&tp>0){if(ts<tp){t=ts;h1=1;}else{t=tp;h2=1;}}\n    else if(ts>0){t=ts;h1=1;}\n    else if(tp>0){t=tp;h2=1;}\n    else{V n=nm(rd);float a=.5f*(n.y+1.f);return ad(ml(mk(1,1,1),1.f-a),ml(mk(.5f,.7f,1.f),a));}\n    V pos=ad(ro,ml(rd,t)),N;\n    V color;\n    if(h1){N=nm(su(pos,sc));color=mk(1.f,.2f,.2f);}\n    else{N=mk(0,1,0);\n    int cx=(int)floor((double)pos.x);\n    int cz=(int)floor((double)pos.z);\n    int s=(cx+cz)&1;\n    float ck=s?.4f:.9f;color=mk(ck,ck,ck);}\n    float diff=fmaxf(dt(N,ld),0.f);\n    V so=ad(pos,ml(N,.001f));\n    float st=hs(so,sc,ld);\n    if(st>.001f){\n        V sp=ad(so,ml(ld,st));\n        if(sp.y>py)diff=0;\n    }\n    return ml(color,.2f+.8f*diff);\n}\nint main(){\n    ld=nm(mk(1.f,1.f,1.f));\n    V cam={0,-.5f,-5.f};\n    V sc={0,-1.f,0};\n    FILE*f=fopen(\"reconstructed.ppm\",\"w\");\n    fprintf(f,\"P3\\n%d %d\\n255\\n\",W,H);\n    float vw=2.f*W/H;\n    float vh=2.f;\n    V vU=mk(vw,0,0);\n    V vV=mk(0,vh,0);\n    V fl=mk(0,0,1.f);\n    V ll=ad(su(su(cam,ml(vU,.5f)),ml(vV,.5f)),fl);\n    for(int j=0;j<H;j++){\n        float v=1.f-(float)j/(H-1);\n        for(int i=0;i<W;i++){\n            float u=(float)i/(W-1);\n            V tgt=ad(ad(ll,ml(vU,u)),ml(vV,v));\n            V rd=nm(su(tgt,cam));\n            V c=tr(cam,rd,sc);\n            int r=(int)(fminf(c.x,1.f)*255.99f),g=(int)(fminf(c.y,1.f)*255.99f),b=(int)(fminf(c.z,1.f)*255.99f);\n            fprintf(f,\"%d %d %d\\n\",r,g,b);\n        }\n    }\n    fclose(f);return 0;\n}\nCEOF\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "gcc -static -O2 -o image image.c -lm 2>&1 && ./image && python3 compare.py\n",
+      "duration": 300.0
+    }
+  ],
+  "task_complete": false
+}

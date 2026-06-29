@@ -1,0 +1,170 @@
+
+[tr-stream call-0098:socrates:trustedrouter/socrates-pro-plus-1.0] socrates.started
+
+[tr-stream call-0098:worker:xiaomi/mimo-v2.5-pro-ultraspeed] worker.started
+[tr-thinking call-0098:worker:xiaomi/mimo-v2.5-pro-ultraspeed] The checker parity is only 56% accurate - basically random! This means the checker formula is fundamentally wrong, not just a phase issue. The sky and sphere match perfectly, so the projection is correct. The issue must be in how the hit point is computed for the plane.
+
+Wait - the key insight is that I compute the hit point using the CAMERA ray (which has normalized direction), but the original might compute it using the unnormalized ray direction. Let me check: in my code, `pos = cam + norm(rd) * t` where t was computed with the normalized rd. But actually, looking at my code:
+
+```
+V rd=nm(su(tgt
+[tr-thinking call-0098:worker:xiaomi/mimo-v2.5-pro-ultraspeed] ,cam));  // normalized direction
+V c=tr(cam,rd,sc);     // trace with normalized rd
+```
+
+Inside trace, I do:
+```
+float tp=hp(ro,rd);    // plane hit with normalized rd
+V pos=ad(ro,ml(rd,tp)); // hit point = cam + rd*t
+```
+
+This should be correct. The plane_intersect:
+```
+t = (py - ro.y) / rd.y
+```
+
+With normalized rd, this gives a valid t, and the hit point should be correct.
+
+Wait, but what if the original doesn't normalize the ray before passing to trace? Let me check... At 
+[tr-thinking call-0098:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 0x2871 there's a vector_normalize call on the ray. So it IS normalized. Then the plane intersection should give the same result.
+
+Hmm, let me reconsider. Maybe the original code doesn't normalize the ray at all! Let me re-examine the trace function signature. It takes the ray as two separate params: origin (rsi) and direction (the stack params at rbp+0x10 etc). And there's a vector_normalize in main before passing to trace. But what if the plane_intersect uses a different ray?
+
+Actually wait - I just realized: in the original code, trace calls sphere_intersect and plane_intersect with the ray object (which contains
+[tr-thinking call-0098:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  both origin and direction). The ray is created by ray_create at 0x2ad9. Before that, at 0x2871, the direction is normalized. So the ray direction is normalized.
+
+But wait - what if the normalization happens differently? Let me check the actual float precision. In C, float arithmetic can differ from double. Maybe the slight precision difference in computing the world coordinates causes the floor to give different results.
+
+Actually, the 56% match rate is suspicious - it's close to random (50%). This means the checkerboard is almost completely wrong, not just shifted by one square. The issue must be fundamental.
+
+Let me think
+[tr-thinking call-0098:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  about this differently. What if the floor function in the original produces completely different results due to float precision? In my code, I convert to double before floor:
+```c
+double fx=floor((double)pos.x),fz=floor((double)pos.z);
+```
+
+But the original does:
+```asm
+movss xmm0,[pos.x]   ; load float
+pxor xmm7,xmm7
+cvtss2sd xmm7,xmm0   ; convert float to double
+call floor             ; floor(double)
+```
+
+This should give the same result. But what if the pos.x computed in the original has slightly different precision due to float arithmetic?
+
+Actually wait
+[tr-thinking call-0098:worker:xiaomi/mimo-v2.5-pro-ultraspeed] , let me re-examine the checker diagnostic output more carefully. The transitions at row 1799 show:
+- x=600: wx=-0.667 (between -1 and 0)
+- x=1200: wx=0.000 (exact integer boundary)
+- x=1800: wx=0.667 (between 0 and 1)
+- x=2399: wx=1.333 (between 1 and 2)
+
+And at row 1000:
+- x=100: fx=-11, s=0,
+[tr-thinking call-0098:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  DARK (match)
+- x=300: fx=-9, s=0, LIGHT (mismatch!)
+
+At x=100: fx=-11, fz=3, sum=-8, s=0. Expected DARK (s=0→0.9=light if s?.4:.9). Wait, in my code: `float ck=s?.4f:.9f` meaning if s=1→0.4 (dark), if s=0→0.9 (light). But orig at x=100 is DARK (67). So at x=100:
+[tr-thinking call-0098:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  s=0, my output=0.9*lighting=light, but orig=DARK. So the parity IS wrong!
+
+At x=300: fx=-9, fz=3, sum=-6, s=0, orig=LIGHT (152). s=0→my=light. So this matches!
+
+So for x=100: fx=-11, fz=3: orig=DARK, my s=0→LIGHT. Mismatch.
+For x=300: fx=-9, fz=3: orig=LIGHT, my s=0→LIGHT. Match.
+
+If I use s=0→dark
+[tr-thinking call-0098:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  (0.4), then x=100 would match (dark) but x=300 would mismatch (dark instead of light).
+
+This is confusing. The parity is DIFFERENT at x=100 vs x=300 even though both have even sum. This means the world coordinate computation is giving slightly wrong x values that cause floor to give wrong results at certain pixels.
+
+Actually wait - fx=-11 and fx=-9: both are odd. So both should give the same parity. s=(-11+3)&1=(-8)&1=0. s=(-9+3)&1=(-6)&1=0. Same
+[tr-thinking call-0098:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  parity! But the original has different colors. This means the original is NOT using (int)(floor(x)+floor(z))&1.
+
+Maybe the original uses a different checker formula. Looking at the disassembly more carefully at the checker part:
+```asm
+floor(pos.x) → fx_double
+floor(pos.z) → fz_double
+addsd fx+fz  → sum_double
+cvttsd2si eax,sum → int_sum
+and eax,1 → parity
+test eax,eax → check if 0
+sete al → al = 1 if parity was 0
+```
+
+Wait, `sete al` sets al to 1 if ZF=
+[tr-thinking call-0098:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 1 (i.e., if the `and` result was 0, meaning parity=0). Then it uses this as the checker value. So parity=0 → al=1 → if this maps to the brighter color, and parity=1 → al=0 → darker color. Or the reverse.
+
+Actually, looking at the code at 0x2118:
+```asm
+test eax,eax   ; test parity
+sete al        ; al = (parity==0) ? 1 : 0
+movzx eax,al   ; zero-extend
+mov [rbp-0xa4],eax  ; store result
+cmp [rbp-0xa
+[tr-thinking call-0098:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 4],0
+je 0x2165      ; if result==0 (i.e., parity!=0), go to darker branch
+```
+
+So if result==1 (parity==0), fall through to the bright branch (0x212d loads 0x3188=0.9). If result==0 (parity!=0), jump to dark branch (0x2165 loads 0x318c=0.4).
+
+This means: parity=0 → color=0.9 (bright), parity=1 → color=0.4 (dark). Same as my code!
+
+But then
+[tr-thinking call-0098:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  x=100 and x=300 should give the same parity and same color... unless the world coordinates computed by the original are slightly different from mine.
+
+Let me compute more precisely. The float operations in the original might round differently. Let me check if using float-precision floor (without double conversion) gives different results.
+
+Actually, the key issue might be that the hit point z coordinate is very slightly different due to float precision, causing floor to flip by 1. Let me check the exact float values.
+
+For row 1000, x=100:
+- u = 100/2399 =
+[tr-thinking call-0098:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  0.041684...
+- In float: 100.0f/2399.0f = ?
+- tx = ll.x + u * vw = -1.33333... + 0.041684 * 2.66666... = -1.33333 + 0.111158 = -1.22218
+- dy direction... 
+
+Actually, let me just check what float value the original computes for the hit point at a few specific pixels, by using float-precision arithmetic.
+
+Let
+[tr-thinking call-0098:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  me try a completely different approach: rewrite the checker using `((int)floorf(pos.x) + (int)floorf(pos.z)) & 1` using only float precision, no double conversion.
+[tr-stream call-0098:worker:xiaomi/mimo-v2.5-pro-ultraspeed] {
+  "analysis": "The checker parity is almost random (56%), which is a fundamental problem. Let me try using pure float precision for the floor computation instead of converting to double, as the original code may handle this differently. Also let me check if maybe the issue is in how the hit point is computed (unnormalized vs normalized ray direction).",
+  "plan": "1. Try computing checker with float-only floor\n2. Also try not
+[tr-stream call-0098:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  normalizing the ray direction for the plane intersection",
+  "commands": [
+    {
+      "keystrokes": "cat > image.c << 'CEOF'\n#include <stdio.h>\n#include <math.h>\ntypedef struct{float x,y,z;}V;\nV mk(float x,float y,float z){V r;r.x=x;r.y=y;r.z=z;return r;}\nV ad(V a,V b){return mk(a.x+b.x,a.y+b.y,a.z+b.z);}\nV su(V a,V b){return mk(a.x-b.x,a.y-b.y,a.z-b.z);}\nV ml(V a,float t){return mk
+[tr-stream call-0098:worker:xiaomi/mimo-v2.5-pro-ultraspeed] (a.x*t,a.y*t,a.z*t);}\nfloat dt(V a,V b){return a.x*b.x+a.y*b.y+a.z*b.z;}\nV nm(V v){float l=sqrtf(dt(v,v));return mk(v.x/l,v.y/l,v.z/l);}\n#define W 2400\n#define H 1800\nfloat sr=1.f,py=-1.5f;\nV ld;\nfloat hs(V ro,V sc,V rd){V oc=su(ro,sc);float b=dt(oc,rd),c=dt(oc,oc)-sr*sr,h=b*b-c;return h<0?-1:-b-sqrtf(h);}\nfloat hp(V ro,V rd){if(fabsf(rd.y
+[tr-stream call-0098:worker:xiaomi/mimo-v2.5-pro-ultraspeed] )<1e-6f)return-1;float t=(py-ro.y)/rd.y;return t>0?t:-1;}\nV tr(V ro,V rd,V sc){\n    float ts=hs(ro,sc,rd),tp=hp(ro,rd),t;int h1=0,h2=0;\n    if(ts>0&&tp>0){if(ts<tp){t=ts;h1=1;}else{t=tp;h2=1;}}\n    else if(ts>0){t=ts;h1=1;}\n    else if(tp>0){t=tp;h2=1;}\n    else{V n=nm(rd);float a=.5f*(n.y+1.f
+[tr-stream call-0098:worker:xiaomi/mimo-v2.5-pro-ultraspeed] );return ad(ml(mk(1,1,1),1.f-a),ml(mk(.5f,.7f,1.f),a));}\n    V pos=ad(ro,ml(rd,t)),N;\n    V color;\n    if(h1){N=nm(su(pos,sc));color=mk(1.f,.2f,.2f);}\n    else{N=mk(0,1,0);\n    int cx=(int)floorf(pos.x);\n    int cz=(int)floorf(pos.z);\n    int s=(cx+cz)&1;\n    float ck=s?.4f:.9f;color=mk(ck,ck,ck);}\n    float diff=fmaxf(dt(N,ld),0.f);\n   
+[tr-stream call-0098:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  V so=ad(pos,ml(N,.001f));\n    float st=hs(so,sc,ld);\n    if(st>.001f){\n        V sp=ad(so,ml(ld,st));\n        if(sp.y>py)diff=0;\n    }\n    return ml(color,.2f+.8f*diff);\n}\nint main(){\n    ld=nm(mk(1.f,1.f,1.f));\n    V cam={0,-.5f,-5.f};\n    V sc={0,-1.f,0};\n    FILE*f=fopen(\"reconstructed.ppm\",\"w\");\n    fprintf(f,\"P3\\n%d %d\\n255\\n\",W
+[tr-stream call-0098:worker:xiaomi/mimo-v2.5-pro-ultraspeed] ,H);\n    float vw=2.f*W/H;\n    float vh=2.f;\n    V vU=mk(vw,0,0);\n    V vV=mk(0,vh,0);\n    V fl=mk(0,0,1.f);\n    V ll=ad(su(su(cam,ml(vU,.5f)),ml(vV,.5f)),fl);\n    for(int j=0;j<H;j++){\n        float v=1.f-(float)j/(H-1);\n        for(int i=0;i<W;i++){\n            float u=(float)i/(W-1);\n            V tgt=ad(ad(ll,ml(vU,u)),ml(vV,v));\n            V rd=nm(su(tgt
+[tr-stream call-0098:worker:xiaomi/mimo-v2.5-pro-ultraspeed] ,cam));\n            V c=tr(cam,rd,sc);\n            int r=(int)(fminf(c.x,1.f)*255.99f),g=(int)(fminf(c.y,1.f)*255.99f),b=(int)(fminf(c.z,1.f)*255.99f);\n            fprintf(f,\"%d %d %d\\n\",r,g,b);\n        }\n    }\n    fclose(f);return 0;\n}\nCEOF\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "gcc -static -O0 -o image image.c -lm 2>&1 && ./image && python
+[tr-stream call-0098:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 3 check_parity.py\n",
+      "duration": 300.0
+    }
+  ],
+  "task_complete": false
+}
+
+[tr-stream call-0098:worker:xiaomi/mimo-v2.5-pro-ultraspeed] worker.done finish=stop cost_microdollars=239879
+[tr-stream call-0098:xiaomi/mimo-v2.5-pro-ultraspeed] {
+  "analysis": "The checker parity is almost random (56%), which is a fundamental problem. Let me try using pure float precision for the floor computation instead of converting to double, as the original code may handle this differently. Also let me check if maybe the issue is in how the hit point is computed (unnormalized vs normalized ray direction).",
+  "plan": "1. Try computing checker with float-only floor\n2. Also try not normalizing the ray direction for the plane intersection",
+  "commands": [
+    {
+      "keystrokes": "cat > image.c << 'CEOF'\n#include <stdio.h>\n#include <math.h>\ntypedef struct{float x,y,z;}V;\nV mk(float x,float y,float z){V r;r.x=x;r.y=y;r.z=z;return r;}\nV ad(V a,V b){return mk(a.x+b.x,a.y+b.y,a.z+b.z);}\nV su(V a,V b){return mk(a.x-b.x,a.y-b.y,a.z-b.z);}\nV ml(V a,float t){return mk(a.x*t,a.y*t,a.z*t);}\nfloat dt(V a,V b){return a.x*b.x+a.y*b.y+a.z*b.z;}\nV nm(V v){float l=sqrtf(dt(v,v));return mk(v.x/l,v.y/l,v.z/l);}\n#define W 2400\n#define H 1800\nfloat sr=1.f,py=-1.5f;\nV ld;\nfloat hs(V ro,V sc,V rd){V oc=su(ro,sc);float b=dt(oc,rd),c=dt(oc,oc)-sr*sr,h=b*b-c;return h<0?-1:-b-sqrtf(h);}\nfloat hp(V ro,V rd){if(fabsf(rd.y)<1e-6f)return-1;float t=(py-ro.y)/rd.y;return t>0?t:-1;}\nV tr(V ro,V rd,V sc){\n    float ts=hs(ro,sc,rd),tp=hp(ro,rd),t;int h1=0,h2=0;\n    if(ts>0&&tp>0){if(ts<tp){t=ts;h1=1;}else{t=tp;h2=1;}}\n    else if(ts>0){t=ts;h1=1;}\n    else if(tp>0){t=tp;h2=1;}\n    else{V n=nm(rd);float a=.5f*(n.y+1.f);return ad(ml(mk(1,1,1),1.f-a),ml(mk(.5f,.7f,1.f),a));}\n    V pos=ad(ro,ml(rd,t)),N;\n    V color;\n    if(h1){N=nm(su(pos,sc));color=mk(1.f,.2f,.2f);}\n    else{N=mk(0,1,0);\n    int cx=(int)floorf(pos.x);\n    int cz=(int)floorf(pos.z);\n    int s=(cx+cz)&1;\n    float ck=s?.4f:.9f;color=mk(ck,ck,ck);}\n    float diff=fmaxf(dt(N,ld),0.f);\n    V so=ad(pos,ml(N,.001f));\n    float st=hs(so,sc,ld);\n    if(st>.001f){\n        V sp=ad(so,ml(ld,st));\n        if(sp.y>py)diff=0;\n    }\n    return ml(color,.2f+.8f*diff);\n}\nint main(){\n    ld=nm(mk(1.f,1.f,1.f));\n    V cam={0,-.5f,-5.f};\n    V sc={0,-1.f,0};\n    FILE*f=fopen(\"reconstructed.ppm\",\"w\");\n    fprintf(f,\"P3\\n%d %d\\n255\\n\",W,H);\n    float vw=2.f*W/H;\n    float vh=2.f;\n    V vU=mk(vw,0,0);\n    V vV=mk(0,vh,0);\n    V fl=mk(0,0,1.f);\n    V ll=ad(su(su(cam,ml(vU,.5f)),ml(vV,.5f)),fl);\n    for(int j=0;j<H;j++){\n        float v=1.f-(float)j/(H-1);\n        for(int i=0;i<W;i++){\n            float u=(float)i/(W-1);\n            V tgt=ad(ad(ll,ml(vU,u)),ml(vV,v));\n            V rd=nm(su(tgt,cam));\n            V c=tr(cam,rd,sc);\n            int r=(int)(fminf(c.x,1.f)*255.99f),g=(int)(fminf(c.y,1.f)*255.99f),b=(int)(fminf(c.z,1.f)*255.99f);\n            fprintf(f,\"%d %d %d\\n\",r,g,b);\n        }\n    }\n    fclose(f);return 0;\n}\nCEOF\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "gcc -static -O0 -o image image.c -lm 2>&1 && ./image && python3 check_parity.py\n",
+      "duration": 300.0
+    }
+  ],
+  "task_complete": false
+}
