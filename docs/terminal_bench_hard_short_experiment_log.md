@@ -166,3 +166,52 @@ Current pickup recommendation:
     `password-recovery`
   - TR Prometheus: `configure-git-webserver`, `feal-linear-cryptanalysis`,
     `password-recovery`
+
+## 2026-06-29 completed emoji status chart
+
+Legend: ✅ pass, ❌ fail, ⏱️ per-task timeout. DeepSeek V4 Pro and old TR Synth
+remain excluded from this chart because their rows are known-bad integration /
+resume artifacts rather than reliable task attempts.
+
+| Model | Cancel async | Fix vuln | Polyglot Rust/C | Git webserver | FEAL | Password | Score |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| GPT-5.5 | ✅ | ✅ | ❌ | ✅ | ✅ | ✅ | 5/6 |
+| Gemini 3.1 Pro Preview | ✅ | ✅ | ❌ | ✅ | ✅ | ✅ | 5/6 |
+| GLM 5.2 | ✅ | ✅ | ✅ | ❌ | ✅ | ✅ | 5/6 |
+| Minimax M3 | ✅ | ✅ | ❌ | ✅ | ⏱️ | ✅ | 4/6 |
+| Claude Opus 4.8 | ❌ | ✅ | ❌ | ❌ | ✅ | ✅ | 3/6 |
+| Kimi K2.6 | ✅ | ✅ | ⏱️ | ✅ | ⏱️ | ⏱️ | 3/6 |
+| Mimo 2.5 Pro | ✅ | ✅ | ⏱️ | ✅ | ⏱️ | ⏱️ | 3/6 |
+| Grok 4.3 | ✅ | ✅ | ⏱️ | ✅ | ⏱️ | ❌ | 3/6 |
+| Nemotron 3 Ultra | ❌ | ✅ | ❌ | ✅ | ⏱️ | ❌ | 2/6 |
+| TR Prometheus | ❌ | ✅ | ⏱️ | ✅ | ⏱️ | ❌ | 2/6 |
+| Gemma 4 31B | ❌ | ⏱️ | ⏱️ | ❌ | ⏱️ | ✅ | 1/6 |
+
+The final six missing cells were completed serially with:
+
+```bash
+uv run python -m trbench.evals.terminal_bench.run \
+  --models x-ai/grok-4.3,trustedrouter/trustedrouter/prometheus \
+  --dataset-path .data/terminal-bench-hard-short/tasks \
+  --tasks configure-git-webserver,feal-linear-cryptanalysis,password-recovery \
+  --agent terminus-2 \
+  --n-concurrent 1 \
+  --per-task \
+  --per-task-order task-major \
+  --per-task-timeout 1200 \
+  --output-root runs/terminal_bench_hard_short_remaining_safe \
+  --out results/terminal_bench_hard_short_remaining_safe.json \
+  --resume
+```
+
+The first attempt at these six cells produced zero-token `unknown_agent_error`
+rows because Docker had exhausted its predefined bridge-network address pools
+before the agent started. Those invalid rows were moved to
+`results/terminal_bench_hard_short_quarantined_rows.jsonl`, orphan task networks
+were removed, and the six cells were rerun serially. The reliable rerun results
+were:
+
+- Grok 4.3: passed `configure-git-webserver`, timed out on
+  `feal-linear-cryptanalysis`, failed `password-recovery`.
+- TR Prometheus: passed `configure-git-webserver`, timed out on
+  `feal-linear-cryptanalysis`, failed `password-recovery`.
