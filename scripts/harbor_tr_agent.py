@@ -162,6 +162,23 @@ def _as_bool(value: Any) -> bool:
     return str(value).strip().lower() not in {"", "0", "false", "no", "off"}
 
 
+def _as_list(value: Any) -> list[str] | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        items = [part.strip() for part in value.split(",")]
+        return [item for item in items if item]
+    if isinstance(value, (list, tuple)):
+        return [str(item) for item in value if str(item).strip()]
+    return [str(value)]
+
+
+def _as_optional_int(value: Any) -> int | None:
+    if value is None or value == "":
+        return None
+    return int(value)
+
+
 def _chunk_text(chunk: dict[str, Any]) -> str:
     choices = chunk.get("choices") or []
     if not choices:
@@ -296,6 +313,12 @@ class TrustedRouterHarborLLM(BaseLLM):
         max_empty_retries: int = 2,
         panel_prompt: str | None = None,
         synthesis_prompt: str | None = None,
+        advisor_depth: int | None = None,
+        advisor_worker_models: list[str] | str | None = None,
+        advisor_models: list[str] | str | None = None,
+        advisor_max_get_advice_calls: int | None = None,
+        advisor_max_tokens: int | None = None,
+        advisor_timeout_ms: int | None = None,
         base_url: str | None = None,
         stream: bool = True,
     ):
@@ -322,9 +345,33 @@ class TrustedRouterHarborLLM(BaseLLM):
         self._max_empty_retries = max_empty_retries
         self._panel_prompt = panel_prompt
         self._synthesis_prompt = synthesis_prompt
+        self._advisor_depth = _as_optional_int(advisor_depth)
+        self._advisor_worker_models = _as_list(advisor_worker_models)
+        self._advisor_models = _as_list(advisor_models)
+        self._advisor_max_get_advice_calls = _as_optional_int(advisor_max_get_advice_calls)
+        self._advisor_max_tokens = _as_optional_int(advisor_max_tokens)
+        self._advisor_timeout_ms = _as_optional_int(advisor_timeout_ms)
         self._stream = _as_bool(stream)
         self._calls_dir = logs_dir / "trustedrouter-calls"
         self._call_index = 0
+
+    def _advisor_tool(self) -> dict[str, Any] | None:
+        parameters: dict[str, Any] = {}
+        if self._advisor_depth is not None:
+            parameters["depth"] = self._advisor_depth
+        if self._advisor_worker_models is not None:
+            parameters["worker_models"] = self._advisor_worker_models
+        if self._advisor_models is not None:
+            parameters["advisor_models"] = self._advisor_models
+        if self._advisor_max_get_advice_calls is not None:
+            parameters["max_get_advice_calls"] = self._advisor_max_get_advice_calls
+        if self._advisor_max_tokens is not None:
+            parameters["advisor_max_tokens"] = self._advisor_max_tokens
+        if self._advisor_timeout_ms is not None:
+            parameters["advisor_timeout_ms"] = self._advisor_timeout_ms
+        if not parameters:
+            return None
+        return {"type": "trustedrouter:advisor", "parameters": parameters}
 
     def _stream_label(self, call_id: int, chunk: dict[str, Any]) -> tuple[str, str]:
         tr = chunk.get("trustedrouter") or {}
@@ -448,10 +495,14 @@ class TrustedRouterHarborLLM(BaseLLM):
             synth_parameters["panel_prompt"] = self._panel_prompt
         if self._synthesis_prompt:
             synth_parameters["synthesis_prompt"] = self._synthesis_prompt
+        tools: list[dict[str, Any]] = []
         if synth_parameters:
-            request["tools"] = [
-                {"type": "trustedrouter:synth", "parameters": synth_parameters}
-            ]
+            tools.append({"type": "trustedrouter:synth", "parameters": synth_parameters})
+        advisor_tool = self._advisor_tool()
+        if advisor_tool is not None:
+            tools.append(advisor_tool)
+        if tools:
+            request["tools"] = tools
         if self._temperature is not None:
             request["temperature"] = self._temperature
 
@@ -514,6 +565,9 @@ class TrustedRouterHarborLLM(BaseLLM):
                         "max_tokens": self._max_tokens,
                         "has_panel_prompt": bool(self._panel_prompt),
                         "has_synthesis_prompt": bool(self._synthesis_prompt),
+                        "has_advisor_tool": self._advisor_tool() is not None,
+                        "advisor_worker_models": self._advisor_worker_models,
+                        "advisor_models": self._advisor_models,
                         "stream": self._stream,
                         "panel_prompt_chars": len(self._panel_prompt or ""),
                         "synthesis_prompt_chars": len(self._synthesis_prompt or ""),
@@ -566,6 +620,9 @@ class TrustedRouterHarborLLM(BaseLLM):
                     "max_tokens": self._max_tokens,
                     "has_panel_prompt": bool(self._panel_prompt),
                     "has_synthesis_prompt": bool(self._synthesis_prompt),
+                    "has_advisor_tool": self._advisor_tool() is not None,
+                    "advisor_worker_models": self._advisor_worker_models,
+                    "advisor_models": self._advisor_models,
                     "stream": self._stream,
                     "panel_prompt_chars": len(self._panel_prompt or ""),
                     "synthesis_prompt_chars": len(self._synthesis_prompt or ""),
@@ -635,6 +692,9 @@ class TrustedRouterHarborLLM(BaseLLM):
                     "final_attempt": final_attempt,
                     "has_panel_prompt": bool(self._panel_prompt),
                     "has_synthesis_prompt": bool(self._synthesis_prompt),
+                    "has_advisor_tool": self._advisor_tool() is not None,
+                    "advisor_worker_models": self._advisor_worker_models,
+                    "advisor_models": self._advisor_models,
                     "stream": self._stream,
                     "panel_prompt_chars": len(self._panel_prompt or ""),
                     "synthesis_prompt_chars": len(self._synthesis_prompt or ""),
@@ -715,6 +775,12 @@ class TRHarborTerminus(Terminus2):
         max_empty_retries: int = 2,
         panel_prompt: str | None = None,
         synthesis_prompt: str | None = None,
+        advisor_depth: int | None = None,
+        advisor_worker_models: list[str] | str | None = None,
+        advisor_models: list[str] | str | None = None,
+        advisor_max_get_advice_calls: int | None = None,
+        advisor_max_tokens: int | None = None,
+        advisor_timeout_ms: int | None = None,
         base_url: str | None = None,
         stream: bool = True,
         **kwargs: Any,
@@ -733,6 +799,12 @@ class TRHarborTerminus(Terminus2):
             max_empty_retries=int(max_empty_retries),
             panel_prompt=panel_prompt,
             synthesis_prompt=synthesis_prompt,
+            advisor_depth=advisor_depth,
+            advisor_worker_models=advisor_worker_models,
+            advisor_models=advisor_models,
+            advisor_max_get_advice_calls=advisor_max_get_advice_calls,
+            advisor_max_tokens=advisor_max_tokens,
+            advisor_timeout_ms=advisor_timeout_ms,
             base_url=base_url,
             stream=stream,
         )
