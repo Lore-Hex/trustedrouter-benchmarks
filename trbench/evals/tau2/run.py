@@ -61,6 +61,51 @@ def _pass_hat_k(success_count: int, num_trials: int, k: int) -> float:
     return math.comb(success_count, k) / math.comb(num_trials, k)
 
 
+def _mean(values: list[float]) -> float:
+    return sum(values) / len(values) if values else 0.0
+
+
+def _diagnostic_partial_reward(reward_info: dict | None) -> float:
+    """Partial-credit score from tau2's serialized component checks.
+
+    tau2's official task reward is intentionally strict: the components listed in
+    reward_basis are multiplied, and premature max_steps sims get no reward_info.
+    For analysis we also want a softer score, analogous to "tests passed / tests":
+    average every serialized component check available for the task. Components
+    not serialized cannot receive credit; missing reward_info is 0.
+    """
+    if not reward_info:
+        return 0.0
+    components: list[float] = []
+    db_check = reward_info.get("db_check")
+    if isinstance(db_check, dict):
+        components.append(float(db_check.get("db_reward") or 0.0))
+    action_checks = reward_info.get("action_checks")
+    if isinstance(action_checks, list) and action_checks:
+        components.append(_mean([float(check.get("action_reward") or 0.0) for check in action_checks]))
+    env_assertions = reward_info.get("env_assertions")
+    if isinstance(env_assertions, list) and env_assertions:
+        values = []
+        for check in env_assertions:
+            if not isinstance(check, dict):
+                continue
+            if "reward" in check:
+                values.append(float(check.get("reward") or 0.0))
+            elif "met" in check:
+                values.append(1.0 if check.get("met") else 0.0)
+        if values:
+            components.append(_mean(values))
+    communicate_checks = reward_info.get("communicate_checks")
+    if isinstance(communicate_checks, list) and communicate_checks:
+        components.append(_mean([1.0 if check.get("met") else 0.0 for check in communicate_checks if isinstance(check, dict)]))
+    nl_assertions = reward_info.get("nl_assertions")
+    if isinstance(nl_assertions, list) and nl_assertions:
+        components.append(_mean([1.0 if check.get("met") else 0.0 for check in nl_assertions if isinstance(check, dict)]))
+    if components:
+        return _mean(components)
+    return float(reward_info.get("reward") or 0.0)
+
+
 def _slug(model: str, domain: str) -> str:
     return "trbench_" + re.sub(r"[^a-z0-9]+", "-", f"{model}_{domain}".lower()).strip("-")
 
@@ -98,7 +143,9 @@ def _run_one(*, tau2_bin: str, tau2_home: Path, domain: str, model: str, user_ll
 
     # reward per (task, trial); a task passes a trial when reward == 1.
     by_task: dict[str, list[float]] = {}
+    partial_by_task: dict[str, list[float]] = {}
     rewards: list[float] = []
+    partial_rewards: list[float] = []
     sim_errors = 0
     for s in sims:
         ri = s.get("reward_info") or {}
@@ -107,10 +154,17 @@ def _run_one(*, tau2_bin: str, tau2_home: Path, domain: str, model: str, user_ll
             sim_errors += 1
             continue
         rewards.append(float(r))
-        by_task.setdefault(str(s.get("task_id")), []).append(float(r))
+        task_id = str(s.get("task_id"))
+        by_task.setdefault(task_id, []).append(float(r))
+        partial = _diagnostic_partial_reward(ri)
+        partial_rewards.append(partial)
+        partial_by_task.setdefault(task_id, []).append(partial)
 
     n_tasks = len(by_task)
     avg_reward = sum(rewards) / len(rewards) if rewards else 0.0
+    partial_macro_vals = [_mean(trs) for trs in partial_by_task.values()]
+    partial_macro = _mean(partial_macro_vals)
+    partial_micro = _mean(partial_rewards)
     # pass^k averaged over tasks, for k = 1..num_trials
     passk: dict[int, float] = {}
     for k in range(1, num_trials + 1):
@@ -120,15 +174,19 @@ def _run_one(*, tau2_bin: str, tau2_home: Path, domain: str, model: str, user_ll
         "model": model, "domain": domain, "n_tasks": n_tasks, "num_trials": num_trials,
         "avg_reward": round(100 * avg_reward, 1),
         "pass1": round(100 * passk.get(1, 0.0), 1),
+        "partial_macro": round(100 * partial_macro, 1),
+        "partial_micro": round(100 * partial_micro, 1),
         "passk": {k: round(100 * v, 1) for k, v in passk.items()},
         "sim_errors": sim_errors,
         "rewards_by_task": by_task,  # replay: lets the metric be recomputed
+        "partial_by_task": partial_by_task,
     }
 
 
 COLUMNS = [
     ("Model", "model"),
     ("pass^1", "pass1"),
+    ("partial", "partial_macro"),
     ("avg_reward", "avg_reward"),
     ("Tasks", "n_tasks"),
     ("Errors", "sim_errors"),
