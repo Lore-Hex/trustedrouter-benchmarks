@@ -211,7 +211,11 @@ def _aggregate_task_rows(rows: list[dict]) -> list[dict]:
         for row in ok_rows:
             resolved_ids.extend(row.get("resolved_ids", []))
             unresolved_ids.extend(row.get("unresolved_ids", []))
-        n = sum(int(r.get("n_tasks") or 0) for r in ok_rows)
+        for row in error_rows:
+            task = row.get("task")
+            if task:
+                unresolved_ids.append(task)
+        n = sum(int(r.get("n_tasks") or 0) for r in ok_rows) + len(error_rows)
         resolved = len(resolved_ids)
         aggregate = {
             "model": model,
@@ -229,6 +233,21 @@ def _aggregate_task_rows(rows: list[dict]) -> list[dict]:
             ]
         aggregates.append(aggregate)
     return aggregates
+
+
+def _ordered_values(rows: list[dict], key: str, preferred: list[str]) -> list[str]:
+    seen = set()
+    out: list[str] = []
+    for value in preferred:
+        if value not in seen:
+            seen.add(value)
+            out.append(value)
+    for row in rows:
+        value = row.get(key)
+        if value and value not in seen:
+            seen.add(value)
+            out.append(value)
+    return out
 
 
 COLUMNS = [
@@ -378,13 +397,21 @@ def main(argv: list[str] | None = None) -> int:
         table = report.markdown_table(good, COLUMNS)
         print(table)
 
+        recorded_tasks = {r.get("task") for r in task_rows if r.get("task")}
+        task_order = (
+            HARD_SHORT_SUBSET
+            if recorded_tasks and recorded_tasks.issubset(set(HARD_SHORT_SUBSET))
+            else tasks
+        )
         result = {
             "eval": "terminal_bench", "dataset": args.dataset, "agent": args.agent,
             "created_at": datetime.now(UTC).isoformat(),
             "base_url_host": urllib.parse.urlparse(args.base_url).netloc,
             "dataset_path": args.dataset_path,
             "per_task": True,
-            "tasks": tasks, "models": models, "results": rows,
+            "tasks": _ordered_values(task_rows, "task", task_order),
+            "models": _ordered_values(task_rows, "model", models),
+            "results": rows,
             "task_results": task_rows,
         }
         out.write_text(json.dumps(result, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")

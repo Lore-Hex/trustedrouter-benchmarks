@@ -147,4 +147,3 @@ Success criteria:
 - Prefer adaptive escalation over always-on expensive debate.
 - Separate judge and final synthesis roles unless a specific experiment is testing same-model collapse.
 - Measure oracle upper bound before judging process quality. If the panel oracle cannot beat the best single model, synthesis has little headroom.
-
