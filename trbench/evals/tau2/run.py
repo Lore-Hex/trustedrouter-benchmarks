@@ -236,7 +236,7 @@ def main(argv: list[str] | None = None) -> int:
 
     models = resolve_panel(args.models)
     out = Path(args.out or f"results/tau2_{args.domain}.json")
-    call_log_dir = Path("runs/tau2") / out.stem / "trustedrouter-calls"
+    call_log_dir = (_REPO_ROOT / "runs" / "tau2" / out.stem / "trustedrouter-calls").resolve()
     # Put our litellm shim on PYTHONPATH so tau2's hardcoded `gpt-4.1-2025-04-14`
     # evaluator/judge calls route through TR instead of aborting the sim. The judge
     # is fixed (not the agent under test) so grading stays consistent across models.
