@@ -225,6 +225,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--out", default=None)
     parser.add_argument("--svg", default="assets/tau2.svg")
     parser.add_argument("--readme", default=None)
+    parser.add_argument("--eval-name", default="tau2",
+                        help="Label written to result artifacts, e.g. tau2 or tau3.")
+    parser.add_argument("--runs-dir", default=None,
+                        help="Directory under runs/ for call logs; defaults to --eval-name.")
     args = parser.parse_args(argv)
 
     api_key = client.api_key_from_env(args.api_key)
@@ -236,7 +240,8 @@ def main(argv: list[str] | None = None) -> int:
 
     models = resolve_panel(args.models)
     out = Path(args.out or f"results/tau2_{args.domain}.json")
-    call_log_dir = (_REPO_ROOT / "runs" / "tau2" / out.stem / "trustedrouter-calls").resolve()
+    runs_dir = args.runs_dir or args.eval_name
+    call_log_dir = (_REPO_ROOT / "runs" / runs_dir / out.stem / "trustedrouter-calls").resolve()
     # Put our litellm shim on PYTHONPATH so tau2's hardcoded `gpt-4.1-2025-04-14`
     # evaluator/judge calls route through TR instead of aborting the sim. The judge
     # is fixed (not the agent under test) so grading stays consistent across models.
@@ -255,10 +260,15 @@ def main(argv: list[str] | None = None) -> int:
     if args.use_sdk:
         env["TRUSTEDROUTER_API_KEY"] = api_key
         env["TRUSTEDROUTER_BASE_URL"] = args.base_url
+        # tau-bench's banking_knowledge `alltools` retrieval uses the OpenAI
+        # embeddings client directly. Route that client through TR too.
+        env.setdefault("OPENAI_API_KEY", api_key)
+        env.setdefault("OPENAI_BASE_URL", args.base_url)
+        env.setdefault("TRBENCH_TAU2_OPENAI_EMBEDDING_MODEL", "openai/text-embedding-3-large")
     else:
         env["OPENAI_API_BASE"] = args.base_url
         env["OPENAI_API_KEY"] = api_key
-    print(f"tau2-bench [{args.domain}]: {len(models)} agents x {args.num_tasks} tasks "
+    print(f"{args.eval_name}-bench [{args.domain}]: {len(models)} agents x {args.num_tasks} tasks "
           f"x {args.num_trials} trials, user={args.user_llm}")
 
     rows = []
@@ -282,7 +292,7 @@ def main(argv: list[str] | None = None) -> int:
     table = report.markdown_table(good, COLUMNS)
     print(table)
     result = {
-        "eval": "tau2", "domain": args.domain, "created_at": datetime.now(UTC).isoformat(),
+        "eval": args.eval_name, "domain": args.domain, "created_at": datetime.now(UTC).isoformat(),
         "base_url_host": urllib.parse.urlparse(args.base_url).netloc,
         "user_llm": args.user_llm, "num_tasks": args.num_tasks, "num_trials": args.num_trials,
         "retrieval_config": args.retrieval_config,
@@ -296,7 +306,7 @@ def main(argv: list[str] | None = None) -> int:
 
     svg = report.svg_bar_chart(
         good, score_key="pass1", max_score=100,
-        title=f"tau2-bench ({args.domain}) on TrustedRouter",
+        title=f"{args.eval_name}-bench ({args.domain}) on TrustedRouter",
         subtitle=f"Agentic tool-use, pass^1. User sim: {args.user_llm}. Higher is better.",
     )
     Path(args.svg).parent.mkdir(parents=True, exist_ok=True)
@@ -306,7 +316,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.readme:
         rp = Path(args.readme)
         block = "\n\n".join([
-            f"tau2-bench snapshot: `{result['created_at']}`. Domain `{args.domain}`, "
+            f"{args.eval_name}-bench snapshot: `{result['created_at']}`. Domain `{args.domain}`, "
             f"{args.num_tasks} tasks x {args.num_trials} trial(s), agent vs fixed user `{args.user_llm}`. "
             f"Metric: pass^1 (task reward == 1).",
             f"![tau2-bench chart]({Path(args.svg).as_posix()})",
