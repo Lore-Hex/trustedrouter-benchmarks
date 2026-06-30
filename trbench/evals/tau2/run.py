@@ -68,7 +68,8 @@ def _slug(model: str, domain: str) -> str:
 def _run_one(*, tau2_bin: str, tau2_home: Path, domain: str, model: str, user_llm: str,
              use_sdk: bool, num_tasks: int, num_trials: int, max_steps: int, max_concurrency: int,
              max_retries: int, retry_delay: float, seed: int, env: dict[str, str],
-             timeout: float, resume: bool) -> dict:
+             timeout: float, resume: bool, retrieval_config: str | None,
+             retrieval_config_kwargs: str | None) -> dict:
     slug = _slug(model, domain)
     # tau2 auto-RESUMES from an existing data/simulations/<slug>/results.json, which
     # silently keeps stale infrastructure-error sims from a prior run. Clear it for a
@@ -83,6 +84,10 @@ def _run_one(*, tau2_bin: str, tau2_home: Path, domain: str, model: str, user_ll
         "--max-retries", str(max_retries), "--retry-delay", str(retry_delay),
         "--seed", str(seed), "--save-to", slug,
     ]
+    if retrieval_config:
+        cmd += ["--retrieval-config", retrieval_config]
+    if retrieval_config_kwargs:
+        cmd += ["--retrieval-config-kwargs", retrieval_config_kwargs]
     print(f"  agent={model} domain={domain} tasks={num_tasks} trials={num_trials} ...", flush=True)
     proc = subprocess.run(cmd, cwd=str(tau2_home), env=env, capture_output=True, text=True, timeout=timeout)
     results_path = tau2_home / "data" / "simulations" / slug / "results.json"
@@ -145,6 +150,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max-retries", type=int, default=6,
                         help="tau2 retries on transient LLM/gateway (infrastructure) errors.")
     parser.add_argument("--retry-delay", type=float, default=5.0)
+    parser.add_argument("--retrieval-config", default=None,
+                        help="Pass-through for tau2 banking_knowledge retrieval config, e.g. bm25 or alltools.")
+    parser.add_argument("--retrieval-config-kwargs", default=None,
+                        help="JSON string passed through to tau2 --retrieval-config-kwargs.")
     parser.add_argument("--resume", action="store_true",
                         help="Keep tau2's existing sims for a slug (default: clear for a clean run).")
     parser.add_argument("--use-sdk", dest="use_sdk", action=argparse.BooleanOptionalAction, default=True,
@@ -168,6 +177,8 @@ def main(argv: list[str] | None = None) -> int:
             f"tau2 CLI not found at {tau2_bin}. Clone+install sierra-research/tau2-bench, pass --tau2-home.")
 
     models = resolve_panel(args.models)
+    out = Path(args.out or f"results/tau2_{args.domain}.json")
+    call_log_dir = Path("runs/tau2") / out.stem / "trustedrouter-calls"
     # Put our litellm shim on PYTHONPATH so tau2's hardcoded `gpt-4.1-2025-04-14`
     # evaluator/judge calls route through TR instead of aborting the sim. The judge
     # is fixed (not the agent under test) so grading stays consistent across models.
@@ -181,6 +192,7 @@ def main(argv: list[str] | None = None) -> int:
         **os.environ,
         "PYTHONPATH": pythonpath,
         "TRBENCH_TAU2_EVAL_LLM": _model_arg(args.eval_llm, args.use_sdk),
+        "TRBENCH_LITELLM_LOG_DIR": str(call_log_dir),
     }
     if args.use_sdk:
         env["TRUSTEDROUTER_API_KEY"] = api_key
@@ -199,6 +211,8 @@ def main(argv: list[str] | None = None) -> int:
             num_tasks=args.num_tasks, num_trials=args.num_trials, max_steps=args.max_steps,
             max_concurrency=args.max_concurrency, max_retries=args.max_retries, retry_delay=args.retry_delay,
             seed=args.seed, env=env, timeout=args.per_model_timeout, resume=args.resume,
+            retrieval_config=args.retrieval_config,
+            retrieval_config_kwargs=args.retrieval_config_kwargs,
         ))
 
     good = [r for r in rows if "error" not in r]
@@ -213,9 +227,11 @@ def main(argv: list[str] | None = None) -> int:
         "eval": "tau2", "domain": args.domain, "created_at": datetime.now(UTC).isoformat(),
         "base_url_host": urllib.parse.urlparse(args.base_url).netloc,
         "user_llm": args.user_llm, "num_tasks": args.num_tasks, "num_trials": args.num_trials,
+        "retrieval_config": args.retrieval_config,
+        "retrieval_config_kwargs": args.retrieval_config_kwargs,
+        "trustedrouter_call_log_dir": str(call_log_dir),
         "models": models, "results": rows,
     }
-    out = Path(args.out or f"results/tau2_{args.domain}.json")
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(result, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     print(f"wrote {out}")
