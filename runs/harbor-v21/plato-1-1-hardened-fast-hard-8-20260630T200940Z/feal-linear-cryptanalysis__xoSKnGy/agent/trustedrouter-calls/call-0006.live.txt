@@ -1,0 +1,340 @@
+
+[tr-stream call-0006:socrates:trustedrouter/advisor] socrates.started
+
+[tr-stream call-0006:worker:xiaomi/mimo-v2.5-pro-ultraspeed] worker.started
+[tr-thinking call-0006:worker:xiaomi/mimo-v2.5-pro-ultraspeed] We have 32 plaintext-ciphertext pairs (decimal) and 100 ciphertexts to decrypt.
+
+The cipher: 4-round FEAL, each round key derived from a 20-bit seed via expand(k & 0xFFFFF). expand(x) = x ^ (x << 16) ^ (x * 12345).
+
+We need to recover the four 20-bit seeds (k0,k1,k2,k3). The expanded keys are 32-bit, but the seeds are only 20 bits each, so total keyspace is 2^80? Actually each seed is 20 bits, so 2^80 total
+[tr-thinking call-0006:worker:xiaomi/mimo-v2.5-pro-ultraspeed] ? That's too large. However, the note says: "Each of the 4 round keys is derived from a 20 bit seed. You still can't brute force the entire keyspace but this should make it easier for you to do a linear attack that recovers round-keys."
+
+So maybe the 20-bit seed is the same for all four round keys? Actually it says "Each of the 4 round keys is derived from a 20 bit seed." That could mean each round key has its own 20-bit seed? Or a single 20-bit seed used to derive all four? The code in feal.c set
+[tr-thinking call-0006:worker:xiaomi/mimo-v2.5-pro-ultraspeed] _keys(k0,k1,k2,k3) each masked to 20 bits. So four independent 20-bit seeds.
+
+Brute-forcing 2^80 is impossible. But maybe we can recover the round keys independently due to the Feistel structure? With known plaintexts, we can attack the last round key first.
+
+Since it's a 4-round Feistel, we can use differential or linear cryptanalysis, but the problem suggests a linear attack.
+
+Let's think: We have plaintext P = (L0, R0). Pre-round mixing: R0 ^= L0. So after pre-round, we have (L0, R0'
+[tr-thinking call-0006:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  = R0 ^ L0). Then four rounds.
+
+Let's denote state before round i as (L_{i-1}, R_{i-1}). Then round i: R_i = L_{i-1} ^ F(R_{i-1} ^ K_i), L_i = R_{i-1}. After 4 rounds we have (L4, R4). Then post-round: L4 ^= R4, then output (R4, L4) swapped.
+
+So ciphertext C = (C_L, C_R) where C_L = R4, C_R = L4 (after post-round). Actually from code: return merge(right, left) where right is the final right
+[tr-thinking call-0006:worker:xiaomi/mimo-v2.5-pro-ultraspeed] , left is the final left after post-round mixing (left ^= right). So output is (right, left).
+
+Thus given ciphertext (C_L, C_R), we have:
+R4 = C_L, L4 = C_R ^ C_L (since left = C_R, and left ^= right before swap? Let's re-read encrypt:
+
+encrypt():
+    left = getleft(plaintext);
+    right = getright(plaintext);
+    right ^= left;  // pre-round mixing
+
+    // 4 rounds
+    for round 0..3:
+        mixed = f_function(right ^ key[round]);
+        temp = right;
+        right = left ^ mixed;
+        left = temp;
+
+    // post-round mixing
+    left ^= right;
+
+    return merge(right, left);
+[tr-thinking call-0006:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  // right is high 32 bits, left is low 32 bits
+
+So final: after 4 rounds we have left, right. Then left ^= right. Then output (right, left).
+
+Given ciphertext CT = (CT_high, CT_low) = (right, left after post). So:
+right = CT_high
+left = CT_low ^ CT_high (since left was XORed with right before output)
+
+Now to reverse last round (round 3). Let's denote before round 3 we have (L3, R3). Round 3: 
+mixed = f(R3 ^ K4) // K4 is key[3] (0-indexed)
+R4 = L3 ^ mixed
+L4 = R3
+
+We know
+[tr-thinking call-0006:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  R4 = CT_high, L4 = R3. So R3 = L4 = CT_low ^ CT_high.
+
+And L3 = R4 ^ mixed = CT_high ^ f(R3 ^ K4).
+
+So we can compute L3 and R3 from ciphertext and K4.
+
+Similarly for encryption, we can go forward from plaintext.
+
+Plaintext P = (P_high, P_low). After pre-round mixing: left = P_high, right = P_low ^ P_high.
+
+Then round 0: mixed0 = f(right ^ K1) where K1 = key[0]
+After round 0: left0 = right, right0 = left
+[tr-thinking call-0006:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  ^ mixed0 = P_high ^ f((P_low ^ P_high) ^ K1).
+
+So after round 0: (L1, R1) = (right, right0) = (P_low ^ P_high, P_high ^ f((P_low ^ P_high) ^ K1)).
+
+This is getting messy.
+
+Maybe we can do an attack by guessing K4 (key[3]) and checking consistency with multiple pairs.
+
+Since each key is only 20 bits, we can brute-force each key individually if we can isolate the effect of one key.
+
+Given a guess for K4, we can compute (L3, R3) for each pair. Then we have
+[tr-thinking call-0006:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  the state before round 3. Similarly, we can compute the state after round 2 from plaintext if we know K1,K2,K3? Not directly.
+
+Alternatively, we can brute-force K4 and K3 together? That's 40 bits, still too large.
+
+But we have 32 pairs, maybe we can use linear approximations to reduce the search.
+
+Given the hint "linear attack", we should look at linear approximations of the F-function.
+
+But maybe there's a simpler way: since the key seeds are only 20 bits, we can try to brute-force one key at a time by using the fact that after
+[tr-thinking call-0006:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  the last round, the intermediate values must be consistent with the plaintext after three rounds.
+
+Let's denote the encryption process:
+
+P -> (L0, R0) after pre-round: L0 = P_high, R0 = P_low ^ P_high.
+
+Round 1: (L1, R1) = (R0, L0 ^ f(R0 ^ K1))
+Round 2: (L2, R2) = (R1, L1 ^ f(R1 ^ K2))
+Round 3: (L3, R3) = (R2, L2 ^ f(R2 ^ K3))
+Round 
+[tr-thinking call-0006:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 4: (L4, R4) = (R3, L3 ^ f(R3 ^ K4))
+
+After post: left = L4 ^ R4, right = R4, output (right, left).
+
+So given ciphertext (C_high, C_low), we have:
+C_high = R4
+C_low = L4 ^ R4 = (L3 ^ f(R3 ^ K4)) ^ R4
+
+But R4 = R3 (since L4 = R3). So R4 = R3.
+Thus C_low = L3 ^ f(R3 ^ K4) ^ R3.
+
+But L
+[tr-thinking call-0006:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 3 = L2 ^ f(R2 ^ K3).
+
+This is complicated.
+
+Maybe we can write a program to brute-force K4 (key[3]) by checking consistency of the derived (L3,R3) across pairs. For a given pair, if we guess K4, we can compute (L3,R3) from ciphertext. Then we can compute the state after round 2: (L2,R2) = (?, ?). Actually from round 3: L3 = R2, R3 = L2 ^ f(R2 ^ K3). So if we also guess K3, we can compute (
+[tr-thinking call-0006:worker:xiaomi/mimo-v2.5-pro-ultraspeed] L2,R2). But we can also compute (L2,R2) from plaintext if we know K1 and K2. Not helpful.
+
+Maybe we can attack the first round key K1 similarly from plaintext side.
+
+Given the structure, maybe we can do a meet-in-the-middle attack? 4 rounds, we can compute up to round 2 from both ends.
+
+Let's think: From plaintext, after round 2 we have (L2,R2) expressed in terms of K1,K2.
+From ciphertext, after reversing round 4 and round 3 we get (L2,R2) expressed in terms of K3,K4.
+So we can equate for each pair:
+[tr-thinking call-0006:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  (L2,R2)_enc = (L2,R2)_dec.
+
+Thus for each pair, given K1,K2,K3,K4 we have consistency. But we need to find these keys.
+
+We can try to brute-force K1 and K2 (40 bits) and compute (L2,R2) for all pairs, store them. Then brute-force K3,K4 and look for matches. But 40 bits is too large (2^40 ~ 1 trillion), and we have to store 2^40 entries times 32 pairs? Not feasible.
+
+But note each key seed is 
+[tr-thinking call-0006:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 20 bits, but expanded to 32 bits. However, the expanded keys are deterministic from the seed. So we only have 2^20 possibilities per key. So total 2^80 possibilities, but we can attack each key separately if we can isolate.
+
+Maybe we can use the linear attack as hinted. Let's look at the F-function:
+
+F(input) uses G function. G(a,b,x) = ((a+b+x) mod 256) rotated left by 2.
+
+So G is basically addition mod 256 plus rotation.
+
+Linear cryptanalysis of FEAL: There are known linear approximations for FEAL. For the
+[tr-thinking call-0006:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  original FEAL, there is a linear approximation with probability 1 or -1? Actually FEAL has perfect linear approximations? I recall that FEAL-4 can be broken with a single known plaintext using linear cryptanalysis.
+
+Let's search memory: The FEAL-4 cipher has a linear approximation with bias 1, meaning it holds with probability 1. Specifically, the output bits of the F-function satisfy certain linear relations. There's a known attack: For FEAL-4, we can recover the key with 2^0 known plaintexts? Actually linear cryptanalysis usually requires many pairs, but FEAL-4 is weak.
+
+Maybe we can find the exact linear approximation. Let's derive.
+
+
+[tr-thinking call-0006:worker:xiaomi/mimo-v2.5-pro-ultraspeed] The F-function: 
+Input is 32 bits split into bytes x0,x1,x2,x3 (little-endian? Actually code extracts least significant byte first: x[0] = input & 0xFF; so x0 is LSB). Then:
+y2 = G(x3 ^ x2, x1 ^ x0, 1)
+y3 = G(x3, y2, 0)
+y1 = G(x1 ^ x0, y2, 0)
+y0 = G(x0, y1, 1)
+
+Output is y0,y1,y2,y3 as little-endian (LSB first).
+
+G(a,b,x) = ROL2(
+[tr-thinking call-0006:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  (a+b+x) mod 256 ).
+
+So G is linear if we ignore carry? Actually addition mod 256 is linear over GF(2) only if we consider carry bits. So not fully linear.
+
+But there might be a linear approximation that holds with high probability.
+
+Given time constraints, maybe we can try a smarter brute-force: Since each key is 20 bits, we can brute-force each key individually by using the fact that the cipher is a Feistel network. For example, if we guess K4 (key[3]), we can decrypt the last round for all pairs and then have a reduced
+[tr-thinking call-0006:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  cipher (3 rounds) with known input/output. Then we can attack K3 similarly, etc.
+
+But after removing last round, we have a 3-round Feistel, still hard.
+
+Alternatively, we can use differential cryptanalysis? But we only have 32 pairs, maybe enough for a deterministic attack.
+
+Given the small key size (20 bits per round key), we can brute-force each key individually if we can isolate the effect of one key using the other three. For example, if we guess K1,K2,K3, we can compute the state after round 3 from plaintext, and then compare with state before
+[tr-thinking call-0006:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  round 4 from ciphertext (which requires K4). But that requires guessing three keys.
+
+We can do a meet-in-the-middle on two keys: Guess K1 and K2, compute state after round 2 for all pairs, store. Then guess K3 and K4, compute state after round 2 from ciphertext side, look for matches. This is 2^40 each side, still large but maybe feasible with optimization and 32 pairs? 2^40 is about 1 trillion, too large for brute-force.
+
+We need to reduce the search space. Perhaps we can attack one key at a time using the structure of the Feistel network and
+[tr-thinking call-0006:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  the linearity in the key schedule.
+
+Another idea: Since the expanded keys are only 32 bits, and we have 32 pairs, we can set up equations for the bits. But the F-function is complex.
+
+Maybe we can use the fact that the key seeds are only 20 bits, and we can brute-force each seed individually by trying all 2^20 possibilities for one seed, and checking consistency with a few pairs. But we need a way to test a single seed.
+
+Suppose we guess K1_seed (20 bits). Then expanded K1 = expand(K1_seed). Now we can partially encrypt: from plaintext we
+[tr-thinking call-0006:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  can compute after round 1 the state (L1,R1) because we know K1. Then we have a 3-round cipher with unknown K2,K3,K4. But we also have the ciphertext, which we can partially decrypt if we knew K4. So we still need other keys.
+
+Maybe we can guess K1 and K4 together (40 bits) and then solve for K2 and K3? With two pairs, we might be able to solve for K2 and K3? Possibly.
+
+Given the limited time, I think we should implement a brute-force over the four 20-bit seeds but using a
+[tr-thinking call-0006:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  smarter approach: Since 2^80 is too large, we can do a meet-in-the-middle on two keys as earlier, but we need to reduce the storage. With 32 pairs, we can store hashes of the intermediate states.
+
+But 2^40 entries is too many to store in memory (16 TB if each entry is 8 bytes). Not feasible.
+
+We need a better attack. Let's search online for FEAL-4 linear attack. But we are offline.
+
+Maybe the intended solution is to use linear cryptanalysis to recover the round keys directly. Let's attempt to derive a linear approximation.
+
+Consider the F-function: Let's denote the input as I,
+[tr-thinking call-0006:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  output as O = F(I). We want linear relations between bits of I and O.
+
+Given the structure, maybe we can find that certain output bits equal certain input bits with probability 1. For example, look at the G function: G(a,b,0) = ROL2(a+b mod 256). The addition mod 256 can be expressed as bitwise XOR plus carry. Not linear.
+
+But perhaps there is a relation like: the MSB of the sum is linear? Not sure.
+
+Given the difficulty, perhaps we can write a program to brute-force all four keys but using pruning: for each pair, we can compute the possible K4 values that satisfy the equation for
+[tr-thinking call-0006:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  that pair. Then intersect across pairs.
+
+Let's derive equation for K4.
+
+From ciphertext: we have R4 = C_high, L4 = C_low ^ C_high.
+From round 4: R4 = L3 ^ f(R3 ^ K4), and R3 = L4.
+So L3 = R4 ^ f(L4 ^ K4) = C_high ^ f((C_low ^ C_high) ^ K4).
+
+Now L3 is the left half before round 4. Also L3 = R2 (from round 3). So we have R2 expressed in terms of K4.
+
+Similarly, from round 3: R3 = L2 ^ f(R2 ^ K3) => L4 = L
+[tr-thinking call-0006:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 2 ^ f(R2 ^ K3). But we don't know L2.
+
+Alternatively, we can also go forward from plaintext: After round 2, we have (L2,R2). We can express L2,R2 in terms of plaintext and K1,K2.
+
+We have:
+From plaintext:
+L0 = P_high
+R0 = P_low ^ P_high
+
+After round1:
+L1 = R0
+R1 = L0 ^ f(R0 ^ K1) = P_high ^ f((P_low ^ P_high) ^ K1)
+
+After round2:
+L2 = R1
+R2 = L1 ^ f(R1 ^ K2) =
+[tr-thinking call-0006:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  R0 ^ f(R1 ^ K2) = (P_low ^ P_high) ^ f(R1 ^ K2)
+
+So R2 = (P_low ^ P_high) ^ f( (P_high ^ f((P_low ^ P_high) ^ K1)) ^ K2 )
+
+But also from ciphertext side we have R2 = L3 = C_high ^ f((C_low ^ C_high) ^ K4).
+
+Thus we have an equation involving K1,K2,K4. Similarly we can get another equation from another pair.
+
+So for each pair, we have one equation relating K1,K2,K4. With enough pairs, we can solve for these keys.
+
+But the equation is complicated.
+[tr-thinking call-0006:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  However, note that each key is only 20 bits. We can brute-force K1 and K2 (40 bits) and then solve for K4 from the equation? Actually for given K1,K2, we can compute R2 from plaintext, and then from the equation we can compute f((C_low ^ C_high) ^ K4) = R2 ^ C_high. Since f is known, we can solve for K4? Not directly, because we need to invert f. f is not invertible? Actually f is a permutation? Let's check: f_function takes 32 bits and outputs 32 bits. Is it bijective? Possibly not, but maybe it's surjective? We
+[tr-thinking call-0006:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  can try to find all K4 such that f((C_low ^ C_high) ^ K4) equals a given value. That's a preimage problem. Since f is not linear, but we can brute-force K4 over 2^20 possibilities.
+
+So for each pair and each guess of (K1,K2), we can compute target = R2 ^ C_high. Then we need to find all K4 such that f((C_low ^ C_high) ^ K4) == target. We can precompute a lookup table for f for all 2^32 inputs? That's 4GB, maybe feasible? Actually f is a function from 32 bits to 32 bits. We can precompute f
+[tr-thinking call-0006:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  for all possible inputs? 2^32 is 4 billion entries, each 4 bytes -> 16GB. Too large.
+
+But note that the argument to f is (C_low ^ C_high) ^ K4. Since K4 is only 20 bits, the argument varies only in lower 20 bits? Actually K4 is 32-bit after expansion, but it's derived from 20-bit seed. So the expanded K4 is a 32-bit value, but only 2^20 possibilities. So we can brute-force over K4_seed (20 bits) and compute expanded K4, then compute f((C_low ^ C
+[tr-thinking call-0006:worker:xiaomi/mimo-v2.5-pro-ultraspeed] _high) ^ expanded_K4) and compare.
+
+So algorithm:
+
+1. For each pair i, compute constant A_i = C_low ^ C_high (from ciphertext), and constant B_i = P_low ^ P_high (from plaintext), and P_high_i.
+
+2. For each guess of K1_seed (20 bits), compute expanded K1 = expand(K1_seed).
+   For each guess of K2_seed (20 bits), compute expanded K2 = expand(K2_seed).
+     For each pair i, compute:
+        R0_i = B_i
+        temp = R0_i ^ K1
+        f_val = f_function
+[tr-thinking call-0006:worker:xiaomi/mimo-v2.5-pro-ultraspeed] (temp)
+        R1_i = P_high_i ^ f_val
+        temp2 = R1_i ^ K2
+        f_val2 = f_function(temp2)
+        R2_i = R0_i ^ f_val2
+        target_i = R2_i ^ (C_high_i)   // because f(A_i ^ K4) should equal target_i
+
+     Now we need to find K4_seed such that for all pairs i, f(A_i ^ expand(K4_seed)) == target_i.
+     So we can iterate over K4_seed (20 bits), compute expanded K4, and for each pair compute f(A_i ^ K4) and check if equals target_i. If matches all pairs, we found K
+[tr-thinking call-0006:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 1_seed, K2_seed, K4_seed. Then we can find K3_seed similarly? Actually we still need K3. But maybe we can compute K3 from another equation.
+
+We can similarly use another equation involving K3. For example, from ciphertext side we can compute L3 as earlier. And from plaintext side we can compute L3 after round2? Actually L3 = R2, which we already computed. And also from round3: L3 = R2, and R3 = L2 ^ f(R2 ^ K3). We know R3 = L4 = C_low ^ C_high. So we can compute L2 = ? From plaintext,
+[tr-thinking call-0006:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  L2 = R1. So we have:
+R3 = L2 ^ f(R2 ^ K3) => C_low ^ C_high = R1 ^ f(R2 ^ K3)
+=> f(R2 ^ K3) = R1 ^ (C_low ^ C_high)
+So we can compute target_for_K3 = R1 ^ (C_low ^ C_high). Then we need to find K3_seed such that f(R2 ^ expand(K3_seed)) == target_for_K3 for all pairs.
+
+Thus after finding K1,K2,K4, we can compute R1,R2 for each pair and then find K3 similarly by brute-forcing K3_seed (20 bits).
+
+So overall we
+[tr-thinking call-0006:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  need to brute-force K1_seed and K2_seed (40 bits) and for each, brute-force K4_seed (20 bits) and check all pairs. That's 2^60 operations, still too large.
+
+But we can optimize: For each guess of (K1_seed, K2_seed), we compute targets for each pair. Then we need to find K4_seed that matches all pairs. We can precompute for each pair a mapping from K4_seed to f(A_i ^ expand(K4_seed)). Then intersect across pairs. Since there are only 2^20 possible K4_seed, we can store for each pair a boolean array of size 2^20 indicating whether
+[tr-thinking call-0006:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  f(A_i ^ expand(K4_seed)) == target_i. Then we can AND these arrays across pairs. That's 2^20 * 32 bits = 32Mbit = 4MB, feasible. But we need to recompute for each (K1,K2) guess. So we can loop over K1_seed,K2_seed (2^40 iterations), for each compute target_i for each pair, then for each K4_seed compute f(A_i ^ expand(K4_seed)) and compare. That's 2^40 * 2^20 = 2^60 f computations, too many.
+
+We need to reduce. Maybe we can first brute
+[tr-thinking call-0006:worker:xiaomi/mimo-v2.5-pro-ultraspeed] -force K1_seed and K4_seed together? Not sure.
+
+Given the time, perhaps we can try a different approach: Since we have 32 pairs, maybe we can use the linear attack to recover the round keys directly without brute-force. Let's search for known linear approximations.
+
+I recall that for FEAL-4, there is a linear approximation: the parity of certain input and output bits of the F-function is 0 with probability 1. Specifically, let's denote the input bytes as a,b,c,d and output bytes as e,f,g,h. Then maybe a⊕b⊕c⊕d = e⊕f⊕g⊕h? Let's test with random values by writing a small program.
+
+We can write
+[tr-thinking call-0006:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  a quick C program to test linearity of F-function. Let's do that now. We'll compile and run to see if any linear relation holds.
+
+We'll create a test program. We'll output something like: for random inputs, compute XOR of all input bits and XOR of all output bits, see if they match. But we need to find the exact relation.
+
+Let's write a program to print input and output bits for a few values. We'll do that in /app.
+[tr-stream call-0006:worker:xiaomi/mimo-v2.5-pro-ultraspeed] {
+  "analysis": "I'll write a quick test program to examine the F-function for linear approximations. This will help determine if there's a simple linear relation that can be used in the attack.",
+  "plan": "1. Create test_linear.c that
+[tr-stream call-0006:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  computes F for random inputs and checks for linear relations between input and output bits.\n2. Compile and run it to see patterns.\n3. Based on findings, design the attack.",
+  "commands": [
+    {
+      "keystrokes": "cat > /app/test_linear.c << 'EOF'\n#include <stdio.h>\n#include <stdint.h>\n#include <stdlib.h>\n#include <time.h>\n\nuint8_t g_function(uint8_t a, uint8_t b, uint8_t x) {\n    uint8_t temp = (a + b + x) & 0xFF;\n    return ((temp << 2) | (temp >> 6)) & 0xFF;\
+[tr-stream call-0006:worker:xiaomi/mimo-v2.5-pro-ultraspeed] n}\n\nuint32_t f_function(uint32_t input_val) {\n    uint8_t x[4], y[4];\n    for (int i = 0; i < 4; i++) {\n        x[i] = input_val & 0xFF;\n        input_val >>= 8;\n    }\n    y[2] = g_function(x[3] ^ x[2], x[1] ^ x[0], 1);\n    y[3] = g_function(x[3], y[2], 0);\n    y[1] = g_function(x[1] ^ x[0], y[2], 0);\n    y[0] = g_function(x[0], y[1], 1);\n    uint32_t output = 0;\n    for (int i = 
+[tr-stream call-0006:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 0; i < 4; i++) output |= (uint32_t)y[i] << (8*i);\n    return output;\n}\n\nint main() {\n    srand(time(NULL));\n    uint32_t cnt[32] = {0};\n    for (int i = 0; i < 1000000; i++) {\n        uint32_t in = ((uint32_t)rand()<<16) ^ rand();\n        uint32_t out = f_function(in);\n        // Check all possible linear masks\n        for (int mask = 1; mask < 32; mask++) {\n            uint32_t inmask = 
+[tr-stream call-0006:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 0, outmask = 0;\n            // compute parity of bits selected by mask in input and output\n            uint32_t tmp = in & ((mask & 1 ? 0xFF : 0) | (mask & 2 ? 0xFF00 : 0) | (mask & 4 ? 0xFF0000 : 0) | (mask & 8 ? 0xFF000000 : 0));\n            uint32_t tmp2 = out & ((mask & 16 ? 0xFF : 0) | (mask & 32 ? 0xFF00 : 0
+[tr-stream call-0006:worker:xiaomi/mimo-v2.5-pro-ultraspeed] ) | (mask & 64 ? 0xFF0000 : 0) | (mask & 128 ? 0xFF000000 : 0));\n            // Not good, let's do bit-level.\n        }\n        // Simpler: check XOR of all input bits vs XOR of all output bits\n        uint32_t in_parity = __builtin_parity(in);\n        uint32_t out_parity = __builtin_parity(out);\n        if (in_parity == out_parity) cnt[0]++; else cnt[1
+[tr-stream call-0006:worker:xiaomi/mimo-v2.5-pro-ultraspeed] ]++;\n        // Check byte-wise XOR\n        uint8_t in_bytes[4], out_bytes[4];\n        for (int j=0;j<4;j++) {in_bytes[j]=(in>>(8*j))&0xFF; out_bytes[j]=(out>>(8*j))&0xFF;}\n        uint8_t in_xor = in_bytes[0]^in_bytes[1]^in_bytes[2]^in_bytes[3];\n        uint8_t out_xor = out_bytes[0]^out_bytes[1]^out_bytes[2]^out_bytes[3];\n        if (
+[tr-stream call-0006:worker:xiaomi/mimo-v2.5-pro-ultraspeed] in_xor == out_xor) cnt[2]++; else cnt[3]++;\n    }\n    printf(\"Parity match: %u / 1000000\\n\", cnt[0]);\n    printf(\"Byte XOR match: %u / 1000000\\n\", cnt[2]);\n    return 0;\n}\nEOF\n",
+      "duration": 0.2
+    },
+    {
+      "keystrokes": "gcc -o /app/test_linear /app/test_linear.c -O2 && /app/test_linear\n",
+      "duration": 2
+
+[tr-stream call-0006:worker:xiaomi/mimo-v2.5-pro-ultraspeed]     }
+  ]
+}
+
+[tr-stream call-0006:worker:xiaomi/mimo-v2.5-pro-ultraspeed] worker.done finish=stop cost_microdollars=28202
+[tr-stream call-0006:xiaomi/mimo-v2.5-pro-ultraspeed] {
+  "analysis": "I'll write a quick test program to examine the F-function for linear approximations. This will help determine if there's a simple linear relation that can be used in the attack.",
+  "plan": "1. Create test_linear.c that computes F for random inputs and checks for linear relations between input and output bits.\n2. Compile and run it to see patterns.\n3. Based on findings, design the attack.",
+  "commands": [
+    {
+      "keystrokes": "cat > /app/test_linear.c << 'EOF'\n#include <stdio.h>\n#include <stdint.h>\n#include <stdlib.h>\n#include <time.h>\n\nuint8_t g_function(uint8_t a, uint8_t b, uint8_t x) {\n    uint8_t temp = (a + b + x) & 0xFF;\n    return ((temp << 2) | (temp >> 6)) & 0xFF;\n}\n\nuint32_t f_function(uint32_t input_val) {\n    uint8_t x[4], y[4];\n    for (int i = 0; i < 4; i++) {\n        x[i] = input_val & 0xFF;\n        input_val >>= 8;\n    }\n    y[2] = g_function(x[3] ^ x[2], x[1] ^ x[0], 1);\n    y[3] = g_function(x[3], y[2], 0);\n    y[1] = g_function(x[1] ^ x[0], y[2], 0);\n    y[0] = g_function(x[0], y[1], 1);\n    uint32_t output = 0;\n    for (int i = 0; i < 4; i++) output |= (uint32_t)y[i] << (8*i);\n    return output;\n}\n\nint main() {\n    srand(time(NULL));\n    uint32_t cnt[32] = {0};\n    for (int i = 0; i < 1000000; i++) {\n        uint32_t in = ((uint32_t)rand()<<16) ^ rand();\n        uint32_t out = f_function(in);\n        // Check all possible linear masks\n        for (int mask = 1; mask < 32; mask++) {\n            uint32_t inmask = 0, outmask = 0;\n            // compute parity of bits selected by mask in input and output\n            uint32_t tmp = in & ((mask & 1 ? 0xFF : 0) | (mask & 2 ? 0xFF00 : 0) | (mask & 4 ? 0xFF0000 : 0) | (mask & 8 ? 0xFF000000 : 0));\n            uint32_t tmp2 = out & ((mask & 16 ? 0xFF : 0) | (mask & 32 ? 0xFF00 : 0) | (mask & 64 ? 0xFF0000 : 0) | (mask & 128 ? 0xFF000000 : 0));\n            // Not good, let's do bit-level.\n        }\n        // Simpler: check XOR of all input bits vs XOR of all output bits\n        uint32_t in_parity = __builtin_parity(in);\n        uint32_t out_parity = __builtin_parity(out);\n        if (in_parity == out_parity) cnt[0]++; else cnt[1]++;\n        // Check byte-wise XOR\n        uint8_t in_bytes[4], out_bytes[4];\n        for (int j=0;j<4;j++) {in_bytes[j]=(in>>(8*j))&0xFF; out_bytes[j]=(out>>(8*j))&0xFF;}\n        uint8_t in_xor = in_bytes[0]^in_bytes[1]^in_bytes[2]^in_bytes[3];\n        uint8_t out_xor = out_bytes[0]^out_bytes[1]^out_bytes[2]^out_bytes[3];\n        if (in_xor == out_xor) cnt[2]++; else cnt[3]++;\n    }\n    printf(\"Parity match: %u / 1000000\\n\", cnt[0]);\n    printf(\"Byte XOR match: %u / 1000000\\n\", cnt[2]);\n    return 0;\n}\nEOF\n",
+      "duration": 0.2
+    },
+    {
+      "keystrokes": "gcc -o /app/test_linear /app/test_linear.c -O2 && /app/test_linear\n",
+      "duration": 2
+    }
+  ]
+}

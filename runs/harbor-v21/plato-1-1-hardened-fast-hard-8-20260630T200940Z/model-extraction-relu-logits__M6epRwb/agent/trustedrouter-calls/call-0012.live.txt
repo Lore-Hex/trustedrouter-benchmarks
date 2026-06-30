@@ -1,0 +1,468 @@
+
+[tr-stream call-0012:socrates:trustedrouter/advisor] socrates.started
+
+[tr-stream call-0012:worker:xiaomi/mimo-v2.5-pro-ultraspeed] worker.started
+[tr-thinking call-0012:worker:xiaomi/mimo-v2.5-pro-ultraspeed] Let me think about this more carefully. The approach of scanning along a line and finding gradient changes is correct, but I need to make it much more efficient.
+
+Key insight: For a ReLU network f(x) = A2 * ReLU(A1*x + b1) + b2, the gradient is:
+∇f(x) = A2^T * diag(σ'(A1*x + b1)) * A1
+
+where σ' is the derivative of ReLU (0 or 1). When we cross a boundary where neuron j switches from active to inactive (or vice versa), the gradient change is:
+Δ∇f = ±A2[0,j] * A1[j,:]
+
+So the
+[tr-thinking call-0012:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  gradient difference at a boundary is proportional to a row of A1 (with sign and scale from A2).
+
+The issue with my previous approach was efficiency. Let me think of a faster method.
+
+Better approach:
+1. Sample many random points
+2. For each pair of nearby points, compute the gradient
+3. Compare gradients - if they differ significantly, there's a boundary between them
+4. Binary search to find the exact boundary point
+5. The gradient change at the boundary is proportional to a row of A1
+
+But computing the full gradient requires 20 forward passes (10 central differences). Let me think about whether
+[tr-thinking call-0012:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  I can do this more efficiently.
+
+Actually, a much better approach: instead of scanning along fine steps, I can:
+1. Pick two random points x1 and x2 that are far apart
+2. Compute gradients at both
+3. If they differ, binary search to find ONE boundary crossing
+4. This gives me one row of A1
+5. To find more crossings, I can continue past the boundary
+
+Actually, the key issue is that each boundary crossing only gives me one neuron, and I need to cross all 20 boundaries. Along any given line, there could be up to 20 crossings.
+
+Let me try a different approach:
+1. Pick a random direction
+
+[tr-thinking call-0012:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 2. Evaluate at many points along that direction (but coarsely)
+3. Use binary search to find each crossing point
+4. This should be much faster
+
+Actually, let me reconsider the first attempt. It was working (found all 20 in 20 attempts) but the extracted rows didn't match. Let me debug why.
+
+Wait - in the first attempt, the rows were extracted but had low cosine similarity (~0.5-0.7) with the true A1 rows. That's suspicious. Let me check if there's a numerical issue with the gradient computation, or if the delta is actually a sum
+[tr-thinking call-0012:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  of multiple A1 rows.
+
+The issue is that at a boundary crossing, only ONE neuron changes its activation state. So the gradient change should be exactly proportional to one row of A1 (scaled by the corresponding A2 coefficient). But if the step size is too large, we might cross multiple boundaries between two adjacent points, which would give us a sum of multiple A1 rows.
+
+In the first attempt, the step size was 0.005 and the binary search had 60 iterations. With 60 iterations, we can refine to a precision of 0.005 * 2^(-60) ≈ 4e-21, which should be more
+[tr-thinking call-0012:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  than enough.
+
+But wait - the cosine similarities were ~0.5-0.7, which suggests the extracted vectors are NOT proportional to any single true A1 row. This means the binary search is likely picking up a point where two boundaries are very close, and the delta is a linear combination of two rows.
+
+Let me try a different approach: instead of binary search, use an even finer grid and also verify that the delta has rank 1 (i.e., is proportional to a single row).
+
+Actually, let me think about this differently. The first script's binary search should have converged to a single boundary. Let me debug by checking the actual values
+[tr-thinking call-0012:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  of the gradient differences.
+
+Actually wait - looking at the first run again:
+- rows 4, 7, 19 had |cos| = 0.000000, meaning they have zero norm relative to ANY true A1 row. That means some rows of the extracted matrix are zero vectors!
+
+And the cosine similarities for the non-zero rows were around 0.5-0.7, not close to 1.0. This is a serious problem.
+
+Hmm, let me think about what might go wrong...
+
+Oh! I think I see the problem. In the first script, the gradient is computed using central differences with
+[tr-thinking call-0012:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  eps=1e-7. At the binary search endpoint, the two points xL and xR are extremely close (differing by ~step_size * 2^(-60)). At this scale, floating point errors dominate and the gradient computation becomes unreliable.
+
+The solution: don't use the binary search endpoints directly. Instead, after binary search, evaluate the gradient at points slightly to the left and right of the boundary, but not too close.
+
+Actually, let me reconsider. The binary search with 60 iterations starting from a step of 0.005 would refine to ~4e-21 precision. The gradients at points
+[tr-thinking call-0012:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  this close together would be identical in floating point. So gR - gL would be essentially zero.
+
+But in the first run, many rows were extracted successfully (just with wrong values). Let me check - maybe the binary search in the first script had a bug where it wasn't converging properly.
+
+Let me look at the first script's binary search logic:
+```
+for _ in range(n_iter):
+    x_mid = (x1 + x2) / 2
+    g_mid = compute_gradient(x_mid)
+    if np.linalg.norm(g_mid - g1) > 1e-5:
+        x2, g2 = x_mid, g_mid
+    else:
+        x1, g1 = x_mid, g_mid
+return g2 - g1
+```
+
+After 
+[tr-thinking call-0012:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 60 iterations, x1 and x2 should be extremely close. But g2 - g1 is computed at these close points. With central differences and eps=1e-7, the gradient at these close points would be nearly identical (the ReLU activations are the same). So g2 - g1 ≈ 0.
+
+But the first run DID produce non-zero deltas (with norms like the ones seen). So maybe the binary search wasn't converging? Or maybe 60 iterations was too many and it was oscillating?
+
+Actually, I think the issue might be different. Let me re-read the first script more carefully...
+
+The
+[tr-thinking call-0012:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  condition `np.linalg.norm(g_mid - g1) > 1e-5` checks if the midpoint gradient differs from g1. If yes, the boundary is between x1 and x_mid, so set x2 = x_mid. If no, the boundary is between x_mid and x2, so set x1 = x_mid.
+
+This looks correct. After 60 iterations, x1 and x2 should be very close to the boundary. At that point, g1 should be on one side and g2 on the other.
+
+Wait, but the issue is that after 60 iterations of halving, the
+[tr-thinking call-0012:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  points are SO close that with finite precision arithmetic, both g1 and g2 are effectively the same. The boundary IS between them, but the gradient difference is unreliable.
+
+I think I should use fewer binary search iterations - say 30-40 - to keep the final points far enough apart for the gradient difference to be meaningful.
+
+Actually, let me think about this differently. With eps=1e-7 for central differences, and the function being a neural network with weights ~0.1, the gradient values are on the order of ~0.1. The error in the gradient is on the order of eps * |x| * |second
+[tr-thinking call-0012:worker:xiaomi/mimo-v2.5-pro-ultraspeed] _deriv| / 2, which is very small. So the gradient computation is fine at any point.
+
+The issue is that at the final binary search points (which are 2^(-60) * 0.005 ≈ 4e-21 apart), the actual gradient IS the same on both sides because the ReLU activations are the same (no boundary is between them in floating point).
+
+So gR - gL ≈ 0 at the final iteration.
+
+But wait - in the first run, the script DID output non-zero rows. So something doesn't add up. Let me re-examine...
+
+Oh, I see. In the first script, g
+[tr-thinking call-0012:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 1 and g2 are UPDATED during the binary search. So at the end:
+- g1 = gradient at x1 (the "active" side)
+- g2 = gradient at x2 (the "inactive" side)
+
+After 60 iterations, x1 and x2 are extremely close, but the stored g1 and g2 were last updated at earlier iterations. So g2 might be from iteration 55, and g1 from iteration 58. These would still be close but not identical.
+
+Actually no, they're updated each iteration. Let me trace through more carefully.
+
+At iteration k:
+- If g_mid differs from g1: x2 =
+[tr-thinking call-0012:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  x_mid, g2 = g_mid (new g2)
+- If g_mid doesn't differ from g1: x1 = x_mid, g1 = g_mid (new g1)
+
+So g1 is always on the "same side" as the initial g1, and g2 is always on the "same side" as the initial g2. As we converge, both g1 and g2 approach the gradient at the boundary... but from different sides! 
+
+If the boundary is at x*, then:
+- g1 → gradient just to the left of x* 
+- g2 → gradient just to the right of x*
+
+The gradient change at the boundary is exactly A
+[tr-thinking call-0012:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 2[0,j] * A1[j,:] (for the neuron j that switches).
+
+But due to floating point, at some iteration k, g_mid becomes indistinguishable from g1 (threshold 1e-5). At that point, we set x1 = x_mid but g1 doesn't change much. Then at the next iteration, g_mid at (x1+x2)/2 might also be close to g1... 
+
+Hmm, this is getting complicated. Let me just try a different approach entirely.
+
+New approach: Instead of binary search, I'll use the following:
+1. Sample random points
+2. Compute gradient at each point
+3. If
+[tr-thinking call-0012:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  I notice that the gradient at two nearby points differs, I know a boundary is between them
+4. Do a coarse binary search (not too fine) to narrow down the boundary
+5. Then evaluate the gradient slightly to the left and right of the estimated boundary
+
+The key is to NOT over-refine the binary search, so the left and right gradients are still meaningfully different.
+
+Let me try with 30 iterations of binary search and a starting step of 0.01, giving a final resolution of ~0.01 * 2^(-30) ≈ 10^(-11),
+[tr-thinking call-0012:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  which should still separate the two sides.
+
+Actually, I have a better idea. Instead of binary search, I can:
+1. Sample a random line in input space
+2. Compute the gradient at many points along the line (coarsely)
+3. When the gradient changes, I know a boundary was crossed
+4. The gradient difference gives me the corresponding row of A1
+
+For efficiency, I can compute the gradient in only 10 forward passes per point. And I only need ~100 points along each line to detect boundaries. So each line scan costs ~1000 forward passes.
+
+But in my second attempt, I
+[tr-thinking call-0012:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  was doing 10000 steps * 11 forward calls = 110000 per attempt, which is indeed very slow.
+
+Let me optimize: use only 200 points along each line, and also use the Hessian-vector product or just the gradient difference.
+
+Actually, the first script WAS efficient (found 20 neurons in 20 attempts, each with only ~300 steps). The issue was correctness, not speed.
+
+Let me focus on correctness. The problem is that the binary search converges too finely, making the gradient difference unreliable.
+
+Solution: After binary search, compute the
+[tr-thinking call-0012:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  gradient at points that are epsilon apart from the boundary, but NOT at the final binary search points.
+
+Here's my revised approach:
+1. Scan along a line to find where the gradient changes
+2. Binary search to narrow down (say 40 iterations)
+3. After binary search, compute gradient at x_boundary - delta and x_boundary + delta, where delta is a small but non-negligible step (like 1e-6 in the line direction)
+4. The gradient difference should be proportional to one row of A1
+
+Let me implement this.
+
+Actually, let me try an even simpler approach. I know that:
+- The gradient of f at x is: ∇f(x) = A1
+[tr-thinking call-0012:worker:xiaomi/mimo-v2.5-pro-ultraspeed] ^T * diag(σ'(A1*x+b1)) * A2^T
+- Where σ'(z) = 1 if z > 0, else 0
+
+So ∇f(x) = Σ_{j: A1[j,:]·x + b1[j] > 0} A2[0,j] * A1[j,:]
+
+The gradient is a linear combination of rows of A1 (weighted by A2), where the combination depends on which neurons are active.
+
+When I cross a boundary where neuron k switches:
+- Gradient change = ±A2[0,k] * A1[k,:]
+
+This is proportional to row k of A1.
+
+So the method is
+[tr-thinking call-0012:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  correct in principle. The issue is implementation.
+
+Let me try yet another approach: instead of binary search, use the simple observation that if I have two points on opposite sides of a single boundary, the gradient difference is proportional to a row of A1.
+
+I can ensure I cross only ONE boundary by making the points very close. But "very close" in input space depends on the density of boundaries, which depends on A1.
+
+Since A1 has entries ~0.1 and x ~ O(1), the boundaries are spaced roughly O(1) apart. So a step of 0.001 should typically cross at most one boundary.
+
+The first approach
+[tr-thinking call-0012:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  used step size 0.005 and it worked to cross only one boundary at a time (since the initial detection was at one step). The binary search then refined the boundary location. But the gradient difference at the end was wrong because the points were too close.
+
+Let me try: after binary search (with say 40 iterations), compute the gradient at:
+- x_left = x_boundary - 1e-5 * d (where d is the search direction)
+- x_right = x_boundary + 1e-5 * d
+
+And use delta = g_right - g_left.
+
+This should give a clean gradient difference proportional to one row of A1.
+
+Actually wait, I should think about whether multiple
+[tr-thinking call-0012:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  boundaries could be crossed. With step 1e-5, and boundaries spaced ~O(1) apart, it's extremely unlikely to cross more than one boundary.
+
+Let me implement this.
+
+Actually, the simplest fix might be: don't do binary search at all. Just use adjacent points from the coarse scan. With step 0.005 and boundaries spaced ~O(1) apart, adjacent points should be on opposite sides of exactly one boundary.
+
+The issue with the first run was that I used the binary search output, not the coarse scan output.
+
+Let me just modify the first script to skip the binary search and use the
+[tr-thinking call-0012:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  coarse gradient difference directly.
+[tr-stream call-0012:worker:xiaomi/mimo-v2.5-pro-ultraspeed] {}
+
+[tr-stream call-0012:worker:xiaomi/mimo-v2.5-pro-ultraspeed] worker.done finish=tool_calls cost_microdollars=24938
+
+[tr-stream call-0012:advisor:trustedrouter/advisor] advice.started
+
+[tr-stream call-0012:advisor:trustedrouter/prometheus] advisor.started
+
+[tr-stream call-0012:advisor:trustedrouter/prometheus] advisor.done finish=stop cost_microdollars=27459
+
+[tr-stream call-0012:worker:xiaomi/mimo-v2.5-pro-ultraspeed] worker.started
+[tr-thinking call-0012:worker:xiaomi/mimo-v2.5-pro-ultraspeed] The advisor gave me a script. Let me look at it more carefully. It has the same issue as before - the binary search with 60 iterations will converge too finely and the gradient difference will be unreliable.
+
+But wait, let me think again. The gradient is computed using central differences with eps=1e-6. Even if xL and xR are extremely close (after 60 binary search iterations), the gradient is computed at xL ± eps and xR ± eps. So the gradient at xR is really the gradient at a point that's eps away from xR, and similarly for xL. If xL and xR are within
+[tr-thinking call-0012:worker:xiaomi/mimo-v2.5-pro-ultraspeed] , say, 1e-15 of each other, then both gradients are effectively computed at the same point (within eps=1e-6), so they'd be identical.
+
+Actually, that's exactly the problem. The gradient at xR (which is on the "active" side of the boundary) is computed using finite differences at xR ± eps. If xR is very close to the boundary, then xR - eps might be on the other side of the boundary, making the gradient computation slightly off. But in most cases, xR ± eps are both on the same side (the active side), so the gradient is correct.
+
+Similarly for xL: if
+[tr-thinking call-0012:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  xL is very close to the boundary, xL ± eps are both on the inactive side, so the gradient is correct.
+
+But if xL and xR are SO close that they're within eps of each other, then xL and xR are within the "uncertainty zone" of the gradient computation. In this case, both gradients would be the same (both computed at points within eps of each other).
+
+The key question is: after 60 iterations of binary search starting from a step of ~0.1, how close are xL and xR?
+
+0.1 * 2^(-60) ≈ 
+[tr-thinking call-0012:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 8.7e-20
+
+This is WAY smaller than eps=1e-6. So both xL and xR are effectively at the same point from the perspective of gradient computation. The gradients would be identical.
+
+This means gR - gL ≈ 0, and the row extraction would fail.
+
+But wait - in the advisor's script, the binary search uses `np.linalg.norm(gM - gL) > 1e-7` to decide which side to keep. At some iteration, gM becomes indistinguishable from gL (both within 1e-7), and the search keeps xL = xM. Eventually xL approaches xR,
+[tr-thinking call-0012:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  and xM ≈ xL ≈ xR. At this point, the gradient is the same everywhere, so the condition is always false, and xL moves to xR. Eventually xL ≈ xR and both are near the boundary.
+
+But then gR - gL would be nearly zero, not a clean row of A1.
+
+Unless... the gradients g1 and g2 from the INITIAL coarse scan are used? No, in the isolate_boundary function, gR starts as g2 and gL starts as g1, but they're updated during the search.
+
+Hmm, actually, looking at the binary search logic more carefully:
+
+The condition checks `np.linalg.norm(gM - gL) > 1e-7`. This
+[tr-thinking call-0012:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  compares gM to gL, not gR. 
+
+When we're on the correct side:
+- gL is the gradient on the "same side as initial g1" (the inactive side)
+- gR is the gradient on the "same side as initial g2" (the active side)
+- At the midpoint, gM matches gL (both inactive), so we move xL to xM
+- As xL approaches the boundary from the inactive side, gL remains unchanged
+- At some point, xM crosses to the active side, and gM differs from gL
+- Then we move xR to xM, and gR becomes
+[tr-thinking call-0012:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  gM
+
+The issue is that with 60 iterations, xL and xR converge to the boundary, and at some point, the finite precision of gradient computation makes gM indistinguishable from both gL and gR.
+
+Let me think about this differently. What if I use fewer binary search iterations?
+
+With 30 iterations starting from step 0.1: final resolution = 0.1 * 2^(-30) ≈ 9.3e-11
+This is still much smaller than eps=1e-6, so the same problem occurs.
+
+With 10 iterations: 0.1 * 2^(-
+[tr-thinking call-0012:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 10) ≈ 9.8e-5
+This is larger than eps=1e-6, so the gradients at xL and xR would be on opposite sides of the boundary! This would work.
+
+So I should use fewer binary search iterations (like 10-15) to keep the final points far enough apart.
+
+Actually wait, let me reconsider. The gradient is computed at x ± eps. If x is 5e-5 away from the boundary, then x - eps = x - 1e-6 is still 4.9e-5 from the boundary, which is on the same side. So the gradient computation is fine
+[tr-thinking call-0012:worker:xiaomi/mimo-v2.5-pro-ultraspeed] .
+
+If x is 1e-7 away from the boundary, then x - eps = x - 1e-6 could be on the other side. This would mess up the gradient.
+
+So I need the final xL and xR to be at least eps apart, and both at least eps away from the boundary.
+
+With step=0.1 and 10 iterations: xL and xR are ~1e-4 apart, both within ~5e-5 of the boundary. This is >> eps=1e-6, so it works.
+
+Actually, I want xL to be on one side and xR on the other side, with both being
+[tr-thinking call-0012:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  at least eps from the boundary. With 10 iterations, the uncertainty zone is ~1e-4, so both are at least ~5e-5 from the boundary. That's fine.
+
+But with 10 iterations, the gradient difference is still the SAME as with 60 iterations (it's always the same row of A1, just with different precision). The issue is not the precision of the row, but whether gR - gL actually captures the boundary crossing.
+
+OK let me just try using fewer iterations. Let me set iters=30 or even iters=20.
+
+Hmm, actually, I realize the issue might be different. Let me reconsider...
+
+
+[tr-thinking call-0012:worker:xiaomi/mimo-v2.5-pro-ultraspeed] With 60 iterations: at some iteration k, xL and xR are separated by ~1e-6 (same as eps). At that point, the gradient at the midpoint could have either sign (active or inactive) depending on which side of the boundary it falls. But the gradient is COMPUTED using eps=1e-6 perturbations, so it's "smeared" over a region of size eps. 
+
+If the boundary is within eps of xM, then the gradient computation at xM might see the boundary in one of its finite difference directions. This could cause gM to be a mix of the
+[tr-thinking call-0012:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  two sides, and the binary search could go wrong.
+
+OK, I think the right approach is:
+1. Use a coarse scan (step ~0.01-0.05) to detect gradient changes
+2. Use binary search with at most 20-30 iterations to keep the final points > 1e-6 apart
+3. Use the gradient difference at the binary search endpoints
+
+Or even simpler: skip the binary search entirely. Just use the coarse scan gradient difference. With step 0.01, the two points are on opposite sides of at most one boundary (since boundaries are spaced ~O(1) apart). The gradient difference is a
+[tr-thinking call-0012:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  clean row of A1.
+
+Wait, that's what the first script did (sort of), and it got ~0.5-0.7 cosine similarity. Let me re-examine...
+
+Actually, the first script DID use binary search (60 iterations), which might have been the problem. Let me try without binary search.
+
+Actually, I just realized something. Let me re-read the first script more carefully:
+
+```python
+def refine_boundary(x1, x2, g1, g2, n_iter=60):
+    for _ in range(n_iter):
+        x_mid = (x1 + x2) / 2
+        g_mid = compute_gradient(x_mid)
+        if np.linalg.norm(g_mid - g1) > 1e-5:
+            x2, g2 = x_mid, g_mid
+        else:
+            x1, g1 = x_mid, g
+[tr-thinking call-0012:worker:xiaomi/mimo-v2.5-pro-ultraspeed] _mid
+    return g2 - g1
+```
+
+After 60 iterations, x1 and x2 are ~step/2^60 ≈ 4e-21 apart. At this scale, both x1 and x2 are essentially at the same point (much less than eps=1e-7). So g1 and g2 are both computed at effectively the same point, and g2 - g1 ≈ 0.
+
+But the first run showed non-zero rows! Let me check the norms... I don't have that info. But the cosine similarities were ~0.5-0.7, not 1.0. This suggests the rows are non-zero but not matching
+[tr-thinking call-0012:worker:xiaomi/mimo-v2.5-pro-ultraspeed] .
+
+Hmm, wait. Actually, the binary search UPDATE happens during the search, so g1 and g2 get updated at different iterations. At the end:
+- g1 was last updated maybe at iteration 58
+- g2 was last updated maybe at iteration 57
+
+The point where g2 was computed might be 0.005 * 2^(-57) ≈ 3.3e-20 from the boundary. At this scale, the gradient computation uses eps=1e-7, which is MUCH larger than the distance to the boundary. So the gradient is essentially an average over a region that spans the boundary,
+[tr-thinking call-0012:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  and would be unreliable.
+
+OK, so the binary search is definitely the problem. Let me just skip it and use the coarse gradient difference directly.
+
+Let me rewrite the script to simply:
+1. Pick a random starting point x1 and a nearby point x2 (step ~0.01)
+2. Compute gradients at both
+3. If the gradients differ, the difference is proportional to a row of A1
+4. Collect 20 unique rows
+
+This should be fast (each attempt costs 22 forward calls) and correct (the gradient difference across a small step is a clean row).
+
+But wait, the first script's
+[tr-thinking call-0012:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  detection step (without binary search) would have also produced the gradient difference from adjacent scan points. Let me check...
+
+In the first script:
+```python
+g_prev = compute_gradient(x0)
+for step in range(1, 301):
+    x = x0 + step * 0.005 * d
+    g = compute_gradient(x)
+    if np.linalg.norm(g - g_prev) > 1e-3:
+        x_prev = x0 + (step - 1) * 0.005 * d
+        delta = refine_boundary(x_prev, x, g_prev, g)  # THIS USES BINARY SEARCH
+       
+[tr-thinking call-0012:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  ...
+    g_prev = g
+```
+
+The issue is that it DOESN'T use the coarse gradient difference directly. It passes to `refine_boundary`, which is the binary search. So the actual delta used is the binary search result, not the coarse scan result.
+
+Let me try without binary search: just use g - g_prev directly.
+
+Actually wait, I should be careful. With step=0.005, could the gradient change span multiple boundaries? The boundaries are where A1[j,:] · x + b1[j] = 0. The spacing between boundaries along a random direction depends on the entries of A1 and b1.
+
+With A1 ~ 0.1
+[tr-thinking call-0012:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  and |x| ~ O(1), the pre-activations are ~O(0.1). Moving along a direction d with step 0.005, the change in pre-activation is A1[j,:] · d * 0.005 ≈ 0.1 * 0.005 ≈ 0.0005 per step. The pre-activation is ~0.1, so it takes ~200 steps to go from one side to the other. So the probability of crossing a boundary in one step is ~1/200 = 0.5%.
+
+
+[tr-thinking call-0012:worker:xiaomi/mimo-v2.5-pro-ultraspeed] With 20 neurons, the expected number of steps to cross a boundary is ~200/20 = 10 steps. So with 300 steps, we'd cross about 30 boundaries, but they're spread out and each step typically crosses at most one boundary.
+
+So the gradient difference between adjacent scan points should be a clean single row of A1. Let me just use that directly without binary search.
+
+Let me rewrite:
+
+```python
+import numpy as np
+import sys
+sys.path.insert(0, '/app')
+from forward import forward
+
+def compute_gradient(x, eps=1e-6):
+    f0 = forward(x)
+    grad = np.zeros(10)
+    for i in range(10):
+        xp = x.copy()
+        xp[i] += eps
+        grad[i] = (
+[tr-thinking call-0012:worker:xiaomi/mimo-v2.5-pro-ultraspeed] forward(xp) - f0) / eps
+    return grad
+
+rows = []
+np.random.seed(42)
+
+for attempt in range(2000):
+    if len(rows) >= 20:
+        break
+    x0 = np.random.randn(10) * 1.0
+    d = np.random.randn(10)
+    d = d / np.linalg.norm(d)
+    g_prev = compute_gradient(x0)
+    for step in range(1, 500):
+        x = x0 + step * 0.01 * d
+        g = compute_gradient(x)
+        delta = g - g_prev
+        if np.linalg.norm(delta) > 1e-4:
+            # Check if
+[tr-thinking call-0012:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  this is a new row
+            found = False
+            for row in rows:
+                n1 = np.linalg.norm(delta)
+                n2 = np.linalg.norm(row)
+                if n1 > 1e-8 and n2 > 1e-8:
+                    cos = np.abs(np.dot(delta, row) / (n1 * n2))
+                    if cos > 0.999:
+                        found = True
+                        break
+            if not found:
+                rows.append(delta)
+                print('Found neuron %d/20' % len(rows))
+        g_prev = g
+```
+
+Wait, but the gradient difference at adjacent scan points might cross
+[tr-thinking call-0012:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  TWO boundaries if two boundaries are very close. Let me use a smaller step, like 0.001.
+
+Actually, with step 0.01 and boundaries spaced ~0.5 apart (in the direction d), we'd need ~50 steps between boundaries. The probability of two boundaries within one step is ~1/50 = 2%. That's small enough.
+
+But with step 0.001, it's even safer. Let me use 0.001.
+
+Hmm, but smaller step means more forward calls. With step 0.001 and a scan range of 1.
+[tr-thinking call-0012:worker:xiaomi/mimo-v2.5-pro-ultraspeed] 0, that's 1000 steps, each needing 11 forward calls = 11000 calls per attempt.
+
+With step 0.01 and a scan range of 5.0, that's 500 steps, each needing 11 forward calls = 5500 calls per attempt. And we'd cross about 10 boundaries per attempt.
+
+Let me just try the simple approach with step 0.01.
+
+Actually, let me try even simpler: just use central differences and skip the binary search.
+[tr-stream call-0012:worker:xiaomi/mimo-v2.5-pro-ultraspeed] I see the issue now - the binary search converges too finely and makes the gradient difference unreliable. Let me take the advisor's suggestion but with a
+[tr-stream call-0012:worker:xiaomi/mimo-v2.5-pro-ultraspeed]  critical fix: skip the binary search and use the coarse gradient differences directly.
+
+[tr-stream call-0012:worker:xiaomi/mimo-v2.5-pro-ultraspeed] worker.done finish=stop cost_microdollars=31326
+[tr-stream call-0012:xiaomi/mimo-v2.5-pro-ultraspeed] I see the issue now - the binary search converges too finely and makes the gradient difference unreliable. Let me take the advisor's suggestion but with a critical fix: skip the binary search and use the coarse gradient differences directly.

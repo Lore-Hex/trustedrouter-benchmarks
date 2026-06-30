@@ -1,0 +1,115 @@
+[?2004hroot@0e7c61e63b28:/app# cat > /app/run.py << 'EOF'
+[?2004l[?2004h> from __future__ import annotations
+[?2004l[?2004h> 
+[?2004l[?2004h> import asyncio
+[?2004l[?2004h> from collections.abc import Awaitable, Callable
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> async def run_tasks(
+[?2004l[?2004h>     tasks: list[Callable[[], Awaitable[None]]],
+[?2004l[?2004h>     max_concurrent: int,
+[?2004l[?2004h> ) -> None:
+[?2004l[?2004h>     semaphore = asyncio.Semaphore(max_concurrent)
+[?2004l[?2004h> 
+[?2004l[?2004h>     async def run_with_semaphore(task: Callable[[], Awaitable[None]]) -> None:
+[?2004l[?2004h>         async with semaphore:
+[?2004l[?2004h>             await task()
+[?2004l[?2004h> 
+[?2004l[?2004h>     async_tasks = [asyncio.create_task(run_with_semaphore(t)) for t in tasks]
+[?2004l[?2004h> 
+[?2004l[?2004h>     try:
+[?2004l[?2004h>         await asyncio.gather(*async_tasks)
+[?2004l[?2004h>     except BaseException:
+[?2004l[?2004h>         # Cancel any tasks that haven't finished yet
+[?2004l[?2004h>         for t in async_tasks:
+[?2004l[?2004h>             if not t.done():
+[?2004l[?2004h>                 t.cancel()
+[?2004l[?2004h>         # Await all tasks so their finally/cleanup blocks still run
+[?2004l[?2004h>         await asyncio.gather(*async_tasks, return_exceptions=True)
+[?2004l[?2004h>         raise
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@0e7c61e63b28:/app# python3 -c "import ast; ast.parse(open('/app/run.py').read()); print('Syntax OK')"
+[?2004lSyntax OK
+[?2004hroot@0e7c61e63b28:/app# python3 -c "from run import run_tasks; print('Import OK'); print(run_tasks.__name__)"
+[?2004lImport OK
+run_tasks
+[?2004hroot@0e7c61e63b28:/app# python3 << 'PYEOF'
+[?2004l[?2004h> import asyncio
+[?2004l[?2004h> from run import run_tasks
+[?2004l[?2004h> 
+[?2004l[?2004h> # Test 1: concurrency limit
+[?2004l[?2004h> results = []
+[?2004l[?2004h> 
+[?2004l[?2004h> async def make_task(i):
+[?2004l[?2004h>     async def task():
+[?2004l[?2004h>         results.append(('start', i))
+[?2004l[?2004h>         await asyncio.sleep(0.1)
+[?2004l[?2004h>         results.append(('end', i))
+[?2004l[?2004h>     return task
+[?2004l[?2004h> 
+[?2004l[?2004h> async def test_concurrency():
+[?2004l[?2004h>     tasks = []
+[?2004l[?2004h>     for i in range(5):
+[?2004l[?2004h>         tasks.append(await make_task(i))
+[?2004l[?2004h>     # Actually, make_task is async but tasks are callables; simplify:
+[?2004l[?2004h>     pass
+[?2004l[?2004h> 
+[?2004l[?2004h> # Simpler test
+[?2004l[?2004h> active = 0
+[?2004l[?2004h> max_seen = 0
+[?2004l[?2004h> 
+[?2004l[?2004h> async def tracked_task(idx):
+[?2004l[?2004h>     global active, max_seen
+[?2004l[?2004h>     active += 1
+[?2004l[?2004h>     if active > max_seen:
+[?2004l[?2004h>         max_seen = active
+[?2004l[?2004h>     await asyncio.sleep(0.1)
+[?2004l[?2004h>     active -= 1
+[?2004l[?2004h> 
+[?2004l[?2004h> async def main():
+[?2004l[?2004h>     global max_seen
+[?2004l[?2004h>     max_seen = 0
+[?2004l[?2004h>     task_fns = [lambda i=i: tracked_task(i) for i in range(10)]
+[?2004l[?2004h>     await run_tasks(task_fns, max_concurrent=3)
+[?2004l[?2004h>     print(f'Test 1 - Max concurrent seen: {max_seen} (expected <= 3)')
+[?2004l[?2004h>     assert max_seen <= 3, f'Concurrency exceeded! got {max_seen}'
+[?2004l[?2004h>     print('Test 1 PASSED')
+[?2004l[?2004h> 
+[?2004l[?2004h> asyncio.run(main())
+[?2004l[?2004h> 
+[?2004l[?2004h> # Test 2: cleanup runs on cancellation
+[?2004l[?2004h> cleanup_ran = []
+[?2004l[?2004h> 
+[?2004l[?2004h> async def cancellable_task(idx):
+[?2004l[?2004h>     try:
+[?2004l[?2004h>         await asyncio.sleep(10)
+[?2004l[?2004h>     finally:
+[?2004l[?2004h>         cleanup_ran.append(idx)
+[?2004l[?2004h> 
+[?2004l[?2004h> async def main2():
+[?2004l[?2004h>     tasks = [lambda i=i: cancellable_task(i) for i in range(5)]
+[?2004l[?2004h>     # Cancel after a short delay
+[?2004l[?2004h>     async def run_and_cancel():
+[?2004l[?2004h>         await run_tasks(tasks, max_concurrent=5)
+[?2004l[?2004h>     t = asyncio.create_task(run_and_cancel())
+[?2004l[?2004h>     await asyncio.sleep(0.05)
+[?2004l[?2004h>     t.cancel()
+[?2004l[?2004h>     try:
+[?2004l[?2004h>         await t
+[?2004l[?2004h>     except asyncio.CancelledError:
+[?2004l[?2004h>         pass
+[?2004l[?2004h>     # Give a moment for cleanup
+[?2004l[?2004h>     await asyncio.sleep(0.1)
+[?2004l[?2004h>     print(f'Test 2 - Cleanup ran for {len(cleanup_ran)} tasks: {sorted(cleanup_ran)}')
+[?2004l[?2004h>     assert len(cleanup_ran) == 5, f'Expected 5 cleanups, got {len(cleanup_ran)}'
+[?2004l[?2004h>     print('Test 2 PASSED')
+[?2004l[?2004h> 
+[?2004l[?2004h> asyncio.run(main2())
+[?2004l[?2004h> print('All tests passed!')
+[?2004l[?2004h> PYEOF
+[?2004lTest 1 - Max concurrent seen: 3 (expected <= 3)
+Test 1 PASSED
+Test 2 - Cleanup ran for 5 tasks: [0, 1, 2, 3, 4]
+Test 2 PASSED
+All tests passed!
+[?2004hroot@0e7c61e63b28:/app# 
