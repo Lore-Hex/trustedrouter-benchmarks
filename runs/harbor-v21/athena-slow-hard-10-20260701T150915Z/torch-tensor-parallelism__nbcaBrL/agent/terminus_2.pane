@@ -1,0 +1,211 @@
+[?2004hroot@0ed0e0bd743a:/app# cat << 'PYEOF' > /app/parallel_linear.py
+[?2004l[?2004h> import torch
+[?2004l[?2004h> import torch.nn as nn
+[?2004l[?2004h> import torch.nn.functional as F
+[?2004l[?2004h> import torch.distributed as dist
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> class _AllGather(torch.autograd.Function):
+[?2004l[?2004h>     @staticmethod
+[?2004l[?2004h>     def forward(ctx, x, world_size, rank):
+[?2004l[?2004h>         ctx.world_size = world_size
+[?2004l[?2004h>         ctx.rank = rank
+[?2004l[?2004h>         if world_size == 1:
+[?2004l[?2004h>             return x.detach().clone()
+[?2004l[?2004h>         x_contig = x.detach().contiguous()
+[?2004l[?2004h>         tensor_list = [torch.empty_like(x_contig) for _ in range(world_size)]
+[?2004l[?2004h>         dist.all_gather(tensor_list, x_contig)
+[?2004l[?2004h>         return torch.cat(tensor_list, dim=-1)
+[?2004l[?2004h> 
+[?2004l[?2004h>     @staticmethod
+[?2004l[?2004h>     def backward(ctx, grad_output):
+[?2004l[?2004h>         if ctx.world_size == 1:
+[?2004l[?2004h>             return grad_output, None, None
+[?2004l[?2004h>         partition_size = grad_output.shape[-1] // ctx.world_size
+[?2004l[?2004h>         start = ctx.rank * partition_size
+[?2004l[?2004h>         end = (ctx.rank + 1) * partition_size
+[?2004l[?2004h>         return grad_output[..., start:end].contiguous(), None, None
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> class _AllReduce(torch.autograd.Function):
+[?2004l[?2004h>     @staticmethod
+[?2004l[?2004h>     def forward(ctx, x):
+[?2004l[?2004h>         x = x.detach().clone().contiguous()
+[?2004l[?2004h>         if dist.is_initialized():
+[?2004l[?2004h>             dist.all_reduce(x, op=dist.ReduceOp.SUM)
+[?2004l[?2004h>         return x
+[?2004l[?2004h> 
+[?2004l[?2004h>     @staticmethod
+[?2004l[?2004h>     def backward(ctx, grad_output):
+[?2004l[?2004h>         return grad_output
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> class ColumnParallelLinear(nn.Module):
+[?2004l[?2004h>     def __init__(self, in_features, out_features, bias, master_weight):
+[?2004l[?2004h>         super().__init__()
+[?2004l[?2004h>         world_size = dist.get_world_size()
+[?2004l[?2004h>         rank = dist.get_rank()
+[?2004l[?2004h>         partition_size = out_features // world_size
+[?2004l[?2004h>         weight_chunk = master_weight[
+[?2004l[?2004h>             rank * partition_size:(rank + 1) * partition_size, :
+[?2004l[?2004h>         ].detach().clone().contiguous()
+[?2004l[?2004h>         self.weight = nn.Parameter(weight_chunk)
+[?2004l[?2004h>         if bias:
+[?2004l[?2004h>             self.bias = nn.Parameter(
+[?2004l[?2004h>                 torch.zeros(
+[?2004l[?2004h>                     partition_size,
+[?2004l[?2004h>                     dtype=master_weight.dtype,
+[?2004l[?2004h>                     device=master_weight.device,
+[?2004l[?2004h>                 )
+[?2004l[?2004h>             )
+[?2004l[?2004h>         else:
+[?2004l[?2004h>             self.register_parameter("bias", None)
+[?2004l[?2004h>         self.in_features = in_features
+[?2004l[?2004h>         self.out_features = out_features
+[?2004l[?2004h> 
+[?2004l[?2004h>     def forward(self, x):
+[?2004l[?2004h>         output = F.linear(x, self.weight, self.bias)
+[?2004l[?2004h>         world_size = dist.get_world_size()
+[?2004l[?2004h>         rank = dist.get_rank()
+[?2004l[?2004h>         output = _AllGather.apply(output, world_size, rank)
+[?2004l[?2004h>         return output
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> class RowParallelLinear(nn.Module):
+[?2004l[?2004h>     def __init__(self, in_features, out_features, bias, master_weight):
+[?2004l[?2004h>         super().__init__()
+[?2004l[?2004h>         world_size = dist.get_world_size()
+[?2004l[?2004h>         rank = dist.get_rank()
+[?2004l[?2004h>         partition_size = in_features // world_size
+[?2004l[?2004h>         weight_chunk = master_weight[
+[?2004l[?2004h>             :, rank * partition_size:(rank + 1) * partition_size
+[?2004l[?2004h>         ].detach().clone().contiguous()
+[?2004l[?2004h>         self.weight = nn.Parameter(weight_chunk)
+[?2004l[?2004h>         if bias:
+[?2004l[?2004h>             self.bias = nn.Parameter(
+[?2004l[?2004h>                 torch.zeros(
+[?2004l[?2004h>                     out_features,
+[?2004l[?2004h>                     dtype=master_weight.dtype,
+[?2004l[?2004h>                     device=master_weight.device,
+[?2004l[?2004h>                 )
+[?2004l[?2004h>             )
+[?2004l[?2004h>         else:
+[?2004l[?2004h>             self.register_parameter("bias", None)
+[?2004l[?2004h>         self.in_features = in_features
+[?2004l[?2004h>         self.out_features = out_features
+[?2004l[?2004h> 
+[?2004l[?2004h>     def forward(self, x):
+[?2004l[?2004h>         output = F.linear(x, self.weight, None)
+[?2004l[?2004h>         output = _AllReduce.apply(output)
+[?2004l[?2004h>         if self.bias is not None:
+[?2004l[?2004h>             output = output + self.bias
+[?2004l[?2004h>         return output
+[?2004l[?2004h> PYEOF
+[?2004l[?2004hroot@0ed0e0bd743a:/app# python3 -m py_compile /app/parallel_linear.py
+[?2004lbash: python3: command not found
+[?2004hroot@0ed0e0bd743a:/app# which python python3 python3.11 python3.10 python3.9 2>/dev/null || true
+[?2004l[?2004hroot@0ed0e0bd743a:/app# ls -l /usr/bin/python* /usr/local/bin/python* 2>/dev/null || true
+[?2004l[?2004hroot@0ed0e0bd743a:/app# ls -l /app/parallel_linear.py && cat /app/parallel_linear.py
+[?2004l-rw-r--r-- 1 root root 3358 Jul  1 17:31 /app/parallel_linear.py
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.distributed as dist
+
+
+class _AllGather(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, world_size, rank):
+        ctx.world_size = world_size
+        ctx.rank = rank
+        if world_size == 1:
+            return x.detach().clone()
+        x_contig = x.detach().contiguous()
+        tensor_list = [torch.empty_like(x_contig) for _ in range(world_size)]
+        dist.all_gather(tensor_list, x_contig)
+        return torch.cat(tensor_list, dim=-1)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        if ctx.world_size == 1:
+            return grad_output, None, None
+        partition_size = grad_output.shape[-1] // ctx.world_size
+        start = ctx.rank * partition_size
+        end = (ctx.rank + 1) * partition_size
+        return grad_output[..., start:end].contiguous(), None, None
+
+
+class _AllReduce(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x):
+        x = x.detach().clone().contiguous()
+        if dist.is_initialized():
+            dist.all_reduce(x, op=dist.ReduceOp.SUM)
+        return x
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return grad_output
+
+
+class ColumnParallelLinear(nn.Module):
+    def __init__(self, in_features, out_features, bias, master_weight):
+        super().__init__()
+        world_size = dist.get_world_size()
+        rank = dist.get_rank()
+        partition_size = out_features // world_size
+        weight_chunk = master_weight[
+            rank * partition_size:(rank + 1) * partition_size, :
+        ].detach().clone().contiguous()
+        self.weight = nn.Parameter(weight_chunk)
+        if bias:
+            self.bias = nn.Parameter(
+                torch.zeros(
+                    partition_size,
+                    dtype=master_weight.dtype,
+                    device=master_weight.device,
+                )
+            )
+        else:
+            self.register_parameter("bias", None)
+        self.in_features = in_features
+        self.out_features = out_features
+
+    def forward(self, x):
+        output = F.linear(x, self.weight, self.bias)
+        world_size = dist.get_world_size()
+        rank = dist.get_rank()
+        output = _AllGather.apply(output, world_size, rank)
+        return output
+
+
+class RowParallelLinear(nn.Module):
+    def __init__(self, in_features, out_features, bias, master_weight):
+        super().__init__()
+        world_size = dist.get_world_size()
+        rank = dist.get_rank()
+        partition_size = in_features // world_size
+        weight_chunk = master_weight[
+            :, rank * partition_size:(rank + 1) * partition_size
+        ].detach().clone().contiguous()
+        self.weight = nn.Parameter(weight_chunk)
+        if bias:
+            self.bias = nn.Parameter(
+                torch.zeros(
+                    out_features,
+                    dtype=master_weight.dtype,
+                    device=master_weight.device,
+                )
+            )
+        else:
+            self.register_parameter("bias", None)
+        self.in_features = in_features
+        self.out_features = out_features
+
+    def forward(self, x):
+        output = F.linear(x, self.weight, None)
+        output = _AllReduce.apply(output)
+        if self.bias is not None:
+            output = output + self.bias
+        return output
+[?2004hroot@0ed0e0bd743a:/app# 
