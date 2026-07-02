@@ -34,6 +34,8 @@ from harbor.models.trial.paths import EnvironmentPaths
 
 TR_KEY_PATH = os.environ.get("TB_TR_KEY_PATH", "~/claude/.tr_key")
 TR_BASE_URL = os.environ.get("TRUSTEDROUTER_BASE_URL") or None
+TR_REQUEST_TIMEOUT = float(os.environ.get("TRUSTEDROUTER_TIMEOUT", "900"))
+TR_MAX_RETRIES = int(os.environ.get("TRUSTEDROUTER_MAX_RETRIES", "2"))
 TERMINUS_CONTROL_KEY_SPEC_TEXT = (
     "Shell commands must end with \\n. Special keys must be sent alone without \\n, "
     'e.g. {"keystrokes":"C-c","duration":0.5}.'
@@ -179,6 +181,12 @@ def _as_optional_int(value: Any) -> int | None:
     return int(value)
 
 
+def _as_optional_float(value: Any) -> float | None:
+    if value is None or value == "":
+        return None
+    return float(value)
+
+
 def _chunk_text(chunk: dict[str, Any]) -> str:
     choices = chunk.get("choices") or []
     if not choices:
@@ -320,6 +328,8 @@ class TrustedRouterHarborLLM(BaseLLM):
         advisor_max_tokens: int | None = None,
         advisor_timeout_ms: int | None = None,
         base_url: str | None = None,
+        request_timeout: float | str | None = None,
+        request_retries: int | str | None = None,
         stream: bool = True,
     ):
         super().__init__()
@@ -336,7 +346,18 @@ class TrustedRouterHarborLLM(BaseLLM):
             api_key = Path(os.path.expanduser(TR_KEY_PATH)).read_text().strip()
 
         self._base_url = base_url or TR_BASE_URL
-        self._client = TrustedRouter(api_key=api_key, base_url=self._base_url)
+        self._request_timeout = _as_optional_float(request_timeout) or TR_REQUEST_TIMEOUT
+        self._request_retries = (
+            _as_optional_int(request_retries)
+            if request_retries is not None
+            else TR_MAX_RETRIES
+        )
+        self._client = TrustedRouter(
+            api_key=api_key,
+            base_url=self._base_url,
+            timeout=self._request_timeout,
+            max_retries=self._request_retries,
+        )
         self._model = model
         self._temperature = temperature
         self._max_tokens = max_tokens
@@ -528,6 +549,8 @@ class TrustedRouterHarborLLM(BaseLLM):
                     "started_at": started_at,
                     "model": self._model,
                     "base_url": self._base_url,
+                    "request_timeout": self._request_timeout,
+                    "request_retries": self._request_retries,
                     "attempt": attempt,
                     "message_count": len(messages),
                     "message_chars": sum(len(m["content"]) for m in messages),
@@ -561,6 +584,8 @@ class TrustedRouterHarborLLM(BaseLLM):
                         "elapsed_ms": round((time.monotonic() - started) * 1000),
                         "model": self._model,
                         "base_url": self._base_url,
+                        "request_timeout": self._request_timeout,
+                        "request_retries": self._request_retries,
                         "temperature": self._temperature,
                         "max_tokens": self._max_tokens,
                         "has_panel_prompt": bool(self._panel_prompt),
@@ -591,6 +616,8 @@ class TrustedRouterHarborLLM(BaseLLM):
                         "elapsed_ms": round((time.monotonic() - started) * 1000),
                         "model": self._model,
                         "base_url": self._base_url,
+                        "request_timeout": self._request_timeout,
+                        "request_retries": self._request_retries,
                         "attempt": attempt,
                         "error": type(exc).__name__,
                         "message": str(exc),
@@ -616,6 +643,8 @@ class TrustedRouterHarborLLM(BaseLLM):
                     "elapsed_ms": elapsed_ms,
                     "model": self._model,
                     "base_url": self._base_url,
+                    "request_timeout": self._request_timeout,
+                    "request_retries": self._request_retries,
                     "temperature": self._temperature,
                     "max_tokens": self._max_tokens,
                     "has_panel_prompt": bool(self._panel_prompt),
@@ -652,6 +681,8 @@ class TrustedRouterHarborLLM(BaseLLM):
                     "elapsed_ms": elapsed_ms,
                     "model": self._model,
                     "base_url": self._base_url,
+                    "request_timeout": self._request_timeout,
+                    "request_retries": self._request_retries,
                     "attempt": attempt,
                     "response_id": dumped.get("id"),
                     "response_model": dumped.get("model"),
@@ -687,6 +718,8 @@ class TrustedRouterHarborLLM(BaseLLM):
                 {
                     "model": self._model,
                     "base_url": self._base_url,
+                    "request_timeout": self._request_timeout,
+                    "request_retries": self._request_retries,
                     "message_count": len(messages),
                     "message_chars": sum(len(m["content"]) for m in messages),
                     "final_attempt": final_attempt,
@@ -782,6 +815,8 @@ class TRHarborTerminus(Terminus2):
         advisor_max_tokens: int | None = None,
         advisor_timeout_ms: int | None = None,
         base_url: str | None = None,
+        request_timeout: float | str | None = None,
+        request_retries: int | str | None = None,
         stream: bool = True,
         **kwargs: Any,
     ):
@@ -806,6 +841,8 @@ class TRHarborTerminus(Terminus2):
             advisor_max_tokens=advisor_max_tokens,
             advisor_timeout_ms=advisor_timeout_ms,
             base_url=base_url,
+            request_timeout=request_timeout,
+            request_retries=request_retries,
             stream=stream,
         )
 
