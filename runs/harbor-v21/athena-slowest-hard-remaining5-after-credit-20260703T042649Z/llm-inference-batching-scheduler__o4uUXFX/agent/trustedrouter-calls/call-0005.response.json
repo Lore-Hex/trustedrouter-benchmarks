@@ -1,0 +1,52 @@
+{
+  "id": "chatcmpl-212f84e31cf64e9eb835cf523f0792db",
+  "object": "chat.completion",
+  "created": 1783053648,
+  "model": "trustedrouter/athena",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "{\n  \"analysis\": \"We now know the full cost model. Key points: batch_metrics computes S_max from actual requests in each batch (not the declared shape), decode cost/latency scale with batch S_max and G_max, and plan_metrics adds per-batch overhead, per-shape compile cost, and per-shape compile latency. One-per-batch already meets cost/pad/p95 for b1 but fails sequential_timecost; for b2 it fails cost and sequential_timecost. Grouping by exact (S,G) reduces batches and overhead but still fails sequential_timecost for both. We need a DP or greedy merger that merges similar-G requests within each S group to reduce sequential time while keeping cost, pad, and p95 under thresholds.\",\n  \"plan\": \"I will write and run a Python optimizer script. It will group requests by (aligned_S, gen_len), then use dynamic programming with a Lagrange multiplier (binary searched) per bucket to merge adjacent gen_len groups within each S group. It will use one shape per bucket (max aligned S) to minimize compile cost, evaluate with the provided CostModel, and write both plan files. The script will print all metrics against thresholds.\",\n  \"commands\": [\n    {\n      \"keystrokes\": \"cat > /app/task_file/optimize.py <<'PY'\\n#!/usr/bin/env python3\\nimport json, math, collections, os, sys\\nsys.path.insert(0, '/app/task_file/scripts')\\nfrom cost_model import CostModel, align, HEADS, HIDDEN\\n\\ncm = CostModel(64)\\nGRAN = 64\\nOVERHEAD = cm.c.Kbatch_overhead_cost\\nTBATCH = cm.c.Tbatch_overhead_ms\\n\\ndef load_requests(path):\\n    return [json.loads(l) for l in open(path)]\\n\\ndef sum_sq_arith(a, n):\\n    return n*(a*a) + a*n*(n-1) + (n*(n-1)*(2*n-1))//6\\n\\ndef decode_cost(S, n):\\n    return cm.c.Kd_attn * sum_sq_arith(S, n) + cm.c.Kd_mlp * HIDDEN * (n*S + n*(n-1)/2)\\n\\ndef decode_lat(S, n):\\n    return cm.c.Td_attn * sum_sq_arith(S, n) + cm.c.Td_mlp * HIDDEN * (n*S + n*(n-1)/2)\\n\\ndef prefill_lat(S):\\n    return cm.c.Tp_attn * S**2 + cm.c.Tp_mlp * S * HIDDEN\\n\\ndef optimize_bucket(reqs, thresholds, max_S, bucket_name):\\n    req_map = {r['request_id']: r for r in reqs}\\n\\n    # Group by (S, G)\\n    sg_reqs = collections.defaultdict(list)\\n    for r in reqs:\\n        S = align(r['prompt_len'], GRAN)\\n        sg_reqs[(S, r['gen_len'])].append(r)\\n\\n    # Group by S -> sorted list of (G, [reqs])\\n    s_groups = collections.defaultdict(list)\\n    for (S, G), rs in sg_reqs.items():\\n        s_groups[S].append((G, rs))\\n    for S in s_groups:\\n        s_groups[S].sort()\\n\\n    def solve_s_group(S, items, lam):\\n        m = len(items)\\n        if m == 0:\\n            return []\\n        dp = [float('inf')] * (m + 1)\\n        parent = [0] * (m + 1)\\n        dp[0] = 0\\n        pl = prefill_lat(S)\\n        for i in range(1, m + 1):\\n            G_max = items[i-1][0]\\n            dc = decode_cost(S, G_max)\\n            dl = decode_lat(S, G_max)\\n            n_total = 0\\n            for j in range(i-1, -1, -1):\\n                n_total += len(items[j][1])\\n                bc = n_total * dc + OVERHEAD\\n                bs = pl + dl + TBATCH\\n                val = dp[j] + bc + lam * bs\\n                if val < dp[i]:\\n                    dp[i] = val\\n                    parent[i] = j\\n        parts = []\\n        i = m\\n        while i > 0:\\n            j = parent[i]\\n            parts.append((j, i))\\n            i = j\\n        parts.reverse()\\n        return parts\\n\\n    def build_plan(lam):\\n        all_batches = []\\n        for S, items in s_groups.items():\\n            parts = solve_s_group(S, items, lam)\\n            for (j, i) in parts:\\n                G_max = items[i-1][0]\\n                rs = []\\n                for k in range(j, i):\\n                    rs.extend(items[k][1])\\n                all_batches.append((S, G_max, rs))\\n        all_batches.sort(key=lambda x: (x[0], x[1]))\\n        plan = []\\n        bid = 0\\n        for S, G_max, rs in all_batches:\\n            bid += 1\\n            for r in rs:\\n                plan.append({\\n                    'request_id': r['request_id'],\\n                    'batch_id': f'b-{bid:04d}',\\n                    'shape': {'seq_align': max_S, 'heads_align': 32, 'hidden_align': 4096}\\n                })\\n        return plan\\n\\n    def eval_plan(plan):\\n        return cm.plan_metrics(req_map, plan)\\n\\n    # Binary search on lambda\\n    lo, hi = 0.0, 1e12\\n    best_plan = None\\n    best_metrics = None\\n    best_lam = None\\n\\n    for iteration in range(100):\\n        lam = (lo + hi) / 2\\n        plan = build_plan(lam)\\n        m = eval_plan(plan)\\n\\n        all_ok = all(m[k] <= th for k, th in thresholds.items())\\n        seq_ok = m['sequential_timecost'] <= thresholds['sequential_timecost']\\n\\n        if all_ok:\\n            best_plan = plan\\n            best_metrics = m\\n            best_lam = lam\\n            lo = lam  # try lower lambda for lower cost\\n        elif not seq_ok:\\n            lo = lam  # need more merging\\n        else:\\n            hi = lam  # need less merging\\n\\n        if hi - lo < 1e-10:\\n            break\\n\\n    # If no valid plan, try grid search\\n    if best_plan is None:\\n        print(f'  [{bucket_name}] Binary search did not find valid plan, trying grid...')\\n        best_score = float('inf')\\n        for exponent in range(-3, 13):\\n            for mantissa in [1, 2, 3, 5, 7]:\\n                lam = mantissa * (10 ** exponent)\\n                plan = build_plan(lam)\\n                m = eval_plan(plan)\\n                score = sum(max(0, m[k] / th - 1) for k, th in thresholds.items())\\n                if score < best_score:\\n                    best_score = score\\n                    best_plan = plan\\n                    best_metrics = m\\n                    best_lam = lam\\n                if score == 0:\\n                    break\\n            if best_score == 0:\\n                break\\n\\n    return best_plan, best_metrics, best_lam\\n\\ndef validate_plan(reqs, plan, max_S):\\n    req_map = {r['request_id']: r for r in reqs}\\n    ids_in_plan = [p['request_id'] for p in plan]\\n    ids_in_reqs = [r['request_id'] for r in reqs]\\n    assert len(ids_in_plan) == len(ids_in_reqs), f'Count mismatch: {len(ids_in_plan)} vs {len(ids_in_reqs)}'\\n    assert set(ids_in_plan) == set(ids_in_reqs), 'ID mismatch'\\n    assert len(ids_in_plan) == len(set(ids_in_plan)), 'Duplicates in plan'\\n    # Check shapes\\n    for p in plan:\\n        sh = p['shape']\\n        assert sh['heads_align'] == 32, f'Bad heads: {sh}'\\n        assert sh['hidden_align'] == 4096, f'Bad hidden: {sh}'\\n        assert sh['seq_align'] >= align(req_map[p['request_id']]['prompt_len'], GRAN), f'Shape too small for {p}'\\n    # Check identical shapes within batch\\n    batch_shapes = collections.defaultdict(set)\\n    for p in plan:\\n        batch_shapes[p['batch_id']].add((p['shape']['seq_align'], p['shape']['heads_align'], p['shape']['hidden_align']))\\n    for bid, shapes in batch_shapes.items():\\n        assert len(shapes) == 1, f'Batch {bid} has multiple shapes: {shapes}'\\n    print(f'  Validation: OK ({len(ids_in_plan)} requests, {len(batch_shapes)} batches)')\\n\\n# Main\\nos.makedirs('/app/task_file/output_data', exist_ok=True)\\n\\nbuckets = [\\n    ('/app/task_file/input_data/requests_bucket_1.jsonl', '/app/task_file/output_data/plan_b1.jsonl',\\n     {'cost': 3.0e11, 'pad_ratio': 0.055, 'p95_latency_ms': 2.1e6, 'sequential_timecost': 2.7e8},\\n     'b1'),\\n    ('/app/task_file/input_data/requests_bucket_2.jsonl', '/app/task_file/output_data/plan_b2.jsonl',\\n     {'cost': 4.8e10, 'pad_ratio': 0.15, 'p95_latency_ms': 2.1e5, 'sequential_timecost': 3.2e7},\\n     'b2'),\\n]\\n\\nall_shapes = set()\\nfor inp, out, thresholds, name in buckets:\\n    print(f'\\\\n=== {name} ===')\\n    reqs = load_requests(inp)\\n    max_S = max(align(r['prompt_len'], GRAN) for r in reqs)\\n    plan, m, lam = optimize_bucket(reqs, thresholds, max_S, name)\\n\\n    if plan is None:\\n        print(f'{out}: NO PLAN FOUND')\\n        continue\\n\\n    validate_plan(reqs, plan, max_S)\\n\\n    with open(out, 'w') as f:\\n        for p in plan:\\n            f.write(json.dumps(p) + '\\\\n')\\n            all_shapes.add((p['shape']['seq_align'], p['shape']['heads_align'], p['shape']['hidden_align']))\\n\\n    print(f'  lambda: {lam}')\\n    for k, th in thresholds.items():\\n        status = 'OK' if m[k] <= th else 'FAIL'\\n        print(f'  {k}: {m[k]:.6e} (threshold: {th:.6e}) {status}')\\n    print(f'  batches: {len(set(p[\\\"batch_id\\\"] for p in plan))}')\\n\\nprint(f'\\\\nUnique shapes across both: {len(all_shapes)} {sorted(all_shapes)}')\\nprint(f'MAX_SHAPES=8: {\\\"OK\\\" if len(all_shapes) <= 8 else \\\"FAIL\\\"}')\\nPY\\npython3 /app/task_file/optimize.py\\n\",\n      \"duration\": 1.0\n    }\n  ]\n}",
+        "name": null,
+        "tool_calls": null,
+        "tool_call_id": null
+      },
+      "finish_reason": "stop",
+      "logprobs": null
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 11286,
+    "completion_tokens": 43608,
+    "total_tokens": 54894,
+    "cost_microdollars": 456886,
+    "orchestration": true,
+    "prompt_tokens_details": {
+      "cached_tokens": 9245
+    },
+    "provider_usage": {
+      "advice_budget_exhausted": false,
+      "advice_call_count": 0,
+      "advisor_attempt_count": 0,
+      "advisor_final_attempt_count": 0,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 9245,
+      "contains_prompt_or_completion": false,
+      "cost_microdollars": 456886,
+      "depth_initial": 2,
+      "max_get_advice_calls": 1,
+      "orchestration": true,
+      "primitive": "trustedrouter/advisor",
+      "reasoning_tokens": 0,
+      "router": "trustedrouter/athena",
+      "subcall_count": 1,
+      "total_cost_microdollars": 456886,
+      "version": "1.0",
+      "worker_attempt_count": 1
+    },
+    "subcall_count": 1,
+    "total_cost_microdollars": 456886
+  }
+}

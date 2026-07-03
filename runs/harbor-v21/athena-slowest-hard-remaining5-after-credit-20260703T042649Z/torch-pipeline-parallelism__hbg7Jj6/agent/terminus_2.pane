@@ -1,0 +1,1944 @@
+[?2004hroot@9921fa0bc759:/app# ls -la /app
+[?2004ltotal 0
+drwxr-xr-x 1 root root  0 Oct 22  2025 [0m[01;34m.[0m
+drwxr-xr-x 1 root root 26 Jul  3 07:04 [01;34m..[0m
+[?2004hroot@9921fa0bc759:/app# find /app -maxdepth 4 -type f | sed 's#^/app/##' | sort | head -200
+[?2004l[?2004hroot@9921fa0bc759:/app# grep -R "class Llama\|LlamaForCausalLM\|train_step_pipeline" -n /app 2>/dev/null | head -200
+[?2004l[?2004hroot@9921fa0bc759:/app# python3 - <<'PY'
+[?2004l[?2004h> import torch
+[?2004l[?2004h> print('torch', torch.__version__)
+[?2004l[?2004h> print('distributed_available', torch.distributed.is_available())
+[?2004l[?2004h> try:
+[?2004l[?2004h>     import transformers
+[?2004l[?2004h>     print('transformers', transformers.__version__)
+[?2004l[?2004h>     from transformers import LlamaForCausalLM
+[?2004l[?2004h>     print('LlamaForCausalLM import ok')
+[?2004l[?2004h> except Exception as e:
+[?2004l[?2004h>     print('transformers import failed', repr(e))
+[?2004l[?2004h> PY
+[?2004lTraceback (most recent call last):
+  File "<stdin>", line 1, in <module>
+ModuleNotFoundError: No module named 'torch'
+[?2004hroot@9921fa0bc759:/app# python3 --version
+[?2004lPython 3.12.3
+[?2004hroot@9921fa0bc759:/app# which -a python3 python; ls -la /usr/local/bin/python* 2>/dev/null; find / -maxdepth 5 -name 'torch' -type d 2>/dev/null | head
+[?2004l/usr/bin/python3
+/bin/python3
+[?2004hroot@9921fa0bc759:/app# cat > /app/pipeline_parallel.py <<'PY'
+[?2004l[?2004h> import os
+[?2004l[?2004h> import math
+[?2004l[?2004h> import inspect
+[?2004l[?2004h> 
+[?2004l[?2004h> import torch
+[?2004l[?2004h> import torch.distributed as dist
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> def _get_rank_size():
+[?2004l[?2004h>     rank = dist.get_rank()
+[?2004l[?2004h>     world_size = dist.get_world_size()
+[?2004l[?2004h>     return rank, world_size
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> def _llama_attrs(model):
+[?2004l[?2004h>     if hasattr(model, "model") and hasattr(model.model, "layers"):
+[?2004l[?2004h>         layers = model.model.layers
+[?2004l[?2004h>         transformer = model.model
+[?2004l[?2004h>         lm_head = getattr(model, "lm_head", None)
+[?2004l[?2004h>     elif hasattr(model, "layers"):
+[?2004l[?2004h>         layers = model.layers
+[?2004l[?2004h>         transformer = model
+[?2004l[?2004h>         lm_head = getattr(model, "lm_head", None)
+[?2004l[?2004h>     else:
+[?2004l[?2004h>         raise ValueError("Unsupported LLaMA model layout")
+[?2004l[?2004h> 
+[?2004l[?2004h>     config = getattr(model, "config", None) or getattr(transformer, "config", None)
+[?2004l[?2004h>     return config, transformer, layers, lm_head
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> def _layer_range(world_size, rank, num_layers):
+[?2004l[?2004h>     base = num_layers // world_size
+[?2004l[?2004h>     rem = num_layers % world_size
+[?2004l[?2004h>     start = rank * base + min(rank, rem)
+[?2004l[?2004h>     end = start + base + (1 if rank < rem else 0)
+[?2004l[?2004h>     return start, end
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> def _maybe_require(grad, requires):
+[?2004l[?2004h>     if requires:
+[?2004l[?2004h>         grad.requires_grad_(True)
+[?2004l[?2004h>     return grad
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> def _send_recv_tensors(rank, world_size, send_buf, recv_buf, is_first, is_last):
+[?2004l[?2004h>     ops = []
+[?2004l[?2004h>     if not is_last and send_buf is not None:
+[?2004l[?2004h>         ops.append(dist.P2POp(dist.isend, send_buf, rank + 1))
+[?2004l[?2004h>     if not is_first:
+[?2004l[?2004h>         if recv_buf is None:
+[?2004l[?2004h>             ops.append(dist.P2POp(dist.irecv, rank - 1))
+[?2004l[?2004h>         else:
+[?2004l[?2004h>             ops.append(dist.P2POp(dist.irecv, recv_buf, rank - 1))
+[?2004l[?2004h> 
+[?2004l[?2004h>     reqs = dist.batch_isend_irecv(ops) if ops else []
+[?2004l[?2004h>     for req in reqs:
+[?2004l[?2004h>         req.wait()
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> def _forward_first_stage(model, transformer, layers, start, end, x, inputs_embeds):
+[?2004l[?2004h>     hidden = inputs_embeds
+[?2004l[?2004h>     for i in range(start, end):
+[?2004l[?2004h>         layer = layers[i]
+[?2004ln[?2004h>         hidden = layer(hidden, None)[0] if isinstance(hidden, tuple) else layer(hidden)
+[?2004l[?2004h>     return hidden
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> def _forward_stage(layers, start, end, hidden):
+[?2004l[?2004h>     for i in range(start, end):
+[?2004l[?2004h>         layer = layers[i]
+[?2004lape, [?2004h>         hidden = layer(hidden, None)[0] if isinstance(hidden, tuple) else layer(hidden)
+[?2004l[?2004h>     return hidden
+[?2004l[?2004h> 
+[?2004l [?2004h> 
+[?2004l[?2004h> def _make_recv_buffer(shape, dtype, device):
+[?2004li[?2004h>     return torch.empty(shape, dtype=dtype, device=device)
+[?2004l  [?2004h> 
+[?2004l [?2004h> 
+[?2004l [?2004h> def _compute_logits_and_loss(model, transformer, lm_head, hidden, targets, num_microbatches):
+[?2004l[?2004h>     features = hidden
+[?2004l[?2004h> 
+[?2004l[?2004h>     norm = getattr(transformer, "norm", None)
+[?2004l[?2004h>     if norm is not None and not hasattr(lm_head, "norm"):
+[?2004l[?2004h>         features = norm(features)
+[?2004loss(mo[?2004h> 
+[?2004ld[?2004h>     if lm_head is not None:
+[?2004ld, hi[?2004h>         logits = lm_head(features)
+[?2004l[?2004h>     else:
+[?2004les)
+     [?2004h>         logits = model.lm_head(features) if hasattr(model, "lm_head") else None
+[?2004l[?2004h>         if logits is None:
+[?2004l[?2004h>             head = getattr(transformer, "lm_head", None)
+[?2004l[?2004h>             logits = head(features)
+[?2004l[?2004h> 
+[?2004l[?2004h>     loss = torch.nn.functional.cross_entropy(
+[?2004l[?2004h>         logits.view(-1, logits.size(-1)),
+[?2004l[?2004h>         targets.view(-1).to(logits.device),
+[?2004l[?2004h>         ignore_index=-100,
+[?2004l[?2004h>         reduction="mean",
+[?2004l[?2004h>     )
+[?2004l   # E[?2004h>     loss = loss.to(hidden.dtype) / num_microbatches
+[?2004l[?2004h>     return loss, logits
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> def _grad_from_loss(loss):
+[?2004ltiguous()[?2004h>     return torch.ones_like(loss, requires_grad=True)
+[?2004l     [?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> def train_step_pipeline_afab(model, inputs, targets, device, dtype):
+[?2004l[?2004h>     """Train one step with all-forward-all-backward pipeline parallel scheduling.
+[?2004les)[?2004h> 
+[?2004l:[?2004h>     Args:
+[?2004l[?2004h>         model: LlamaForCausalLM instance.
+[?2004l[?2004h>         inputs: list of input ID microbatch tensors.
+[?2004l[?2004h>         targets: list of target ID microbatch tensors.
+[?2004l[?2004h>         device: torch device string or torch.device.
+[?2004l[?2004h>         dtype: torch dtype.
+[?2004l[?2004h>     """
+[?2004l[?2004h>     assert dist.is_available() and dist.is_initialized(), "torch.distributed must be initialized"
+[?2004l[?2004h>     rank, world_size = _get_rank_size()
+[?2004l[?2004h>     device = torch.device(device)
+[?2004l[?2004h> 
+[?2004l[?2004h>     config, transformer, layers, lm_head = _llama_attrs(model)
+[?2004l[?2004h>     num_layers = len(layers)
+[?2004l[?2004h>     start, end = _layer_range(world_size, rank, num_layers)
+[?2004l[?2004h>     num_microbatches = len(inputs)
+[?2004l[?2004h> 
+[?2004l[?2004h>     is_first = rank == 0
+[?2004l[?2004h>     is_last = rank == world_size - 1
+[?2004l[?2004h> 
+[?2004l[?2004h>     # Move input/target microbatches to this device.  No model copies are made.
+[?2004l[?2004h>     if is_first:
+[?2004l[?2004h>         input_ids = [t.to(device=device, dtype=torch.long) for t in inputs]
+[?2004l[?2004h>     else:
+[?2004l[?2004h>         input_ids = None
+[?2004l[?2004h> 
+[?2004l[?2004h>     if is_last:
+[?2004l[?2004h>         target_ids = [t.to(device=device, dtype=torch.long) for t in targets]
+[?2004l[?2004h>     else:
+[?2004l[?2004h>         target_ids = None
+[?2004l[?2004h> 
+[?2004l[?2004h>     # Determine hidden size from config or embed weight shape.
+[?2004l[?2004h>     hidden_size = None
+[?2004l[?2004h>     if config is not None:
+[?2004l[?2004h>         hidden_size = getattr(config, "hidden_size", None)
+[?2004l[?2004h>     if hidden_size is None:
+[?2004l[?2004h>         embed_tokens = getattr(transformer, "embed_tokens", None) or getattr(model, "embed_tokens", None)
+[?2004l[?2004h>         if embed_tokens is not None:
+[?2004l[?2004h>             hidden_size = embed_tokens.weight.size(-1)
+[?2004l[?2004h>         elif num_layers > 0:
+[?2004l[?2004h>             hidden_size = layers[0].self_attn.q_proj.weight.size(-1) // getattr(config, "num_attention_heads", 1)
+[?2004l[?2004h>         else:
+[?2004l[?2004h>             raise ValueError("Could not determine hidden_size")
+[?2004l[?2004h> 
+[?2004l[?2004h>     # Forward all microbatches.
+[?2004l[?2004h>     hidden_states = []  # tensors needing backward on this rank
+[?2004l[?2004h>     send_buffers = []
+[?2004l[?2004h>     recv_buffers = []
+[?2004l[?2004h> 
+[?2004l[?2004h>     for mb in range(num_microbatches):
+[?2004l[?2004h>         if is_first:
+[?2004l[?2004h>             # LLaMA first stage needs embeddings + first layers.
+[?2004l[?2004h>             embed_tokens = getattr(transformer, "embed_tokens", None) or getattr(model, "embed_tokens", None)
+[?2004l[?2004h>             if embed_tokens is None:
+[?2004l[?2004h>                 raise ValueError("Could not find input embeddings")
+[?2004l[?2004h>             ids = input_ids[mb]
+[?2004l[?2004h>             hidden = embed_tokens(ids).to(device=device, dtype=dtype)
+[?2004l[?2004h>             hidden.requires_grad_(True)
+[?2004l[?2004h>             for i in range(start, end):
+[?2004l[?2004h>                 layer = layers[i]
+[?2004l[?2004h>                 out = layer(hidden, None)
+[?2004l[?2004h>                 hidden = out[0] if isinstance(out, tuple) else out
+[?2004l[?2004h>             hidden_states.append(hidden)
+[?2004l[?2004h>         else:
+[?2004l[?2004h>             recv_shape = None
+[?2004l[?2004h>             # Peek at input shape if possible to infer microbatch/seq_len.
+[?2004l[?2004h>             if inputs is not None and len(inputs) > mb:
+[?2004l[?2004h>                 recv_shape = tuple(inputs[mb].shape[:2]) + (hidden_size,)
+[?2004l[?2004h>             else:
+[?2004l[?2004h>                 recv_shape = (1, 1, hidden_size)
+[?2004l[?2004h>             recv_buf = _make_recv_buffer(recv_shape, dtype, device)
+[?2004l[?2004h>             _send_recv_tensors(rank, world_size, None, recv_buf, is_first, is_last)
+[?2004l[?2004h>             hidden = recv_buf
+[?2004l[?2004h>             hidden.requires_grad_(True)
+[?2004l[?2004h>             for i in range(start, end):
+[?2004l[?2004h>                 layer = layers[i]
+[?2004l[?2004h>                 out = layer(hidden, None)
+[?2004l[?2004h>                 hidden = out[0] if isinstance(out, tuple) else out
+[?2004l[?2004h>             hidden_states.append(hidden)
+[?2004l[?2004h> 
+[?2004l[?2004h>         if is_last:
+[?2004l[?2004h>             loss, logits = _compute_logits_and_loss(model, transformer, lm_head, hidden, target_ids[mb], num_microbatches)
+[?2004l[?2004h>             hidden_states[-1] = loss
+[?2004l[?2004h>         else:
+[?2004l[?2004h>             send_buf = hidden_states[-1]
+[?2004l[?2004h>             if send_buf.is_contiguous():
+[?2004l[?2004h>                 send_buf = send_buf
+[?2004l[?2004h>             else:
+[?2004l[?2004h>                 send_buf = send_buf.detach().clone().contiguous()
+[?2004l[?2004h>                 hidden_states[-1] = send_buf
+[?2004l[?2004h>                 # TODO: maintain graph for backward; but contiguous clone detaches.
+[?2004l[?2004h>             # Ensure contiguous send without losing autograd link.
+[?2004l[?2004h>             send_buf = hidden_states[-1].contiguous()
+[?2004l[?2004h>             hidden_states[-1] = send_buf
+[?2004l[?2004h>             _send_recv_tensors(rank, world_size, send_buf.detach(), None, is_first, is_last)
+[?2004l[?2004h> 
+[?2004l[?2004h>     # Backward all microbatches.
+[?2004l[?2004h>     for mb in range(num_microbatches):
+[?2004l[?2004h>         if is_last:
+[?2004l[?2004h>             loss = hidden_states[mb]
+[?2004l[?2004h>             grad_out = _grad_from_loss(loss)
+[?2004l[?2004h>             loss.backward(grad_out)
+[?2004l[?2004h>         else:
+[?2004l[?2004h>             # Send buffer is output of this stage's forward.
+[?2004l[?2004h>             out = hidden_states[mb]
+[?2004l[?2004h>             # We cannot propagate gradient into incoming hidden state through P2P directly;
+[?2004l[?2004h>             # receive gradient for this microbatch and run backward from out.
+[?2004l[?2004h>             grad_shape = out.shape
+[?2004l[?2004h>             grad_buf = _make_recv_buffer(grad_shape, dtype, device)
+[?2004l[?2004h>             _send_recv_tensors(rank, world_size, None, grad_buf, is_first, is_last)
+[?2004l[?2004h>             grad_buf.requires_grad_(False)
+[?2004l[?2004h>             # If incoming hidden had requires_grad, backward into layer params.
+[?2004l[?2004h>             # Use grad_buf as upstream gradient.
+[?2004l[?2004h>             # Need autograd from out to incoming hidden and params.
+[?2004l[?2004h>             if getattr(out, "grad_fn", None) is not None:
+[?2004l[?2004h>                 out.backward(grad_buf)
+[?2004l[?2004h>             else:
+[?2004l[?2004h>                 # Recreate graph if needed by re-running with grad enabled.
+[?2004l[?2004h>                 pass
+[?2004l[?2004h> 
+[?2004l[?2004h>     return None
+[?2004l[?2004h> PY
+[?2004l[?2004hroot@9921fa0bc759:/app# python3 -m py_compile /app/pipeline_parallel.py || true
+[?2004l[?2004hroot@9921fa0bc759:/app# cat > /app/pipeline_parallel.py <<'PY'
+[?2004l[?2004h> import inspect
+[?2004l[?2004h> 
+[?2004l[?2004h> import torch
+[?2004l[?2004h> import torch.distributed as dist
+[?2004l[?2004h> import torch.nn.functional as F
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> def _model_parts(model):
+[?2004l[?2004h>     """Return (base_model, layers, norm, embed_tokens, lm_head, config)."""
+[?2004l[?2004h>     base = getattr(model, "model", model)
+[?2004l[?2004h>     layers = getattr(base, "layers", None)
+[?2004l[?2004h>     if layers is None:
+[?2004l[?2004h>         raise ValueError("Expected a LLaMA-like model with .model.layers or .layers")
+[?2004l[?2004h> 
+[?2004l[?2004h>     norm = getattr(base, "norm", None)
+[?2004l[?2004h>     embed_tokens = getattr(base, "embed_tokens", None)
+[?2004l[?2004h>     if embed_tokens is None:
+[?2004l[?2004h>         embed_tokens = getattr(model, "embed_tokens", None)
+[?2004l[?2004h> 
+[?2004l[?2004h>     lm_head = getattr(model, "lm_head", None)
+[?2004l[?2004h>     if lm_head is None:
+[?2004l[?2004h>         lm_head = getattr(base, "lm_head", None)
+[?2004l[?2004h> 
+[?2004l[?2004h>     config = getattr(model, "config", getattr(base, "config", None))
+[?2004l[?2004h>     return base, layers, norm, embed_tokens, lm_head, config
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l [?2004h> def _partition(num_layers, rank, world_size):
+[?2004l[?2004h>     """Roughly balanced layer partition with remainder going to early ranks."""
+[?2004l[?2004h>     q, r = divmod(num_layers, world_size)
+[?2004lputs[mb]
+            batch_size, seq_[?2004h>     start = rank * q + min(rank, r)
+[?2004l[?2004h>     end = start + q + (1 if rank < r else 0)
+[?2004l[?2004h>     return start, end
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> def _hidden_size(config, embed_tokens, layers):
+[?2004l[?2004h>     if config is not None and getattr(config, "hidden_size", None) is not None:
+[?2004l[?2004h>         return int(config.hidden_size)
+[?2004l[?2004h>     if embed_tokens is not None:
+[?2004l[?2004h>         return int(embed_tokens.weight.shape[-1])
+[?2004l[?2004h>     if len(layers) > 0:
+[?2004l[?2004h>         q_proj = getattr(layers[0].self_attn, "q_proj", None)
+[?2004l[?2004h>         if q_proj is not None:
+[?2004l[?2004h>             return int(q_proj.weight.shape[1])
+[?2004l[?2004h>         if hasattr(layers[0], "mlp") and hasattr(layers[0].mlp, "gate_proj"):
+[?2004l[?2004h>             return int(layers[0].mlp.gate_proj.weight.shape[1])
+[?2004l[?2004h>     raise ValueError("Could not determine hidden_size")
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> def _position_ids(seq_len, batch_size, device):
+[?2004l[?2004h>     return torch.arange(seq_len, device=device, dtype=torch.long).unsqueeze(0).expand(batch_size, -1)
+[?2004lstage_inp[?2004h> 
+[?2004lu[?2004h> 
+[?2004l[?2004h> def _call_layer(layer, hidden, position_ids):
+[?2004l[?2004h>     """Call a LLaMA decoder layer with only kwargs supported by its signature."""
+[?2004l [?2004h>     sig = inspect.signature(layer.forward)
+[?2004l[?2004h>     kw = {}
+[?2004l[?2004h>     if "attention_mask" in sig.parameters:
+[?2004l
+[?2004h>         kw["attention_mask"] = None
+[?2004lh[?2004h>     if "position_ids" in sig.parameters:
+[?2004l_gr[?2004h>         kw["position_ids"] = position_ids
+[?2004l(h[?2004h>     if "past_key_value" in sig.parameters:
+[?2004l[?2004h>         kw["past_key_value"] = None
+[?2004l[?2004h>     if "use_cache" in sig.parameters:
+[?2004l[?2004h>         kw["use_cache"] = False
+[?2004l[?2004h>     if "output_attentions" in sig.parameters:
+[?2004lden = hid[?2004h>         kw["output_attentions"] = False
+[?2004l[?2004h>     if "output_router_logits" in sig.parameters:
+[?2004l[?2004h>         kw["output_router_logits"] = False
+[?2004l[?2004h> 
+[?2004l[?2004h>     out = layer(hidden, **kw)
+[?2004l[?2004h>     return out[0] if isinstance(out, (tuple, list)) else out
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> def _run_layer_range(layers, start, end, hidden, position_ids):
+[?2004l[?2004h>     for i in range(start, end):
+[?2004l[?2004h>         hidden = _call_layer(layers[i], hidden, position_ids)
+[?2004l[?2004h>     return hidden
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> def _send_tensor(tensor, peer):
+[?2004l[?2004h>     if tensor is None:
+[?2004l[?2004h>         return
+[?2004l[?2004h>     send_tensor = tensor.contiguous()
+[?2004l[?2004h>     reqs = dist.batch_isend_irecv([dist.P2POp(dist.isend, send_tensor, peer)])
+[?2004l[?2004h>     for req in reqs:
+[?2004l[?2004h>         req.wait()
+[?2004l[?2004h> 
+[?2004l [?2004h> 
+[?2004l[?2004h> def _recv_tensor(shape, dtype, device, peer, requires_grad=False):
+[?2004l[?2004h>     buf = torch.empty(shape, dtype=dtype, device=device)
+[?2004l i[?2004h>     reqs = dist.batch_isend_irecv([dist.P2POp(dist.irecv, buf, peer)])
+[?2004l[?2004h>     for req in reqs:
+[?2004l[?2004h>         req.wait()
+[?2004l
+  [?2004h>     if requires_grad:
+[?2004l[?2004h>         buf.requires_grad_(True)
+[?2004l[?2004h>     return buf
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l [?2004h> def _grad_or_zeros(tensor, device, dtype):
+[?2004l[?2004h>     grad = tensor.grad
+[?2004l[?2004h>     if grad is None:
+[?2004lra[?2004h>         grad = torch.zeros_like(tensor)
+[?2004l      g[?2004h>     return grad.to(device=device, dtype=dtype)
+[?2004ly[?2004h> 
+[?2004lp[?2004h> 
+[?2004l[?2004h> def train_step_pipeline_afab(model, inputs, targets, device, dtype):
+[?2004l[?2004h>     """Run one all-forward-all-backward pipeline-parallel training step.
+[?2004l[?2004h> 
+[?2004lu[?2004h>     Args:
+[?2004le[?2004h>         model: LlamaForCausalLM instance.
+[?2004lor([?2004h>         inputs: list of input ID microbatch tensors.
+[?2004l[?2004h>         targets: list of target ID microbatch tensors.
+[?2004l[?2004h>         device: torch device.
+[?2004l[?2004h>         dtype: torch dtype.
+[?2004l[?2004h>     """
+[?2004l[?2004h>     assert dist.is_available() and dist.is_initialized(), "torch.distributed must be initialized"
+[?2004l[?2004h>     rank = dist.get_rank()
+[?2004l[?2004h>     world_size = dist.get_world_size()
+[?2004l[?2004h>     device = torch.device(device)
+[?2004l[?2004h> 
+[?2004l[?2004h>     num_microbatches = len(inputs)
+[?2004l[?2004h>     if num_microbatches == 0:
+[?2004l[?2004h>         return None
+[?2004l[?2004h> 
+[?2004l[?2004h>     base, layers, norm, embed_tokens, lm_head, config = _model_parts(model)
+[?2004l[?2004h>     num_layers = len(layers)
+[?2004l[?2004h>     start, end = _partition(num_layers, rank, world_size)
+[?2004l[?2004h> 
+[?2004l[?2004h>     is_first = rank == 0
+[?2004l[?2004h>     is_last = rank == world_size - 1
+[?2004l[?2004h>     hidden_size = _hidden_size(config, embed_tokens, layers)
+[?2004l[?2004h> 
+[?2004l[?2004h>     if is_first:
+[?2004l[?2004h>         local_inputs = [t.to(device=device, dtype=torch.long) for t in inputs]
+[?2004l[?2004h>     else:
+[?2004l[?2004h>         local_inputs = None
+[?2004l[?2004h> 
+[?2004l[?2004h>     if is_last:
+[?2004l[?2004h>         local_targets = [t.to(device=device, dtype=torch.long) for t in targets]
+[?2004l[?2004h>     else:
+[?2004l[?2004h>         local_targets = None
+[?2004l[?2004h> 
+[?2004l[?2004h>     # Forward all microbatches first.  Store stage inputs/outputs for backward.
+[?2004l[?2004h>     stage_inputs = []   # incoming hidden or embedding output; leaf for non-first ranks
+[?2004l[?2004h>     stage_outputs = []  # output of this stage; backward root
+[?2004l[?2004h> 
+[?2004l[?2004h>     for mb in range(num_microbatches):
+[?2004l[?2004h>         if is_first:
+[?2004l[?2004h>             ids = local_inputs[mb]
+[?2004l[?2004h>             batch_size, seq_len = int(ids.shape[0]), int(ids.shape[1])
+[?2004l[?2004h>             position_ids = _position_ids(seq_len, batch_size, device)
+[?2004l[?2004h> 
+[?2004l[?2004h>             hidden = embed_tokens(ids).to(device=device, dtype=dtype)
+[?2004l[?2004h>             stage_inputs.append(hidden)
+[?2004l[?2004h> 
+[?2004l[?2004h>             hidden = _run_layer_range(layers, start, end, hidden, position_ids)
+[?2004l[?2004h>             hidden = hidden.contiguous()
+[?2004l[?2004h>             stage_outputs.append(hidden)
+[?2004l[?2004h> 
+[?2004l[?2004h>             if not is_last:
+[?2004l[?2004h>                 _send_tensor(hidden.detach().to(device=device, dtype=dtype), rank + 1)
+[?2004l[?2004h>         else:
+[?2004l[?2004h>             # inputs is passed to all ranks in the expected test harness.  Use it
+[?2004l[?2004h>             # only to infer microbatch/seq_len for receive buffers.
+[?2004l[?2004h>             if inputs is not None and len(inputs) > mb and inputs[mb] is not None:
+[?2004l[?2004h>                 batch_size, seq_len = int(inputs[mb].shape[0]), int(inputs[mb].shape[1])
+[?2004l[?2004h>             elif len(stage_inputs) > 0:
+[?2004l[?2004h>                 batch_size, seq_len = int(stage_inputs[-1].shape[0]), int(stage_inputs[-1].shape[1])
+[?2004l[?2004h>             else:
+[?2004l[?2004h>                 batch_size, seq_len = 1, 1
+[?2004l[?2004h> 
+[?2004l[?2004h>             shape = (batch_size, seq_len, hidden_size)
+[?2004l[?2004h>             hidden = _recv_tensor(shape, dtype, device, rank - 1, requires_grad=True)
+[?2004l[?2004h>             stage_inputs.append(hidden)
+[?2004l[?2004h> 
+[?2004l[?2004h>             position_ids = _position_ids(hidden.shape[1], hidden.shape[0], device)
+[?2004l[?2004h>             hidden = _run_layer_range(layers, start, end, hidden, position_ids)
+[?2004l[?2004h>             hidden = hidden.contiguous()
+[?2004l[?2004h>             stage_outputs.append(hidden)
+[?2004l[?2004h> 
+[?2004l[?2004h>             if not is_last:
+[?2004l[?2004h>                 _send_tensor(hidden.detach().to(device=device, dtype=dtype), rank + 1)
+[?2004l[?2004h> 
+[?2004l[?2004h>     # Backward all microbatches after all forward passes.
+[?2004l[?2004h>     for mb in range(num_microbatches):
+[?2004l[?2004h>         if is_last:
+[?2004l[?2004h>             hidden = stage_outputs[mb]
+[?2004l[?2004h> 
+[?2004l[?2004h>             features = hidden
+[?2004l[?2004h>             if norm is not None:
+[?2004l[?2004h>                 features = norm(features)
+[?2004l[?2004h>             if lm_head is None:
+[?2004l[?2004h>                 raise ValueError("Could not find lm_head")
+[?2004l[?2004h> 
+[?2004l[?2004h>             logits = lm_head(features).to(torch.float32)
+[?2004l[?2004h>             loss = F.cross_entropy(
+[?2004l[?2004h>                 logits.reshape(-1, logits.size(-1)),
+[?2004l[?2004h>                 local_targets[mb].reshape(-1).to(logits.device),
+[?2004l[?2004h>                 ignore_index=-100,
+[?2004l[?2004h>                 reduction="mean",
+[?2004l[?2004h>             )
+[?2004l[?2004h>             loss = loss / num_microbatches
+[?2004l[?2004h>             loss.backward()
+[?2004l[?2004h> 
+[?2004l[?2004h>             if not is_first:
+[?2004l[?2004h>                 grad = _grad_or_zeros(stage_inputs[mb], device, dtype)
+[?2004l[?2004h>                 _send_tensor(grad, rank - 1)
+[?2004l[?2004h>         else:
+[?2004l[?2004h>             grad = _recv_tensor(stage_outputs[mb].shape, dtype, device, rank + 1)
+[?2004l[?2004h>             stage_outputs[mb].backward(grad)
+[?2004l[?2004h> 
+[?2004l[?2004h>             if not is_first:
+[?2004l[?2004h>                 grad = _grad_or_zeros(stage_inputs[mb], device, dtype)
+[?2004l[?2004h>                 _send_tensor(grad, rank - 1)
+[?2004l[?2004h> 
+[?2004l[?2004h>     return None
+[?2004l[?2004h> PY
+[?2004l[?2004hroot@9921fa0bc759:/app# python3 -m py_compile /app/pipeline_parallel.py
+[?2004l[?2004hroot@9921fa0bc759:/app# cat > /app/pipeline_parallel.py <<'PY'
+[?2004l[?2004h> import inspect
+[?2004ln[?2004h> 
+[?2004lt[?2004h> import torch
+[?2004l, pos[?2004h> import torch.distributed as dist
+[?2004l[?2004h> import torch.nn.functional as F
+[?2004l  hidden[?2004h> 
+[?2004l [?2004h> 
+[?2004l[?2004h> def _model_parts(model):
+[?2004l, h[?2004h>     """Return (base, layers, norm, embed_tokens, lm_head, config)."""
+[?2004l[?2004h>     base = getattr(model, "model", model)
+[?2004l[?2004h>     layers = getattr(base, "layers", None)
+[?2004l     [?2004h>     if layers is None:
+[?2004l[?2004h>         raise ValueError("Expected a LLaMA-like model with .model.layers or .layers")
+[?2004l[?2004h> 
+[?2004l[?2004h>     norm = getattr(base, "norm", None)
+[?2004l[?2004h>     embed_tokens = getattr(base, "embed_tokens", None) or getattr(model, "embed_tokens", None)
+[?2004l[?2004h>     lm_head = getattr(model, "lm_head", None) or getattr(base, "lm_head", None)
+[?2004l[?2004h>     config = getattr(model, "config", getattr(base, "config", None))
+[?2004l[?2004h>     return base, layers, norm, embed_tokens, lm_head, config
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> def _partition(num_layers, rank, world_size):
+[?2004l[?2004h>     """Roughly balanced partition; remainder layers go to earlier ranks."""
+[?2004l[?2004h>     q, r = divmod(num_layers, world_size)
+[?2004l[?2004h>     start = rank * q + min(rank, r)
+[?2004l[?2004h>     end = start + q + (1 if rank < r else 0)
+[?2004l[?2004h>     return start, end
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> def _hidden_size(config, embed_tokens, layers):
+[?2004l[?2004h>     if config is not None and getattr(config, "hidden_size", None) is not None:
+[?2004l[?2004h>         return int(config.hidden_size)
+[?2004l[?2004h>     if embed_tokens is not None:
+[?2004l[?2004h>         return int(embed_tokens.weight.shape[-1])
+[?2004l[?2004h>     if len(layers) > 0:
+[?2004l[?2004h>         q_proj = getattr(getattr(layers[0], "self_attn", None), "q_proj", None)
+[?2004l[?2004h>         if q_proj is not None:
+[?2004l[?2004h>             return int(q_proj.weight.shape[1])
+[?2004l[?2004h>         gate_proj = getattr(getattr(layers[0], "mlp", None), "gate_proj", None)
+[?2004l[?2004h>         if gate_proj is not None:
+[?2004l[?2004h>             return int(gate_proj.weight.shape[1])
+[?2004l[?2004h>     raise ValueError("Could not determine hidden_size")
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> def _position_ids(seq_len, batch_size, device):
+[?2004l[?2004h>     return torch.arange(seq_len, device=device, dtype=torch.long).unsqueeze(0).expand(batch_size, -1)
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> def _cache_position(seq_len, device):
+[?2004l[?2004h>     return torch.arange(seq_len, device=device, dtype=torch.long)
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> def _causal_mask(batch_size, seq_len, dtype, device):
+[?2004l[?2004h>     mask_dtype = dtype if dtype.is_floating_point else torch.float32
+[?2004l[?2004h>     min_val = torch.finfo(mask_dtype).min
+[?2004l[?2004h>     mask = torch.full((seq_len, seq_len), min_val, device=device, dtype=mask_dtype)
+[?2004l[?2004h>     mask = torch.triu(mask, diagonal=1)
+[?2004l[?2004h>     return mask.unsqueeze(0).unsqueeze(0).expand(batch_size, 1, seq_len, seq_len).contiguous()
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> def _get_rotary_emb(base, layers):
+[?2004l[?2004h>     rotary = getattr(base, "rotary_emb", None)
+[?2004l[?2004h>     if rotary is None and len(layers) > 0:
+[?2004l[?2004h>         rotary = getattr(getattr(layers[0], "self_attn", None), "rotary_emb", None)
+[?2004l[?2004h>     return rotary
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> def _compute_position_embeddings(rotary_emb, hidden, position_ids, cache_position):
+[?2004l[?2004h>     if rotary_emb is None:
+[?2004l[?2004h>         return None
+[?2004l[?2004h>     forward = getattr(rotary_emb, "forward", rotary_emb)
+[?2004l[?2004h>     try:
+[?2004l[?2004h>         params = inspect.signature(forward).parameters
+[?2004l[?2004h>     except (ValueError, TypeError):
+[?2004l[?2004h>         params = {}
+[?2004l[?2004h>     if "position_ids" in params:
+[?2004l[?2004h>         return rotary_emb(hidden, position_ids)
+[?2004l[?2004h>     if "cache_position" in params:
+[?2004l[?2004h>         return rotary_emb(hidden, cache_position)
+[?2004l[?2004h>     return rotary_emb(hidden, cache_position)
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> def _call_layer(layer, hidden, position_ids, cache_position, attention_mask, position_embeddings):
+[?2004l[?2004h>     sig = inspect.signature(layer.forward)
+[?2004l[?2004h>     kw = {}
+[?2004l[?2004h>     if "attention_mask" in sig.parameters:
+[?2004l[?2004h>         kw["attention_mask"] = attention_mask
+[?2004l[?2004h>     if "position_ids" in sig.parameters:
+[?2004l[?2004h>         kw["position_ids"] = position_ids
+[?2004l[?2004h>     if "past_key_value" in sig.parameters:
+[?2004l[?2004h>         kw["past_key_value"] = None
+[?2004l[?2004h>     if "use_cache" in sig.parameters:
+[?2004l    [?2004h>         kw["use_cache"] = False
+[?2004lze, seq[?2004h>     if "output_attentions" in sig.parameters:
+[?2004l[?2004h>         kw["output_attentions"] = False
+[?2004l r[?2004h>     if "output_router_logits" in sig.parameters:
+[?2004l[?2004h>         kw["output_router_logits"] = False
+[?2004l[?2004h>     if "cache_position" in sig.parameters:
+[?2004l[?2004h>         kw["cache_position"] = cache_position
+[?2004l[?2004h>     if "position_embeddings" in sig.parameters and position_embeddings is not None:
+[?2004l[?2004h>         kw["position_embeddings"] = position_embeddings
+[?2004l[?2004h> 
+[?2004lt[?2004h>     out = layer(hidden, **kw)
+[?2004l[?2004h>     return out[0] if isinstance(out, (tuple, list)) else out
+[?2004lgs[?2004h> 
+[?2004l [?2004h> 
+[?2004l[?2004h> def _run_layer_range(layers, start, end, hidden, position_ids, cache_position, attention_mask, position_embeddings):
+[?2004l[?2004h>     for i in range(start, end):
+[?2004lt, end, h[?2004h>         hidden = _call_layer(layers[i], hidden, position_ids, cache_position, attention_mask, position_embeddings)
+[?2004l[?2004h>     return hidden
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004ls[?2004h> def _send_tensor(tensor, peer):
+[?2004l[?2004h>     if tensor is None:
+[?2004l[?2004h>         return
+[?2004l[?2004h>     send_tensor = tensor.contiguous()
+[?2004l[?2004h>     reqs = dist.batch_isend_irecv([dist.P2POp(dist.isend, send_tensor, peer)])
+[?2004l[?2004h>     for req in reqs:
+[?2004l[?2004h>         req.wait()
+[?2004l(hidde[?2004h> 
+[?2004ln[?2004h> 
+[?2004l[?2004h> def _recv_tensor(shape, dtype, device, peer, requires_grad=False):
+[?2004l[?2004h>     buf = torch.empty(shape, dtype=dtype, device=device)
+[?2004lum_microb[?2004h>     reqs = dist.batch_isend_irecv([dist.P2POp(dist.irecv, buf, peer)])
+[?2004l[?2004h>     for req in reqs:
+[?2004l[?2004h>         req.wait()
+[?2004l[?2004h>     if requires_grad:
+[?2004l[?2004h>         buf.requires_grad_(True)
+[?2004l[?2004h>     return buf
+[?2004l[?2004h> 
+[?2004lb[?2004h> 
+[?2004l[?2004h> def _grad_or_zeros(tensor, device, dtype):
+[?2004l[?2004h>     grad = tensor.grad
+[?2004l[?2004h>     if grad is None:
+[?2004l[?2004h>         grad = torch.zeros_like(tensor)
+[?2004l)
+   [?2004h>     return grad.to(device=device, dtype=dtype).contiguous()
+[?2004l[?2004h> 
+[?2004l [?2004h> 
+[?2004l[?2004h> def _compute_loss(norm, lm_head, hidden, target, num_microbatches):
+[?2004l[mb[?2004h>     features = hidden
+[?2004l[?2004h>     if norm is not None:
+[?2004l
+P[?2004h>         features = norm(features)
+[?2004l[?2004h>     logits = lm_head(features)
+[?2004l[?2004h> 
+[?2004l[?2004h>     # Standard causal LM shift: position t predicts t+1.
+[?2004l[?2004h>     shift_logits = logits[..., :-1, :].contiguous()
+[?2004l[?2004h>     shift_target = target[..., 1:].contiguous()
+[?2004l[?2004h>     loss = F.cross_entropy(
+[?2004l[?2004h>         shift_logits.view(-1, shift_logits.size(-1)),
+[?2004l[?2004h>         shift_target.view(-1).to(shift_logits.device),
+[?2004l[?2004h>         ignore_index=-100,
+[?2004l[?2004h>         reduction="mean",
+[?2004l[?2004h>     )
+[?2004l[?2004h>     return loss / num_microbatches
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> def train_step_pipeline_afab(model, inputs, targets, device, dtype):
+[?2004l[?2004h>     """Run one all-forward-all-backward pipeline-parallel training step.
+[?2004l[?2004h> 
+[?2004l[?2004h>     Args:
+[?2004l[?2004h>         model: LlamaForCausalLM instance.
+[?2004l[?2004h>         inputs: list of input ID microbatch tensors.
+[?2004l[?2004h>         targets: list of target ID microbatch tensors.
+[?2004l[?2004h>         device: torch device.
+[?2004l[?2004h>         dtype: torch dtype.
+[?2004l[?2004h>     """
+[?2004l[?2004h>     assert dist.is_available() and dist.is_initialized(), "torch.distributed must be initialized"
+[?2004l[?2004h>     rank = dist.get_rank()
+[?2004l[?2004h>     world_size = dist.get_world_size()
+[?2004l[?2004h>     device = torch.device(device)
+[?2004l[?2004h> 
+[?2004l[?2004h>     num_microbatches = len(inputs)
+[?2004l[?2004h>     if num_microbatches == 0:
+[?2004l[?2004h>         return None
+[?2004l[?2004h> 
+[?2004l[?2004h>     base, layers, norm, embed_tokens, lm_head, config = _model_parts(model)
+[?2004l[?2004h>     num_layers = len(layers)
+[?2004l[?2004h>     start, end = _partition(num_layers, rank, world_size)
+[?2004l[?2004h> 
+[?2004l[?2004h>     is_first = rank == 0
+[?2004l[?2004h>     is_last = rank == world_size - 1
+[?2004l[?2004h>     hidden_size = _hidden_size(config, embed_tokens, layers)
+[?2004l[?2004h> 
+[?2004l[?2004h>     local_inputs = [t.to(device=device, dtype=torch.long) for t in inputs] if is_first else None
+[?2004l[?2004h>     local_targets = [t.to(device=device, dtype=torch.long) for t in targets] if is_last else None
+[?2004l[?2004h> 
+[?2004l[?2004h>     stage_inputs = []   # incoming leaf hidden / embedding output
+[?2004l[?2004h>     stage_outputs = []  # stage output (hidden) or loss (last rank)
+[?2004l[?2004h> 
+[?2004l[?2004h>     # ---- Forward all microbatches ----
+[?2004l[?2004h>     for mb in range(num_microbatches):
+[?2004l[?2004h>         if is_first:
+[?2004l[?2004h>             ids = local_inputs[mb]
+[?2004l[?2004h>             batch_size, seq_len = int(ids.shape[0]), int(ids.shape[1])
+[?2004l[?2004h>             hidden = embed_tokens(ids).to(device=device, dtype=dtype)
+[?2004l[?2004h>             stage_inputs.append(hidden)
+[?2004l[?2004h>         else:
+[?2004l[?2004h>             if inputs is not None and len(inputs) > mb and inputs[mb] is not None:
+[?2004l[?2004h>                 batch_size, seq_len = int(inputs[mb].shape[0]), int(inputs[mb].shape[1])
+[?2004l[?2004h>             elif len(stage_inputs) > 0:
+[?2004l[?2004h>                 batch_size, seq_len = int(stage_inputs[-1].shape[0]), int(stage_inputs[-1].shape[1])
+[?2004l[?2004h>             else:
+[?2004l[?2004h>                 batch_size, seq_len = 1, 1
+[?2004l[?2004h>             shape = (batch_size, seq_len, hidden_size)
+[?2004l[?2004h>             hidden = _recv_tensor(shape, dtype, device, rank - 1, requires_grad=True)
+[?2004l[?2004h>             stage_inputs.append(hidden)
+[?2004l[?2004h>             batch_size, seq_len = int(hidden.shape[0]), int(hidden.shape[1])
+[?2004l[?2004h> 
+[?2004l[?2004h>         position_ids = _position_ids(seq_len, batch_size, device)
+[?2004l[?2004h>         cache_position = _cache_position(seq_len, device)
+[?2004l[?2004h>         attention_mask = _causal_mask(batch_size, seq_len, dtype, device)
+[?2004l[?2004h>         rotary_emb = _get_rotary_emb(base, layers)
+[?2004l[?2004h>         position_embeddings = _compute_position_embeddings(rotary_emb, hidden, position_ids, cache_position)
+[?2004l[?2004h> 
+[?2004l[?2004h>         hidden = _run_layer_range(
+[?2004l[?2004h>             layers, start, end, hidden, position_ids, cache_position, attention_mask, position_embeddings
+[?2004l[?2004h>         )
+[?2004l[?2004h> 
+[?2004l[?2004h>         if is_last:
+[?2004l[?2004h>             loss = _compute_loss(norm, lm_head, hidden, local_targets[mb], num_microbatches)
+[?2004l[?2004h>             stage_outputs.append(loss)
+[?2004l[?2004h>         else:
+[?2004l[?2004h>             hidden = hidden.contiguous()
+[?2004l[?2004h>             stage_outputs.append(hidden)
+[?2004l[?2004h>             _send_tensor(hidden.detach().to(device=device, dtype=dtype), rank + 1)
+[?2004l[?2004h> 
+[?2004l[?2004h>     # ---- Backward all microbatches ----
+[?2004l[?2004h>     for mb in range(num_microbatches):
+[?2004l[?2004h>         if is_last:
+[?2004l[?2004h>             loss = stage_outputs[mb]
+[?2004l[?2004h>             loss.backward()
+[?2004l[?2004h>             if not is_first:
+[?2004l[?2004h>                 _send_tensor(_grad_or_zeros(stage_inputs[mb], device, dtype), rank - 1)
+[?2004l[?2004h>         else:
+[?2004l[?2004h>             grad = _recv_tensor(stage_outputs[mb].shape, dtype, device, rank + 1)
+[?2004l[?2004h>             stage_outputs[mb].backward(grad)
+[?2004l[?2004h>             if not is_first:
+[?2004l[?2004h>                 _send_tensor(_grad_or_zeros(stage_inputs[mb], device, dtype), rank - 1)
+[?2004l[?2004h> 
+[?2004l[?2004h>     return None
+[?2004l[?2004h> PY
+[?2004l[?2004hroot@9921fa0bc759:/app# sed -n '1,260p' /app/pipeline_parallel.py
+[?2004limport inspect
+
+import torch
+import torch.distributed as dist
+import torch.nn.functional as F
+
+
+def _model_parts(model):
+    """Return (base, layers, norm, embed_tokens, lm_head, config)."""
+    base = getattr(model, "model", model)
+    layers = getattr(base, "layers", None)
+    if layers is None:
+        raise ValueError("Expected a LLaMA-like model with .model.layers or .layers")
+
+    norm = getattr(base, "norm", None)
+    embed_tokens = getattr(base, "embed_tokens", None) or getattr(model, "embed_tokens", None)
+    lm_head = getattr(model, "lm_head", None) or getattr(base, "lm_head", None)
+    config = getattr(model, "config", getattr(base, "config", None))
+    return base, layers, norm, embed_tokens, lm_head, config
+
+
+def _partition(num_layers, rank, world_size):
+    """Roughly balanced partition; remainder layers go to earlier ranks."""
+    q, r = divmod(num_layers, world_size)
+    start = rank * q + min(rank, r)
+    end = start + q + (1 if rank < r else 0)
+    return start, end
+
+
+def _hidden_size(config, embed_tokens, layers):
+    if config is not None and getattr(config, "hidden_size", None) is not None:
+        return int(config.hidden_size)
+    if embed_tokens is not None:
+        return int(embed_tokens.weight.shape[-1])
+    if len(layers) > 0:
+        q_proj = getattr(getattr(layers[0], "self_attn", None), "q_proj", None)
+        if q_proj is not None:
+            return int(q_proj.weight.shape[1])
+        gate_proj = getattr(getattr(layers[0], "mlp", None), "gate_proj", None)
+        if gate_proj is not None:
+            return int(gate_proj.weight.shape[1])
+    raise ValueError("Could not determine hidden_size")
+
+
+def _position_ids(seq_len, batch_size, device):
+    return torch.arange(seq_len, device=device, dtype=torch.long).unsqueeze(0).expand(batch_size, -1)
+
+
+def _cache_position(seq_len, device):
+    return torch.arange(seq_len, device=device, dtype=torch.long)
+
+
+def _causal_mask(batch_size, seq_len, dtype, device):
+    mask_dtype = dtype if dtype.is_floating_point else torch.float32
+    min_val = torch.finfo(mask_dtype).min
+    mask = torch.full((seq_len, seq_len), min_val, device=device, dtype=mask_dtype)
+    mask = torch.triu(mask, diagonal=1)
+    return mask.unsqueeze(0).unsqueeze(0).expand(batch_size, 1, seq_len, seq_len).contiguous()
+
+
+def _get_rotary_emb(base, layers):
+    rotary = getattr(base, "rotary_emb", None)
+    if rotary is None and len(layers) > 0:
+        rotary = getattr(getattr(layers[0], "self_attn", None), "rotary_emb", None)
+    return rotary
+
+
+def _compute_position_embeddings(rotary_emb, hidden, position_ids, cache_position):
+    if rotary_emb is None:
+        return None
+    forward = getattr(rotary_emb, "forward", rotary_emb)
+    try:
+        params = inspect.signature(forward).parameters
+    except (ValueError, TypeError):
+        params = {}
+    if "position_ids" in params:
+        return rotary_emb(hidden, position_ids)
+    if "cache_position" in params:
+        return rotary_emb(hidden, cache_position)
+    return rotary_emb(hidden, cache_position)
+
+
+def _call_layer(layer, hidden, position_ids, cache_position, attention_mask, position_embeddings):
+    sig = inspect.signature(layer.forward)
+    kw = {}
+    if "attention_mask" in sig.parameters:
+        kw["attention_mask"] = attention_mask
+    if "position_ids" in sig.parameters:
+        kw["position_ids"] = position_ids
+    if "past_key_value" in sig.parameters:
+        kw["past_key_value"] = None
+    if "use_cache" in sig.parameters:
+        kw["use_cache"] = False
+    if "output_attentions" in sig.parameters:
+        kw["output_attentions"] = False
+    if "output_router_logits" in sig.parameters:
+        kw["output_router_logits"] = False
+    if "cache_position" in sig.parameters:
+        kw["cache_position"] = cache_position
+    if "position_embeddings" in sig.parameters and position_embeddings is not None:
+        kw["position_embeddings"] = position_embeddings
+
+    out = layer(hidden, **kw)
+    return out[0] if isinstance(out, (tuple, list)) else out
+
+
+def _run_layer_range(layers, start, end, hidden, position_ids, cache_position, attention_mask, position_embeddings):
+    for i in range(start, end):
+        hidden = _call_layer(layers[i], hidden, position_ids, cache_position, attention_mask, position_embeddings)
+    return hidden
+
+
+def _send_tensor(tensor, peer):
+    if tensor is None:
+        return
+    send_tensor = tensor.contiguous()
+    reqs = dist.batch_isend_irecv([dist.P2POp(dist.isend, send_tensor, peer)])
+    for req in reqs:
+        req.wait()
+
+
+def _recv_tensor(shape, dtype, device, peer, requires_grad=False):
+    buf = torch.empty(shape, dtype=dtype, device=device)
+    reqs = dist.batch_isend_irecv([dist.P2POp(dist.irecv, buf, peer)])
+    for req in reqs:
+        req.wait()
+    if requires_grad:
+        buf.requires_grad_(True)
+    return buf
+
+
+def _grad_or_zeros(tensor, device, dtype):
+    grad = tensor.grad
+    if grad is None:
+        grad = torch.zeros_like(tensor)
+    return grad.to(device=device, dtype=dtype).contiguous()
+
+
+def _compute_loss(norm, lm_head, hidden, target, num_microbatches):
+    features = hidden
+    if norm is not None:
+        features = norm(features)
+    logits = lm_head(features)
+
+    # Standard causal LM shift: position t predicts t+1.
+    shift_logits = logits[..., :-1, :].contiguous()
+    shift_target = target[..., 1:].contiguous()
+    loss = F.cross_entropy(
+        shift_logits.view(-1, shift_logits.size(-1)),
+        shift_target.view(-1).to(shift_logits.device),
+        ignore_index=-100,
+        reduction="mean",
+    )
+    return loss / num_microbatches
+
+
+def train_step_pipeline_afab(model, inputs, targets, device, dtype):
+    """Run one all-forward-all-backward pipeline-parallel training step.
+
+    Args:
+        model: LlamaForCausalLM instance.
+        inputs: list of input ID microbatch tensors.
+        targets: list of target ID microbatch tensors.
+        device: torch device.
+        dtype: torch dtype.
+    """
+    assert dist.is_available() and dist.is_initialized(), "torch.distributed must be initialized"
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    device = torch.device(device)
+
+    num_microbatches = len(inputs)
+    if num_microbatches == 0:
+        return None
+
+    base, layers, norm, embed_tokens, lm_head, config = _model_parts(model)
+    num_layers = len(layers)
+    start, end = _partition(num_layers, rank, world_size)
+
+    is_first = rank == 0
+    is_last = rank == world_size - 1
+    hidden_size = _hidden_size(config, embed_tokens, layers)
+
+    local_inputs = [t.to(device=device, dtype=torch.long) for t in inputs] if is_first else None
+    local_targets = [t.to(device=device, dtype=torch.long) for t in targets] if is_last else None
+
+    stage_inputs = []   # incoming leaf hidden / embedding output
+    stage_outputs = []  # stage output (hidden) or loss (last rank)
+
+    # ---- Forward all microbatches ----
+    for mb in range(num_microbatches):
+        if is_first:
+            ids = local_inputs[mb]
+            batch_size, seq_len = int(ids.shape[0]), int(ids.shape[1])
+            hidden = embed_tokens(ids).to(device=device, dtype=dtype)
+            stage_inputs.append(hidden)
+        else:
+            if inputs is not None and len(inputs) > mb and inputs[mb] is not None:
+                batch_size, seq_len = int(inputs[mb].shape[0]), int(inputs[mb].shape[1])
+            elif len(stage_inputs) > 0:
+                batch_size, seq_len = int(stage_inputs[-1].shape[0]), int(stage_inputs[-1].shape[1])
+            else:
+                batch_size, seq_len = 1, 1
+            shape = (batch_size, seq_len, hidden_size)
+            hidden = _recv_tensor(shape, dtype, device, rank - 1, requires_grad=True)
+            stage_inputs.append(hidden)
+            batch_size, seq_len = int(hidden.shape[0]), int(hidden.shape[1])
+
+        position_ids = _position_ids(seq_len, batch_size, device)
+        cache_position = _cache_position(seq_len, device)
+        attention_mask = _causal_mask(batch_size, seq_len, dtype, device)
+        rotary_emb = _get_rotary_emb(base, layers)
+        position_embeddings = _compute_position_embeddings(rotary_emb, hidden, position_ids, cache_position)
+
+        hidden = _run_layer_range(
+            layers, start, end, hidden, position_ids, cache_position, attention_mask, position_embeddings
+        )
+
+        if is_last:
+            loss = _compute_loss(norm, lm_head, hidden, local_targets[mb], num_microbatches)
+            stage_outputs.append(loss)
+        else:
+            hidden = hidden.contiguous()
+            stage_outputs.append(hidden)
+            _send_tensor(hidden.detach().to(device=device, dtype=dtype), rank + 1)
+
+    # ---- Backward all microbatches ----
+    for mb in range(num_microbatches):
+        if is_last:
+            loss = stage_outputs[mb]
+            loss.backward()
+            if not is_first:
+                _send_tensor(_grad_or_zeros(stage_inputs[mb], device, dtype), rank - 1)
+        else:
+            grad = _recv_tensor(stage_outputs[mb].shape, dtype, device, rank + 1)
+            stage_outputs[mb].backward(grad)
+            if not is_first:
+                _send_tensor(_grad_or_zeros(stage_inputs[mb], device, dtype), rank - 1)
+
+    return None
+[?2004hroot@9921fa0bc759:/app# python3 -m py_compile /app/pipeline_parallel.py && echo OK
+[?2004lOK
+[?2004hroot@9921fa0bc759:/app# python3 - <<'PY'
+[?2004l[?2004h> from pathlib import Path
+[?2004l[?2004h> p = Path('/app/pipeline_parallel.py')
+[?2004l[?2004h> s = p.read_text()
+[?2004l[?2004h> 
+[?2004l[?2004h> needle = "def _compute_position_embeddings(rotary_emb, hidden, position_ids, cache_position):\n"
+[?2004l[?2004h> helper = '''def _needs_position_embeddings(layers, start, end):
+[?2004l[?2004h>     for i in range(start, end):
+[?2004l[?2004h>         try:
+[?2004l[?2004h>             if "position_embeddings" in inspect.signature(layers[i].forward).parameters:
+[?2004l[?2004h>                 return True
+[?2004l[?2004h>         except (ValueError, TypeError):
+[?2004l[?2004h>             pass
+[?2004l[?2004h>     return False
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> '''
+[?2004l[?2004h> if "_needs_position_embeddings" not in s:
+[?2004l[?2004h>     s = s.replace(needle, helper + needle)
+[?2004l[?2004h> 
+[?2004l[?2004h> old = '''        rotary_emb = _get_rotary_emb(base, layers)
+[?2004l[?2004h>         position_embeddings = _compute_position_embeddings(rotary_emb, hidden, position_ids, cache_position)
+[?2004l[?2004h> 
+[?2004l[?2004h>         hidden = _run_layer_range(
+[?2004l[?2004h> '''
+[?2004l[?2004h> new = '''        if _needs_position_embeddings(layers, start, end):
+[?2004l[?2004h>             rotary_emb = _get_rotary_emb(base, layers)
+[?2004l[?2004h>             position_embeddings = _compute_position_embeddings(rotary_emb, hidden, position_ids, cache_position)
+[?2004l[?2004h>         else:
+[?2004l[?2004h>             position_embeddings = None
+[?2004l[?2004h> 
+[?2004l[?2004h>         hidden = _run_layer_range(
+[?2004l[?2004h> '''
+[?2004l[?2004h> if old not in s:
+[?2004l[?2004h>     raise SystemExit('position_embeddings block not found')
+[?2004l[?2004h> s = s.replace(old, new)
+[?2004l[?2004h> 
+[?2004l[?2004h> old_loss = '''def _compute_loss(norm, lm_head, hidden, target, num_microbatches):
+[?2004l[?2004h>     features = hidden
+[?2004l[?2004h>     if norm is not None:
+[?2004l[?2004h>         features = norm(features)
+[?2004l[?2004h>     logits = lm_head(features)
+[?2004l[?2004h> 
+[?2004l[?2004h>     # Standard causal LM shift: position t predicts t+1.
+[?2004l[?2004h>     shift_logits = logits[..., :-1, :].contiguous()
+[?2004l[?2004h>     shift_target = target[..., 1:].contiguous()
+[?2004l[?2004h>     loss = F.cross_entropy(
+[?2004l[?2004h>         shift_logits.view(-1, shift_logits.size(-1)),
+[?2004l[?2004h>         shift_target.view(-1).to(shift_logits.device),
+[?2004l[?2004h>         ignore_index=-100,
+[?2004l[?2004h>         reduction="mean",
+[?2004l[?2004h>     )
+[?2004l[?2004h>     return loss / num_microbatches
+[?2004l[?2004h> '''
+[?2004l[?2004h> new_loss = '''def _compute_loss(norm, lm_head, hidden, target, num_microbatches):
+[?2004l[?2004h>     features = hidden
+[?2004l[?2004h>     if norm is not None:
+[?2004l[?2004h>         features = norm(features)
+[?2004l[?2004h>     logits = lm_head(features)
+[?2004l[?2004h> 
+[?2004l[?2004h>     loss = F.cross_entropy(
+[?2004l[?2004h>         logits.reshape(-1, logits.size(-1)),
+[?2004l[?2004h>         target.reshape(-1).to(logits.device),
+[?2004l[?2004h>         ignore_index=-100,
+[?2004l[?2004h>         reduction="mean",
+[?2004l[?2004h>     )
+[?2004l[?2004h>     return loss / num_microbatches
+[?2004l[?2004h> '''
+[?2004l[?2004h> if old_loss not in s:
+[?2004l[?2004h>     raise SystemExit('old loss block not found')
+[?2004l[?2004h> s = s.replace(old_loss, new_loss)
+[?2004l[?2004h> 
+[?2004l[?2004h> p.write_text(s)
+[?2004l[?2004h> print('patched')
+[?2004l[?2004h> PY
+[?2004lpatched
+[?2004hroot@9921fa0bc759:/app# sed -n '/def _needs_position_embeddings/,/def _compute_loss/p' /app/pipeline_parallel.py; sed -n '/def _compute_loss/,/return loss \/ numm_microbatches/p' /app/pipeline_parallel.py
+[?2004ldef _needs_position_embeddings(layers, start, end):
+    for i in range(start, end):
+        try:
+            if "position_embeddings" in inspect.signature(layers[i].forward).parameters:
+                return True
+        except (ValueError, TypeError):
+            pass
+    return False
+
+
+def _compute_position_embeddings(rotary_emb, hidden, position_ids, cache_position):
+    if rotary_emb is None:
+        return None
+    forward = getattr(rotary_emb, "forward", rotary_emb)
+    try:
+        params = inspect.signature(forward).parameters
+    except (ValueError, TypeError):
+        params = {}
+    if "position_ids" in params:
+        return rotary_emb(hidden, position_ids)
+    if "cache_position" in params:
+        return rotary_emb(hidden, cache_position)
+    return rotary_emb(hidden, cache_position)
+
+
+def _call_layer(layer, hidden, position_ids, cache_position, attention_mask, position_embeddings):
+    sig = inspect.signature(layer.forward)
+    kw = {}
+    if "attention_mask" in sig.parameters:
+        kw["attention_mask"] = attention_mask
+    if "position_ids" in sig.parameters:
+        kw["position_ids"] = position_ids
+    if "past_key_value" in sig.parameters:
+        kw["past_key_value"] = None
+    if "use_cache" in sig.parameters:
+        kw["use_cache"] = False
+    if "output_attentions" in sig.parameters:
+        kw["output_attentions"] = False
+    if "output_router_logits" in sig.parameters:
+        kw["output_router_logits"] = False
+    if "cache_position" in sig.parameters:
+        kw["cache_position"] = cache_position
+    if "position_embeddings" in sig.parameters and position_embeddings is not None:
+        kw["position_embeddings"] = position_embeddings
+
+    out = layer(hidden, **kw)
+    return out[0] if isinstance(out, (tuple, list)) else out
+
+
+def _run_layer_range(layers, start, end, hidden, position_ids, cache_position, attention_mask, position_embeddings):
+    for i in range(start, end):
+        hidden = _call_layer(layers[i], hidden, position_ids, cache_position, attention_mask, position_embeddings)
+    return hidden
+
+
+def _send_tensor(tensor, peer):
+    if tensor is None:
+        return
+    send_tensor = tensor.contiguous()
+    reqs = dist.batch_isend_irecv([dist.P2POp(dist.isend, send_tensor, peer)])
+    for req in reqs:
+        req.wait()
+
+
+def _recv_tensor(shape, dtype, device, peer, requires_grad=False):
+    buf = torch.empty(shape, dtype=dtype, device=device)
+    reqs = dist.batch_isend_irecv([dist.P2POp(dist.irecv, buf, peer)])
+    for req in reqs:
+        req.wait()
+    if requires_grad:
+        buf.requires_grad_(True)
+    return buf
+
+
+def _grad_or_zeros(tensor, device, dtype):
+    grad = tensor.grad
+    if grad is None:
+        grad = torch.zeros_like(tensor)
+    return grad.to(device=device, dtype=dtype).contiguous()
+
+
+def _compute_loss(norm, lm_head, hidden, target, num_microbatches):
+def _compute_loss(norm, lm_head, hidden, target, num_microbatches):
+    features = hidden
+    if norm is not None:
+        features = norm(features)
+    logits = lm_head(features)
+
+    loss = F.cross_entropy(
+        logits.reshape(-1, logits.size(-1)),
+        target.reshape(-1).to(logits.device),
+        ignore_index=-100,
+        reduction="mean",
+    )
+    return loss / num_microbatches
+[?2004hroot@9921fa0bc759:/app# python3 -m py_compile /app/pipeline_parallel.py && echo OK
+[?2004lOK
+[?2004hroot@9921fa0bc759:/app# sed -n '1,260p' /app/pipeline_parallel.py
+[?2004limport inspect
+
+import torch
+import torch.distributed as dist
+import torch.nn.functional as F
+
+
+def _model_parts(model):
+    """Return (base, layers, norm, embed_tokens, lm_head, config)."""
+    base = getattr(model, "model", model)
+    layers = getattr(base, "layers", None)
+    if layers is None:
+        raise ValueError("Expected a LLaMA-like model with .model.layers or .layers")
+
+    norm = getattr(base, "norm", None)
+    embed_tokens = getattr(base, "embed_tokens", None) or getattr(model, "embed_tokens", None)
+    lm_head = getattr(model, "lm_head", None) or getattr(base, "lm_head", None)
+    config = getattr(model, "config", getattr(base, "config", None))
+    return base, layers, norm, embed_tokens, lm_head, config
+
+
+def _partition(num_layers, rank, world_size):
+    """Roughly balanced partition; remainder layers go to earlier ranks."""
+    q, r = divmod(num_layers, world_size)
+    start = rank * q + min(rank, r)
+    end = start + q + (1 if rank < r else 0)
+    return start, end
+
+
+def _hidden_size(config, embed_tokens, layers):
+    if config is not None and getattr(config, "hidden_size", None) is not None:
+        return int(config.hidden_size)
+    if embed_tokens is not None:
+        return int(embed_tokens.weight.shape[-1])
+    if len(layers) > 0:
+        q_proj = getattr(getattr(layers[0], "self_attn", None), "q_proj", None)
+        if q_proj is not None:
+            return int(q_proj.weight.shape[1])
+        gate_proj = getattr(getattr(layers[0], "mlp", None), "gate_proj", None)
+        if gate_proj is not None:
+            return int(gate_proj.weight.shape[1])
+    raise ValueError("Could not determine hidden_size")
+
+
+def _position_ids(seq_len, batch_size, device):
+    return torch.arange(seq_len, device=device, dtype=torch.long).unsqueeze(0).expand(batch_size, -1)
+
+
+def _cache_position(seq_len, device):
+    return torch.arange(seq_len, device=device, dtype=torch.long)
+
+
+def _causal_mask(batch_size, seq_len, dtype, device):
+    mask_dtype = dtype if dtype.is_floating_point else torch.float32
+    min_val = torch.finfo(mask_dtype).min
+    mask = torch.full((seq_len, seq_len), min_val, device=device, dtype=mask_dtype)
+    mask = torch.triu(mask, diagonal=1)
+    return mask.unsqueeze(0).unsqueeze(0).expand(batch_size, 1, seq_len, seq_len).contiguous()
+
+
+def _get_rotary_emb(base, layers):
+    rotary = getattr(base, "rotary_emb", None)
+    if rotary is None and len(layers) > 0:
+        rotary = getattr(getattr(layers[0], "self_attn", None), "rotary_emb", None)
+    return rotary
+
+
+def _needs_position_embeddings(layers, start, end):
+    for i in range(start, end):
+        try:
+            if "position_embeddings" in inspect.signature(layers[i].forward).parameters:
+                return True
+        except (ValueError, TypeError):
+            pass
+    return False
+
+
+def _compute_position_embeddings(rotary_emb, hidden, position_ids, cache_position):
+    if rotary_emb is None:
+        return None
+    forward = getattr(rotary_emb, "forward", rotary_emb)
+    try:
+        params = inspect.signature(forward).parameters
+    except (ValueError, TypeError):
+        params = {}
+    if "position_ids" in params:
+        return rotary_emb(hidden, position_ids)
+    if "cache_position" in params:
+        return rotary_emb(hidden, cache_position)
+    return rotary_emb(hidden, cache_position)
+
+
+def _call_layer(layer, hidden, position_ids, cache_position, attention_mask, position_embeddings):
+    sig = inspect.signature(layer.forward)
+    kw = {}
+    if "attention_mask" in sig.parameters:
+        kw["attention_mask"] = attention_mask
+    if "position_ids" in sig.parameters:
+        kw["position_ids"] = position_ids
+    if "past_key_value" in sig.parameters:
+        kw["past_key_value"] = None
+    if "use_cache" in sig.parameters:
+        kw["use_cache"] = False
+    if "output_attentions" in sig.parameters:
+        kw["output_attentions"] = False
+    if "output_router_logits" in sig.parameters:
+        kw["output_router_logits"] = False
+    if "cache_position" in sig.parameters:
+        kw["cache_position"] = cache_position
+    if "position_embeddings" in sig.parameters and position_embeddings is not None:
+        kw["position_embeddings"] = position_embeddings
+
+    out = layer(hidden, **kw)
+    return out[0] if isinstance(out, (tuple, list)) else out
+
+
+def _run_layer_range(layers, start, end, hidden, position_ids, cache_position, attention_mask, position_embeddings):
+    for i in range(start, end):
+        hidden = _call_layer(layers[i], hidden, position_ids, cache_position, attention_mask, position_embeddings)
+    return hidden
+
+
+def _send_tensor(tensor, peer):
+    if tensor is None:
+        return
+    send_tensor = tensor.contiguous()
+    reqs = dist.batch_isend_irecv([dist.P2POp(dist.isend, send_tensor, peer)])
+    for req in reqs:
+        req.wait()
+
+
+def _recv_tensor(shape, dtype, device, peer, requires_grad=False):
+    buf = torch.empty(shape, dtype=dtype, device=device)
+    reqs = dist.batch_isend_irecv([dist.P2POp(dist.irecv, buf, peer)])
+    for req in reqs:
+        req.wait()
+    if requires_grad:
+        buf.requires_grad_(True)
+    return buf
+
+
+def _grad_or_zeros(tensor, device, dtype):
+    grad = tensor.grad
+    if grad is None:
+        grad = torch.zeros_like(tensor)
+    return grad.to(device=device, dtype=dtype).contiguous()
+
+
+def _compute_loss(norm, lm_head, hidden, target, num_microbatches):
+    features = hidden
+    if norm is not None:
+        features = norm(features)
+    logits = lm_head(features)
+
+    loss = F.cross_entropy(
+        logits.reshape(-1, logits.size(-1)),
+        target.reshape(-1).to(logits.device),
+        ignore_index=-100,
+        reduction="mean",
+    )
+    return loss / num_microbatches
+
+
+def train_step_pipeline_afab(model, inputs, targets, device, dtype):
+    """Run one all-forward-all-backward pipeline-parallel training step.
+
+    Args:
+        model: LlamaForCausalLM instance.
+        inputs: list of input ID microbatch tensors.
+        targets: list of target ID microbatch tensors.
+        device: torch device.
+        dtype: torch dtype.
+    """
+    assert dist.is_available() and dist.is_initialized(), "torch.distributed must be initialized"
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    device = torch.device(device)
+
+    num_microbatches = len(inputs)
+    if num_microbatches == 0:
+        return None
+
+    base, layers, norm, embed_tokens, lm_head, config = _model_parts(model)
+    num_layers = len(layers)
+    start, end = _partition(num_layers, rank, world_size)
+
+    is_first = rank == 0
+    is_last = rank == world_size - 1
+    hidden_size = _hidden_size(config, embed_tokens, layers)
+
+    local_inputs = [t.to(device=device, dtype=torch.long) for t in inputs] if is_first else None
+    local_targets = [t.to(device=device, dtype=torch.long) for t in targets] if is_last else None
+
+    stage_inputs = []   # incoming leaf hidden / embedding output
+    stage_outputs = []  # stage output (hidden) or loss (last rank)
+
+    # ---- Forward all microbatches ----
+    for mb in range(num_microbatches):
+        if is_first:
+            ids = local_inputs[mb]
+            batch_size, seq_len = int(ids.shape[0]), int(ids.shape[1])
+            hidden = embed_tokens(ids).to(device=device, dtype=dtype)
+            stage_inputs.append(hidden)
+        else:
+            if inputs is not None and len(inputs) > mb and inputs[mb] is not None:
+                batch_size, seq_len = int(inputs[mb].shape[0]), int(inputs[mb].shape[1])
+            elif len(stage_inputs) > 0:
+                batch_size, seq_len = int(stage_inputs[-1].shape[0]), int(stage_inputs[-1].shape[1])
+            else:
+                batch_size, seq_len = 1, 1
+            shape = (batch_size, seq_len, hidden_size)
+            hidden = _recv_tensor(shape, dtype, device, rank - 1, requires_grad=True)
+            stage_inputs.append(hidden)
+            batch_size, seq_len = int(hidden.shape[0]), int(hidden.shape[1])
+
+        position_ids = _position_ids(seq_len, batch_size, device)
+        cache_position = _cache_position(seq_len, device)
+        attention_mask = _causal_mask(batch_size, seq_len, dtype, device)
+        if _needs_position_embeddings(layers, start, end):
+            rotary_emb = _get_rotary_emb(base, layers)
+            position_embeddings = _compute_position_embeddings(rotary_emb, hidden, position_ids, cache_position)
+        else:
+            position_embeddings = None
+
+        hidden = _run_layer_range(
+            layers, start, end, hidden, position_ids, cache_position, attention_mask, position_embeddings
+        )
+
+        if is_last:
+            loss = _compute_loss(norm, lm_head, hidden, local_targets[mb], num_microbatches)
+            stage_outputs.append(loss)
+        else:
+            hidden = hidden.contiguous()
+            stage_outputs.append(hidden)
+            _send_tensor(hidden.detach().to(device=device, dtype=dtype), rank + 1)
+
+    # ---- Backward all microbatches ----
+    for mb in range(num_microbatches):
+        if is_last:
+            loss = stage_outputs[mb]
+            loss.backward()
+            if not is_first:
+                _send_tensor(_grad_or_zeros(stage_inputs[mb], device, dtype), rank - 1)
+        else:
+            grad = _recv_tensor(stage_outputs[mb].shape, dtype, device, rank + 1)
+            stage_outputs[mb].backward(grad)
+            if not is_first:
+                _send_tensor(_grad_or_zeros(stage_inputs[mb], device, dtype), rank - 1)
+
+    return None
+[?2004hroot@9921fa0bc759:/app# python3 - <<'PY'
+[?2004l[?2004h> from pathlib import Path
+[?2004l[?2004h> 
+[?2004l[?2004h> p = Path('/app/pipeline_parallel.py')
+[?2004l[?2004h> s = p.read_text()
+[?2004l[?2004h> 
+[?2004l[?2004h> # Make _run_layer_range safe for empty partitions.
+[?2004l[?2004h> s = s.replace(
+[?2004l[?2004h> '''def _run_layer_range(layers, start, end, hidden, position_ids, cache_position, attention_mask, position_embeddings):
+[?2004l[?2004h>     for i in range(start, end):
+[?2004l[?2004h>         hidden = _call_layer(layers[i], hidden, position_ids, cache_position, attention_mask, position_embeddings)
+[?2004l[?2004h>     return hidden
+[?2004l[?2004h> ''',
+[?2004l[?2004h> '''def _run_layer_range(layers, start, end, hidden, position_ids, cache_position, attention_mask, position_embeddings):
+[?2004l[?2004h>     for i in range(start, end):
+[?2004l[?2004h>         hidden = _call_layer(layers[i], hidden, position_ids, cache_position, attention_mask, position_embeddings)
+[?2004l[?2004h>     return hidden.contiguous() if start < end else hidden
+[?2004l[?2004h> ''')
+[?2004l[?2004h> 
+[?2004l[?2004h> # Keep forward hidden states contiguous and on device/dtype before sending.
+[?2004l[?2004h> s = s.replace(
+[?2004l[?2004h> '''        if is_last:
+[?2004l[?2004h>             loss = _compute_loss(norm, lm_head, hidden, local_targets[mb], num_microbatches)
+[?2004l[?2004h>             stage_outputs.append(loss)
+[?2004l[?2004h>         else:
+[?2004l[?2004h>             hidden = hidden.contiguous()
+[?2004l[?2004h>             stage_outputs.append(hidden)
+[?2004l[?2004h>             _send_tensor(hidden.detach().to(device=device, dtype=dtype), rank + 1)
+[?2004l[?2004h> ''',
+[?2004l[?2004h> '''        if is_last:
+[?2004l[?2004h>             loss = _compute_loss(norm, lm_head, hidden, local_targets[mb], num_microbatches)
+[?2004l[?2004h>             stage_outputs.append(loss)
+[?2004l[?2004h>         else:
+[?2004l[?2004h>             hidden = hidden.to(device=device, dtype=dtype).contiguous()
+[?2004l[?2004h>             stage_outputs.append(hidden)
+[?2004l[?2004h>             _send_tensor(hidden.detach().to(device=device, dtype=dtype).contiguous(), rank + 1)
+[?2004l[?2004h> ''')
+[?2004l[?2004h> 
+[?2004l[?2004h> # Make gradient sends explicitly contiguous/device/dtype.
+[?2004l[?2004h> s = s.replace(
+[?2004l[?2004h> '''            if not is_first:
+[?2004l[?2004h>                 _send_tensor(_grad_or_zeros(stage_inputs[mb], device, dtype), rank - 1)
+[?2004l[?2004h>         else:
+[?2004l[?2004h> ''',
+[?2004l[?2004h> '''            if not is_first:
+[?2004l[?2004h>                 _send_tensor(_grad_or_zeros(stage_inputs[mb], device, dtype).contiguous(), rank - 1)
+[?2004l[?2004h>         else:
+[?2004l[?2004h> ''')
+[?2004l[?2004h> s = s.replace(
+[?2004l[?2004h> '''            stage_outputs[mb].backward(grad)
+[?2004l[?2004h>             if not is_first:
+[?2004l[?2004h>                 _send_tensor(_grad_or_zeros(stage_inputs[mb], device, dtype), rank - 1)
+[?2004l[?2004h> ''',
+[?2004l[?2004h> '''            stage_outputs[mb].backward(grad)
+[?2004l[?2004h>             if not is_first:
+[?2004l[?2004h>                 _send_tensor(_grad_or_zeros(stage_inputs[mb], device, dtype).contiguous(), rank - 1)
+[?2004l[?2004h> ''')
+[?2004l[?2004h> 
+[?2004l[?2004h> # Ensure loss block is unshifted; do not double-shift if already unshifted.
+[?2004l[?2004h> if "shift_logits = logits[..., :-1, :]" in s:
+[?2004l[?2004h>     s = s.replace(
+[?2004l[?2004h> '''def _compute_loss(norm, lm_head, hidden, target, num_microbatches):
+[?2004l[?2004h>     features = hidden
+[?2004l[?2004h>     if norm is not None:
+[?2004l[?2004h>         features = norm(features)
+[?2004l[?2004h>     logits = lm_head(features)
+[?2004l[?2004h> 
+[?2004l[?2004h>     shift_logits = logits[..., :-1, :].contiguous()
+[?2004l[?2004h>     shift_target = target[..., 1:].contiguous()
+[?2004l[?2004h>     loss = F.cross_entropy(
+[?2004l[?2004h>         shift_logits.reshape(-1, shift_logits.size(-1)),
+[?2004l[?2004h>         shift_target.reshape(-1).to(shift_logits.device),
+[?2004l[?2004h>         ignore_index=-100,
+[?2004l[?2004h>         reduction="mean",
+[?2004l[?2004h>     )
+[?2004l[?2004h>     return loss / num_microbatches
+[?2004l[?2004h> ''',
+[?2004l[?2004h> '''def _compute_loss(norm, lm_head, hidden, target, num_microbatches):
+[?2004l[?2004h>     features = hidden
+[?2004l[?2004h>     if norm is not None:
+[?2004l[?2004h>         features = norm(features)
+[?2004l[?2004h>     logits = lm_head(features)
+[?2004l[?2004h> 
+[?2004l[?2004h>     loss = F.cross_entropy(
+[?2004l[?2004h>         logits.reshape(-1, logits.size(-1)),
+[?2004l[?2004h>         target.reshape(-1).to(logits.device),
+[?2004l[?2004h>         ignore_index=-100,
+[?2004l[?2004h>         reduction="mean",
+[?2004l[?2004h>     )
+[?2004l[?2004h>     return loss / num_microbatches
+[?2004l[?2004h> ''')
+[?2004l[?2004h> 
+[?2004l[?2004h> p.write_text(s)
+[?2004l[?2004h> print('final patch applied')
+[?2004l[?2004h> PY
+[?2004lfinal patch applied
+[?2004hroot@9921fa0bc759:/app# sed -n '1,260p' /app/pipeline_parallel.py
+[?2004limport inspect
+
+import torch
+import torch.distributed as dist
+import torch.nn.functional as F
+
+
+def _model_parts(model):
+    """Return (base, layers, norm, embed_tokens, lm_head, config)."""
+    base = getattr(model, "model", model)
+    layers = getattr(base, "layers", None)
+    if layers is None:
+        raise ValueError("Expected a LLaMA-like model with .model.layers or .layers")
+
+    norm = getattr(base, "norm", None)
+    embed_tokens = getattr(base, "embed_tokens", None) or getattr(model, "embed_tokens", None)
+    lm_head = getattr(model, "lm_head", None) or getattr(base, "lm_head", None)
+    config = getattr(model, "config", getattr(base, "config", None))
+    return base, layers, norm, embed_tokens, lm_head, config
+
+
+def _partition(num_layers, rank, world_size):
+    """Roughly balanced partition; remainder layers go to earlier ranks."""
+    q, r = divmod(num_layers, world_size)
+    start = rank * q + min(rank, r)
+    end = start + q + (1 if rank < r else 0)
+    return start, end
+
+
+def _hidden_size(config, embed_tokens, layers):
+    if config is not None and getattr(config, "hidden_size", None) is not None:
+        return int(config.hidden_size)
+    if embed_tokens is not None:
+        return int(embed_tokens.weight.shape[-1])
+    if len(layers) > 0:
+        q_proj = getattr(getattr(layers[0], "self_attn", None), "q_proj", None)
+        if q_proj is not None:
+            return int(q_proj.weight.shape[1])
+        gate_proj = getattr(getattr(layers[0], "mlp", None), "gate_proj", None)
+        if gate_proj is not None:
+            return int(gate_proj.weight.shape[1])
+    raise ValueError("Could not determine hidden_size")
+
+
+def _position_ids(seq_len, batch_size, device):
+    return torch.arange(seq_len, device=device, dtype=torch.long).unsqueeze(0).expand(batch_size, -1)
+
+
+def _cache_position(seq_len, device):
+    return torch.arange(seq_len, device=device, dtype=torch.long)
+
+
+def _causal_mask(batch_size, seq_len, dtype, device):
+    mask_dtype = dtype if dtype.is_floating_point else torch.float32
+    min_val = torch.finfo(mask_dtype).min
+    mask = torch.full((seq_len, seq_len), min_val, device=device, dtype=mask_dtype)
+    mask = torch.triu(mask, diagonal=1)
+    return mask.unsqueeze(0).unsqueeze(0).expand(batch_size, 1, seq_len, seq_len).contiguous()
+
+
+def _get_rotary_emb(base, layers):
+    rotary = getattr(base, "rotary_emb", None)
+    if rotary is None and len(layers) > 0:
+        rotary = getattr(getattr(layers[0], "self_attn", None), "rotary_emb", None)
+    return rotary
+
+
+def _needs_position_embeddings(layers, start, end):
+    for i in range(start, end):
+        try:
+            if "position_embeddings" in inspect.signature(layers[i].forward).parameters:
+                return True
+        except (ValueError, TypeError):
+            pass
+    return False
+
+
+def _compute_position_embeddings(rotary_emb, hidden, position_ids, cache_position):
+    if rotary_emb is None:
+        return None
+    forward = getattr(rotary_emb, "forward", rotary_emb)
+    try:
+        params = inspect.signature(forward).parameters
+    except (ValueError, TypeError):
+        params = {}
+    if "position_ids" in params:
+        return rotary_emb(hidden, position_ids)
+    if "cache_position" in params:
+        return rotary_emb(hidden, cache_position)
+    return rotary_emb(hidden, cache_position)
+
+
+def _call_layer(layer, hidden, position_ids, cache_position, attention_mask, position_embeddings):
+    sig = inspect.signature(layer.forward)
+    kw = {}
+    if "attention_mask" in sig.parameters:
+        kw["attention_mask"] = attention_mask
+    if "position_ids" in sig.parameters:
+        kw["position_ids"] = position_ids
+    if "past_key_value" in sig.parameters:
+        kw["past_key_value"] = None
+    if "use_cache" in sig.parameters:
+        kw["use_cache"] = False
+    if "output_attentions" in sig.parameters:
+        kw["output_attentions"] = False
+    if "output_router_logits" in sig.parameters:
+        kw["output_router_logits"] = False
+    if "cache_position" in sig.parameters:
+        kw["cache_position"] = cache_position
+    if "position_embeddings" in sig.parameters and position_embeddings is not None:
+        kw["position_embeddings"] = position_embeddings
+
+    out = layer(hidden, **kw)
+    return out[0] if isinstance(out, (tuple, list)) else out
+
+
+def _run_layer_range(layers, start, end, hidden, position_ids, cache_position, attention_mask, position_embeddings):
+    for i in range(start, end):
+        hidden = _call_layer(layers[i], hidden, position_ids, cache_position, attention_mask, position_embeddings)
+    return hidden.contiguous() if start < end else hidden
+
+
+def _send_tensor(tensor, peer):
+    if tensor is None:
+        return
+    send_tensor = tensor.contiguous()
+    reqs = dist.batch_isend_irecv([dist.P2POp(dist.isend, send_tensor, peer)])
+    for req in reqs:
+        req.wait()
+
+
+def _recv_tensor(shape, dtype, device, peer, requires_grad=False):
+    buf = torch.empty(shape, dtype=dtype, device=device)
+    reqs = dist.batch_isend_irecv([dist.P2POp(dist.irecv, buf, peer)])
+    for req in reqs:
+        req.wait()
+    if requires_grad:
+        buf.requires_grad_(True)
+    return buf
+
+
+def _grad_or_zeros(tensor, device, dtype):
+    grad = tensor.grad
+    if grad is None:
+        grad = torch.zeros_like(tensor)
+    return grad.to(device=device, dtype=dtype).contiguous()
+
+
+def _compute_loss(norm, lm_head, hidden, target, num_microbatches):
+    features = hidden
+    if norm is not None:
+        features = norm(features)
+    logits = lm_head(features)
+
+    loss = F.cross_entropy(
+        logits.reshape(-1, logits.size(-1)),
+        target.reshape(-1).to(logits.device),
+        ignore_index=-100,
+        reduction="mean",
+    )
+    return loss / num_microbatches
+
+
+def train_step_pipeline_afab(model, inputs, targets, device, dtype):
+    """Run one all-forward-all-backward pipeline-parallel training step.
+
+    Args:
+        model: LlamaForCausalLM instance.
+        inputs: list of input ID microbatch tensors.
+        targets: list of target ID microbatch tensors.
+        device: torch device.
+        dtype: torch dtype.
+    """
+    assert dist.is_available() and dist.is_initialized(), "torch.distributed must be initialized"
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    device = torch.device(device)
+
+    num_microbatches = len(inputs)
+    if num_microbatches == 0:
+        return None
+
+    base, layers, norm, embed_tokens, lm_head, config = _model_parts(model)
+    num_layers = len(layers)
+    start, end = _partition(num_layers, rank, world_size)
+
+    is_first = rank == 0
+    is_last = rank == world_size - 1
+    hidden_size = _hidden_size(config, embed_tokens, layers)
+
+    local_inputs = [t.to(device=device, dtype=torch.long) for t in inputs] if is_first else None
+    local_targets = [t.to(device=device, dtype=torch.long) for t in targets] if is_last else None
+
+    stage_inputs = []   # incoming leaf hidden / embedding output
+    stage_outputs = []  # stage output (hidden) or loss (last rank)
+
+    # ---- Forward all microbatches ----
+    for mb in range(num_microbatches):
+        if is_first:
+            ids = local_inputs[mb]
+            batch_size, seq_len = int(ids.shape[0]), int(ids.shape[1])
+            hidden = embed_tokens(ids).to(device=device, dtype=dtype)
+            stage_inputs.append(hidden)
+        else:
+            if inputs is not None and len(inputs) > mb and inputs[mb] is not None:
+                batch_size, seq_len = int(inputs[mb].shape[0]), int(inputs[mb].shape[1])
+            elif len(stage_inputs) > 0:
+                batch_size, seq_len = int(stage_inputs[-1].shape[0]), int(stage_inputs[-1].shape[1])
+            else:
+                batch_size, seq_len = 1, 1
+            shape = (batch_size, seq_len, hidden_size)
+            hidden = _recv_tensor(shape, dtype, device, rank - 1, requires_grad=True)
+            stage_inputs.append(hidden)
+            batch_size, seq_len = int(hidden.shape[0]), int(hidden.shape[1])
+
+        position_ids = _position_ids(seq_len, batch_size, device)
+        cache_position = _cache_position(seq_len, device)
+        attention_mask = _causal_mask(batch_size, seq_len, dtype, device)
+        if _needs_position_embeddings(layers, start, end):
+            rotary_emb = _get_rotary_emb(base, layers)
+            position_embeddings = _compute_position_embeddings(rotary_emb, hidden, position_ids, cache_position)
+        else:
+            position_embeddings = None
+
+        hidden = _run_layer_range(
+            layers, start, end, hidden, position_ids, cache_position, attention_mask, position_embeddings
+        )
+
+        if is_last:
+            loss = _compute_loss(norm, lm_head, hidden, local_targets[mb], num_microbatches)
+            stage_outputs.append(loss)
+        else:
+            hidden = hidden.to(device=device, dtype=dtype).contiguous()
+            stage_outputs.append(hidden)
+            _send_tensor(hidden.detach().to(device=device, dtype=dtype).contiguous(), rank + 1)
+
+    # ---- Backward all microbatches ----
+    for mb in range(num_microbatches):
+        if is_last:
+            loss = stage_outputs[mb]
+            loss.backward()
+            if not is_first:
+                _send_tensor(_grad_or_zeros(stage_inputs[mb], device, dtype).contiguous(), rank - 1)
+        else:
+            grad = _recv_tensor(stage_outputs[mb].shape, dtype, device, rank + 1)
+            stage_outputs[mb].backward(grad)
+            if not is_first:
+                _send_tensor(_grad_or_zeros(stage_inputs[mb], device, dtype).contiguous(), rank - 1)
+
+    return None
+[?2004hroot@9921fa0bc759:/app# python3 -m py_compile /app/pipeline_parallel.py && echo COMPILED_OK
+[?2004lCOMPILED_OK
+[?2004hroot@9921fa0bc759:/app# python3 - <<'PY'
+[?2004l[?2004h> from pathlib import Path
+[?2004l[?2004h> p = Path('/app/pipeline_parallel.py')
+[?2004l[?2004h> s = p.read_text()
+[?2004l[?2004h> 
+[?2004l[?2004h> # Ensure _run_layer_range returns a contiguous tensor when layers are run.
+[?2004l[?2004h> s = s.replace(
+[?2004l[?2004h> '''def _run_layer_range(layers, start, end, hidden, position_ids, cache_position, attention_mask, position_embeddings):
+[?2004l[?2004h>     for i in range(start, end):
+[?2004l[?2004h>         hidden = _call_layer(layers[i], hidden, position_ids, cache_position, attention_mask, position_embeddings)
+[?2004l[?2004h>     return hidden
+[?2004l[?2004h> ''',
+[?2004l[?2004h> '''def _run_layer_range(layers, start, end, hidden, position_ids, cache_position, attention_mask, position_embeddings):
+[?2004l[?2004h>     for i in range(start, end):
+[?2004l[?2004h>         hidden = _call_layer(layers[i], hidden, position_ids, cache_position, attention_mask, position_embeddings)
+[?2004l[?2004h>     return hidden.contiguous() if start < end else hidden
+[?2004l[?2004h> ''')
+[?2004l[?2004h> 
+[?2004l[?2004h> # Cache needs_position_embeddings once before the forward loop.
+[?2004l[?2004h> s = s.replace(
+[?2004l[?2004h> '''    local_inputs = [t.to(device=device, dtype=torch.long) for t in inputs] if is_first else None
+[?2004l[?2004h>     local_targets = [t.to(device=device, dtype=torch.long) for t in targets] if is_last else None
+[?2004l[?2004h> 
+[?2004l[?2004h>     stage_inputs = []   # incoming leaf hidden / embedding output
+[?2004l[?2004h> ''',
+[?2004l[?2004h> '''    local_inputs = [t.to(device=device, dtype=torch.long) for t in inputs] if is_first else None
+[?2004l[?2004h>     local_targets = [t.to(device=device, dtype=torch.long) for t in targets] if is_last else None
+[?2004l[?2004h>     needs_position_embeddings = _needs_position_embeddings(layers, start, end)
+[?2004l[?2004h> 
+[?2004l[?2004h>     stage_inputs = []   # incoming leaf hidden / embedding output
+[?2004l[?2004h> ''')
+[?2004l[?2004h> 
+[?2004l[?2004h> s = s.replace(
+[?2004l[?2004h> '''        if _needs_position_embeddings(layers, start, end):
+[?2004l[?2004h>             rotary_emb = _get_rotary_emb(base, layers)
+[?2004l[?2004h>             position_embeddings = _compute_position_embeddings(rotary_emb, hidden, position_ids, cache_position)
+[?2004l[?2004h>         else:
+[?2004l[?2004h>             position_embeddings = None
+[?2004l[?2004h> ''',
+[?2004l[?2004h> '''        if needs_position_embeddings:
+[?2004l[?2004h>             rotary_emb = _get_rotary_emb(base, layers)
+[?2004l[?2004h>             position_embeddings = _compute_position_embeddings(rotary_emb, hidden, position_ids, cache_position)
+[?2004l[?2004h>         else:
+[?2004l[?2004h>             position_embeddings = None
+[?2004l[?2004h> ''')
+[?2004l[?2004h> 
+[?2004l[?2004h> # Use standard causal LM shifted loss.
+[?2004l[?2004h> s = s.replace(
+[?2004l[?2004h> '''def _compute_loss(norm, lm_head, hidden, target, num_microbatches):
+[?2004l[?2004h>     features = hidden
+[?2004l[?2004h>     if norm is not None:
+[?2004l[?2004h>         features = norm(features)
+[?2004l[?2004h>     logits = lm_head(features)
+[?2004l[?2004h> 
+[?2004l[?2004h>     loss = F.cross_entropy(
+[?2004l[?2004h>         logits.reshape(-1, logits.size(-1)),
+[?2004l[?2004h>         target.reshape(-1).to(logits.device),
+[?2004l[?2004h>         ignore_index=-100,
+[?2004l[?2004h>         reduction="mean",
+[?2004l[?2004h>     )
+[?2004l[?2004h>     return loss / num_microbatches
+[?2004l[?2004h> ''',
+[?2004l[?2004h> '''def _compute_loss(norm, lm_head, hidden, target, num_microbatches):
+[?2004l[?2004h>     features = hidden
+[?2004l[?2004h>     if norm is not None:
+[?2004l[?2004h>         features = norm(features)
+[?2004l[?2004h>     logits = lm_head(features)
+[?2004l[?2004h> 
+[?2004l[?2004h>     shift_logits = logits[..., :-1, :].contiguous()
+[?2004l[?2004h>     shift_target = target[..., 1:].contiguous()
+[?2004l[?2004h>     loss = F.cross_entropy(
+[?2004l[?2004h>         shift_logits.reshape(-1, shift_logits.size(-1)),
+[?2004l[?2004h>         shift_target.reshape(-1).to(shift_logits.device),
+[?2004l[?2004h>         ignore_index=-100,
+[?2004l[?2004h>         reduction="mean",
+[?2004l[?2004h>     )
+[?2004l[?2004h>     return loss / num_microbatches
+[?2004l[?2004h> ''')
+[?2004l[?2004h> 
+[?2004l[?2004h> p.write_text(s)
+[?2004l[?2004h> print('final patched')
+[?2004l[?2004h> PY
+[?2004lfinal patched
+[?2004hroot@9921fa0bc759:/app# sed -n '/def _run_layer_range/,/return hidden/p' /app/pipeline_parallel.py; sed -n '/def _compute_loss/,/return loss \/ num_microbatches//p' /app/pipeline_parallel.py; grep -n 'needs_position_embeddings' /app/pipeline_parallel.py
+[?2004ldef _run_layer_range(layers, start, end, hidden, position_ids, cache_position, attention_mask, position_embeddings):
+    for i in range(start, end):
+        hidden = _call_layer(layers[i], hidden, position_ids, cache_position, attention_mask, position_embeddings)
+    return hidden.contiguous() if start < end else hidden
+def _compute_loss(norm, lm_head, hidden, target, num_microbatches):
+    features = hidden
+    if norm is not None:
+        features = norm(features)
+    logits = lm_head(features)
+
+    shift_logits = logits[..., :-1, :].contiguous()
+    shift_target = target[..., 1:].contiguous()
+    loss = F.cross_entropy(
+        shift_logits.reshape(-1, shift_logits.size(-1)),
+        shift_target.reshape(-1).to(shift_logits.device),
+        ignore_index=-100,
+        reduction="mean",
+    )
+    return loss / num_microbatches
+[32m[K68[m[K[36m[K:[m[Kdef _[01;31m[Kneeds_position_embeddings[m[K(layers, start, end):
+[32m[K195[m[K[36m[K:[m[K    [01;31m[Kneeds_position_embeddings[m[K = _[01;31m[Kneeds_position_embeddings[m[K(layers, start, end)
+[32m[K222[m[K[36m[K:[m[K        if [01;31m[Kneeds_position_embeddings[m[K:
+[?2004hroot@9921fa0bc759:/app# python3 -m py_compile /app/pipeline_parallel.py && echo COMPILED_OK
+[?2004lCOMPILED_OK
+[?2004hroot@9921fa0bc759:/app# python3 - <<'PY'
+[?2004l[?2004h> from pathlib import Path
+[?2004l[?2004h> p = Path('/app/pipeline_parallel.py')
+[?2004l[?2004h> s = p.read_text()
+[?2004l[?2004h> old = '''def _compute_loss(norm, lm_head, hidden, target, num_microbatches):
+[?2004l[?2004h>     features = hidden
+[?2004l[?2004h>     if norm is not None:
+[?2004l[?2004h>         features = norm(features)
+[?2004l[?2004h>     logits = lm_head(features)
+[?2004l[?2004h> 
+[?2004l[?2004h>     shift_logits = logits[..., :-1, :].contiguous()
+[?2004l[?2004h>     shift_target = target[..., 1:].contiguous()
+[?2004l[?2004h>     loss = F.cross_entropy(
+[?2004l[?2004h>         shift_logits.reshape(-1, shift_logits.size(-1)),
+[?2004l[?2004h>         shift_target.reshape(-1).to(shift_logits.device),
+[?2004l[?2004h>         ignore_index=-100,
+[?2004l[?2004h>         reduction="mean",
+[?2004l[?2004h>     )
+[?2004l[?2004h>     return loss / num_microbatches
+[?2004l[?2004h> '''
+[?2004l[?2004h> new = '''def _compute_loss(norm, lm_head, hidden, target, num_microbatches):
+[?2004l[?2004h>     features = hidden
+[?2004l[?2004h>     if norm is not None:
+[?2004l[?2004h>         features = norm(features)
+[?2004l[?2004h>     logits = lm_head(features)
+[?2004l[?2004h> 
+[?2004l[?2004h>     loss = F.cross_entropy(
+[?2004l[?2004h>         logits.reshape(-1, logits.size(-1)),
+[?2004l[?2004h>         target.reshape(-1).to(logits.device),
+[?2004l[?2004h>         ignore_index=-100,
+[?2004l[?2004h>         reduction="mean",
+[?2004l[?2004h>     )
+[?2004l[?2004h>     return loss / num_microbatches
+[?2004l[?2004h> '''
+[?2004l[?2004h> if old not in s:
+[?2004l[?2004h>     print('shifted loss block not found; leaving file unchanged')
+[?2004l[?2004h> else:
+[?2004l[?2004h>     p.write_text(s.replace(old, new))
+[?2004l[?2004h>     print('patched loss to unshifted target alignment')
+[?2004l[?2004h> PY
+[?2004lpatched loss to unshifted target alignment
+[?2004hroot@9921fa0bc759:/app# sed -n '/def _compute_loss/,/return loss \/ num_microbatches/p' /app/pipeline_parallel.py
+[?2004ldef _compute_loss(norm, lm_head, hidden, target, num_microbatches):
+    features = hidden
+    if norm is not None:
+        features = norm(features)
+    logits = lm_head(features)
+
+    loss = F.cross_entropy(
+        logits.reshape(-1, logits.size(-1)),
+        target.reshape(-1).to(logits.device),
+        ignore_index=-100,
+        reduction="mean",
+    )
+    return loss / num_microbatches
+[?2004hroot@9921fa0bc759:/app# python3 -m py_compile /app/pipeline_parallel.py && echo COMPILED_OK
+[?2004lCOMPILED_OK
+[?2004hroot@9921fa0bc759:/app# python3 - <<'PY'
+[?2004l[?2004h> from pathlib import Path
+[?2004l[?2004h> p = Path('/app/pipeline_parallel.py')
+[?2004l[?2004h> s = p.read_text()
+[?2004l[?2004h> s = s.replace(
+[?2004l[?2004h> '''    if "position_ids" in params:
+[?2004l[?2004h>         return rotary_emb(hidden, position_ids)
+[?2004l[?2004h>     if "cache_position" in params:
+[?2004l[?2004h>         return rotary_emb(hidden, cache_position)
+[?2004l[?2004h>     return rotary_emb(hidden, cache_position)
+[?2004l[?2004h> ''',
+[?2004l[?2004h> '''    if "position_ids" in params:
+[?2004l[?2004h>         return rotary_emb(hidden, position_ids=position_ids)
+[?2004l[?2004h>     if "cache_position" in params:
+[?2004l[?2004h>         return rotary_emb(hidden, cache_position=cache_position)
+[?2004l[?2004h>     return rotary_emb(hidden, cache_position=cache_position)
+[?2004l[?2004h> ''')
+[?2004l[?2004h> p.write_text(s)
+[?2004l[?2004h> print('patched rotary_emb calls to use keyword arguments')
+[?2004l[?2004h> PY
+[?2004lpatched rotary_emb calls to use keyword arguments
+[?2004hroot@9921fa0bc759:/app# sed -n '/def _compute_position_embeddings/,/return rotary_emb/p' /app/pipeline_parallel.py
+[?2004ldef _compute_position_embeddings(rotary_emb, hidden, position_ids, cache_position):
+    if rotary_emb is None:
+        return None
+    forward = getattr(rotary_emb, "forward", rotary_emb)
+    try:
+        params = inspect.signature(forward).parameters
+    except (ValueError, TypeError):
+        params = {}
+    if "position_ids" in params:
+        return rotary_emb(hidden, position_ids=position_ids)
+[?2004hroot@9921fa0bc759:/app# python3 -m py_compile /app/pipeline_parallel.py && echo COMPILED_OK
+[?2004lCOMPILED_OK
+[?2004hroot@9921fa0bc759:/app# 
