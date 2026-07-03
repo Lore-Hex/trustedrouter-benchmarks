@@ -84,6 +84,9 @@ patch_test_sh() {
       s#source "/\.local/bin/env"#source "\$HOME/.local/bin/env"#g;
     ' "$test_sh"
     perl -0pi -e '
+      s/\nfi[ \t]+gcc\n/\nfi\nif ! command -v gcc >\/dev\/null 2>\&1; then\n    mkdir -p \/etc\/apt\/apt.conf.d\n    printf '\''Acquire::Retries "5";\\nAcquire::http::Timeout "20";\\nAcquire::https::Timeout "20";\\nAcquire::ForceIPv4 "true";\\n'\'' > \/etc\/apt\/apt.conf.d\/80-local-verifier-retries\n    apt-get update\n    apt-get install -y --no-install-recommends gcc libc6-dev\nfi\n/s;
+    ' "$test_sh"
+    perl -0pi -e '
       s/# Install gcc \(needed for compiling FEAL C extension in tests\)\napt install -y gcc/# Install gcc only if the patched image does not already provide it.\nif ! command -v gcc >\/dev\/null 2>\&1; then\n    mkdir -p \/etc\/apt\/apt.conf.d\n    printf '\''Acquire::Retries "5";\\nAcquire::http::Timeout "20";\\nAcquire::https::Timeout "20";\\nAcquire::ForceIPv4 "true";\\n'\'' > \/etc\/apt\/apt.conf.d\/80-local-verifier-retries\n    apt-get update\n    apt-get install -y --no-install-recommends gcc libc6-dev\nfi/s;
       s/# Install gcc \(needed for compiling FEAL C extension in tests\)\napt-get install -y gcc/# Install gcc only if the patched image does not already provide it.\nif ! command -v gcc >\/dev\/null 2>\&1; then\n    mkdir -p \/etc\/apt\/apt.conf.d\n    printf '\''Acquire::Retries "5";\\nAcquire::http::Timeout "20";\\nAcquire::https::Timeout "20";\\nAcquire::ForceIPv4 "true";\\n'\'' > \/etc\/apt\/apt.conf.d\/80-local-verifier-retries\n    apt-get update\n    apt-get install -y --no-install-recommends gcc libc6-dev\nfi/s;
     ' "$test_sh"
@@ -91,8 +94,8 @@ patch_test_sh() {
   fi
 
   perl -0pi -e '
-    s/# Install curl\napt-get update\napt-get install -y curl/'"$test_marker"'\n# Install curl only if the image does not already provide it.\nexport PATH="\$HOME\/.local\/bin:\$PATH"\nif ! command -v curl >\/dev\/null 2>\&1; then\n    mkdir -p \/etc\/apt\/apt.conf.d\n    printf '\''Acquire::Retries "5";\\nAcquire::http::Timeout "20";\\nAcquire::https::Timeout "20";\\nAcquire::ForceIPv4 "true";\\n'\'' > \/etc\/apt\/apt.conf.d\/80-local-verifier-retries\n    apt-get update\n    apt-get install -y curl\nfi/s;
-    s/# Install uv\ncurl -LsSf https:\/\/astral\.sh\/uv\/0\.7\.13\/install\.sh \| sh\n\n?source \$HOME\/\.local\/bin\/env/# Install uv only if the image does not already provide it.\nif ! command -v uv >\/dev\/null 2>\&1; then\n    curl --connect-timeout 20 --max-time 120 -LsSf https:\/\/astral.sh\/uv\/0.7.13\/install.sh | sh\nfi\nif [ -f "\$HOME\/.local\/bin\/env" ]; then\n    source "\$HOME\/.local\/bin\/env"\nfi\nexport PATH="\$HOME\/.local\/bin:\$PATH"/s;
+    s/# Install curl\napt-get update\napt-get install -y curl[^\n]*/'"$test_marker"'\n# Install curl only if the image does not already provide it.\nexport PATH="\$HOME\/.local\/bin:\$PATH"\nif ! command -v curl >\/dev\/null 2>\&1; then\n    mkdir -p \/etc\/apt\/apt.conf.d\n    printf '\''Acquire::Retries "5";\\nAcquire::http::Timeout "20";\\nAcquire::https::Timeout "20";\\nAcquire::ForceIPv4 "true";\\n'\'' > \/etc\/apt\/apt.conf.d\/80-local-verifier-retries\n    apt-get update\n    apt-get install -y curl\nfi/s;
+    s/# Install uv\ncurl -LsSf https:\/\/astral\.sh\/uv\/[^\/]+\/install\.sh \| sh\n\n?source \$HOME\/\.local\/bin\/env/# Install uv only if the image does not already provide it.\nif ! command -v uv >\/dev\/null 2>\&1; then\n    curl --connect-timeout 20 --max-time 120 -LsSf https:\/\/astral.sh\/uv\/'"$uv_version"'\/install.sh | sh\nfi\nif [ -f "\$HOME\/.local\/bin\/env" ]; then\n    source "\$HOME\/.local\/bin\/env"\nfi\nexport PATH="\$HOME\/.local\/bin:\$PATH"/s;
   ' "$test_sh"
 
   perl -0pi -e '
