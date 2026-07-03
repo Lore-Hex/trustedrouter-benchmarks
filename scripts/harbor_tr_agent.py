@@ -43,6 +43,7 @@ TERMINUS_CONTROL_KEY_SPEC_TEXT = (
 TERMINUS_CONTROL_KEY_SPEC_TEMPLATE = TERMINUS_CONTROL_KEY_SPEC_TEXT.replace(
     "{", "{{"
 ).replace("}", "}}")
+TMUX_CONTROL_KEYS = {"C-c", "C-d", "C-z", "C-l"}
 
 
 def _patch_terminus_prompt_template(template: str) -> str:
@@ -185,6 +186,21 @@ def _as_optional_float(value: Any) -> float | None:
     if value is None or value == "":
         return None
     return float(value)
+
+
+def _normalize_tmux_keys(keys: str | list[str]) -> str | list[str]:
+    """Treat newline-suffixed symbolic keys as tmux key tokens."""
+    if isinstance(keys, str):
+        stripped = keys.strip()
+        if stripped in TMUX_CONTROL_KEYS:
+            return [stripped]
+        return keys
+
+    normalized: list[str] = []
+    for key in keys:
+        stripped = key.strip()
+        normalized.append(stripped if stripped in TMUX_CONTROL_KEYS else key)
+    return normalized
 
 
 def _chunk_text(chunk: dict[str, Any]) -> str:
@@ -500,7 +516,10 @@ class TrustedRouterHarborLLM(BaseLLM):
         **kwargs: Any,
     ) -> LLMResponse:
         messages = [
-            {"role": m.get("role", "user"), "content": _content_to_str(m.get("content"))}
+            {
+                "role": m.get("role", "user"),
+                "content": _content_to_str(m.get("content")),
+            }
             for m in (message_history or [])
         ]
         prompt = _ensure_control_key_spec(prompt, messages)
@@ -770,8 +789,167 @@ class TrustedRouterHarborLLM(BaseLLM):
         return self._output_limit
 
 
+class ReplayThenLiveLLM(BaseLLM):
+    """Replay saved call responses, then delegate subsequent calls to TrustedRouter."""
+
+    def __init__(
+        self,
+        *,
+        replay_calls_dir: Path,
+        replay_until_call: int,
+        live_llm: TrustedRouterHarborLLM,
+        logs_dir: Path,
+        max_tokens: int,
+    ):
+        super().__init__()
+        self._replay_calls_dir = replay_calls_dir
+        self._live_llm = live_llm
+        self._logs_dir = logs_dir
+        self._calls_dir = logs_dir / "trustedrouter-calls"
+        self._max_tokens = max_tokens
+        self._next_replay_call = 1
+        self._replay_paths = [
+            replay_calls_dir / f"call-{call_id:04d}.response.json"
+            for call_id in range(1, replay_until_call + 1)
+        ]
+        missing = [str(path) for path in self._replay_paths if not path.exists()]
+        if missing:
+            raise FileNotFoundError(
+                "Missing replay response files: " + ", ".join(missing[:5])
+            )
+        self._live_llm._call_index = replay_until_call
+
+    async def call(
+        self,
+        prompt: str,
+        message_history: list[dict[str, Any]] | None = None,
+        logging_path: Path | None = None,
+        **kwargs: Any,
+    ) -> LLMResponse:
+        if self._next_replay_call > len(self._replay_paths):
+            return await self._live_llm.call(
+                prompt,
+                message_history=message_history,
+                logging_path=logging_path,
+                **kwargs,
+            )
+
+        call_id = self._next_replay_call
+        self._next_replay_call += 1
+        source_path = self._replay_paths[call_id - 1]
+        dumped = json.loads(source_path.read_text())
+        content = _message_content(dumped)
+        message = ((dumped.get("choices") or [{}])[0].get("message") or {})
+        reasoning_content = message.get("reasoning_content")
+        started_at = datetime.now(UTC).isoformat()
+
+        messages = [
+            {"role": m.get("role", "user"), "content": _content_to_str(m.get("content"))}
+            for m in (message_history or [])
+        ]
+        messages.append({"role": "user", "content": prompt})
+
+        request_path = self._calls_dir / f"call-{call_id:04d}.request.json"
+        response_path = self._calls_dir / f"call-{call_id:04d}.response.json"
+        meta_path = self._calls_dir / f"call-{call_id:04d}.meta.json"
+        manifest_path = self._calls_dir / "manifest.jsonl"
+        replayed_response = json.loads(json.dumps(dumped, default=str))
+        replayed_response["usage"] = {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "cache_tokens": 0,
+            "cost_microdollars": 0,
+        }
+        replayed_response["replayed_from"] = str(source_path)
+
+        _write_json(
+            request_path,
+            {
+                "model": self._live_llm._model,
+                "messages": messages,
+                "max_tokens": self._max_tokens,
+            },
+        )
+        _write_json(response_path, replayed_response)
+        _write_json(
+            meta_path,
+            {
+                "started_at": started_at,
+                "elapsed_ms": 0,
+                "model": self._live_llm._model,
+                "base_url": self._live_llm._base_url,
+                "max_tokens": self._max_tokens,
+                "message_count": len(messages),
+                "message_chars": sum(len(m["content"]) for m in messages),
+                "response_id": dumped.get("id"),
+                "response_model": dumped.get("model"),
+                "content_chars": len(content),
+                "usage": replayed_response["usage"],
+                "replayed_from": str(source_path),
+                "request_path": request_path.name,
+                "full_response_path": response_path.name,
+            },
+        )
+        _append_jsonl(
+            manifest_path,
+            {
+                "event": "replayed",
+                "call_id": call_id,
+                "started_at": started_at,
+                "model": self._live_llm._model,
+                "base_url": self._live_llm._base_url,
+                "message_count": len(messages),
+                "message_chars": sum(len(m["content"]) for m in messages),
+                "response_id": dumped.get("id"),
+                "response_model": dumped.get("model"),
+                "content_chars": len(content),
+                "usage": replayed_response["usage"],
+                "replayed_from": str(source_path),
+                "request_path": request_path.name,
+                "response_path": response_path.name,
+                "meta_path": meta_path.name,
+            },
+        )
+        if logging_path is not None:
+            _write_json(
+                logging_path,
+                {
+                    "model": self._live_llm._model,
+                    "base_url": self._live_llm._base_url,
+                    "message_count": len(messages),
+                    "message_chars": sum(len(m["content"]) for m in messages),
+                    "content_chars": len(content),
+                    "usage": replayed_response["usage"],
+                    "replayed_from": str(source_path),
+                    "full_response_path": str(response_path),
+                },
+            )
+
+        return LLMResponse(
+            content=content,
+            reasoning_content=reasoning_content,
+            model_name=dumped.get("model") or self._live_llm._model,
+            usage=UsageInfo(
+                prompt_tokens=0,
+                completion_tokens=0,
+                cache_tokens=0,
+                cost_usd=0,
+            ),
+            response_id=dumped.get("id"),
+        )
+
+    def get_model_context_limit(self) -> int:
+        return self._live_llm.get_model_context_limit()
+
+    def get_model_output_limit(self) -> int | None:
+        return self._live_llm.get_model_output_limit()
+
+
 class DirectAptTmuxSession(TmuxSession):
     """TmuxSession that avoids apt-get update when package lists are already present."""
+
+    async def send_keys(self, keys: str | list[str], *args: Any, **kwargs: Any):
+        return await super().send_keys(_normalize_tmux_keys(keys), *args, **kwargs)
 
     def _get_combined_install_command(
         self, system_info: dict[str, Any], tools: list[str]
@@ -818,13 +996,15 @@ class TRHarborTerminus(Terminus2):
         request_timeout: float | str | None = None,
         request_retries: int | str | None = None,
         stream: bool = True,
+        replay_calls_dir: str | None = None,
+        replay_until_call: int | str | None = None,
         **kwargs: Any,
     ):
         if model_name is None:
             raise ValueError("model_name is required")
         super().__init__(logs_dir=logs_dir, model_name=model_name, **kwargs)
         self._prompt_template = _patch_terminus_prompt_template(self._prompt_template)
-        self._llm = TrustedRouterHarborLLM(
+        live_llm = TrustedRouterHarborLLM(
             model=model_name,
             logs_dir=logs_dir,
             temperature=self._temperature,
@@ -845,6 +1025,21 @@ class TRHarborTerminus(Terminus2):
             request_retries=request_retries,
             stream=stream,
         )
+        if replay_calls_dir:
+            replay_until = int(replay_until_call or 0)
+            if replay_until <= 0:
+                raise ValueError(
+                    "replay_until_call must be positive when replay_calls_dir is set"
+                )
+            self._llm = ReplayThenLiveLLM(
+                replay_calls_dir=Path(replay_calls_dir),
+                replay_until_call=replay_until,
+                live_llm=live_llm,
+                logs_dir=logs_dir,
+                max_tokens=int(max_tokens),
+            )
+        else:
+            self._llm = live_llm
 
     async def setup(self, environment: BaseEnvironment) -> None:
         if self._record_terminal_session:
