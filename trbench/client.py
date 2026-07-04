@@ -15,6 +15,7 @@ import json
 import os
 import time
 import urllib.request
+from pathlib import Path
 from typing import Any
 
 from trustedrouter import TrustedRouter
@@ -30,9 +31,33 @@ _API_KEY_ENV = (
 )
 
 
+def _load_dotenv_if_needed() -> None:
+    if any(os.environ.get(name) for name in _API_KEY_ENV):
+        return
+
+    candidates = [
+        Path.cwd() / ".env",
+        Path(__file__).resolve().parents[1] / ".env",
+    ]
+    for path in candidates:
+        if not path.exists():
+            continue
+        for raw_line in path.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            if key in _API_KEY_ENV and not os.environ.get(key):
+                os.environ[key] = value.strip().strip("\"'")
+        if any(os.environ.get(name) for name in _API_KEY_ENV):
+            return
+
+
 def api_key_from_env(explicit: str | None = None) -> str:
     if explicit:
         return explicit
+    _load_dotenv_if_needed()
     for name in _API_KEY_ENV:
         value = os.environ.get(name)
         if value:
@@ -72,6 +97,14 @@ def extract_text(data: dict[str, Any]) -> str:
     return ""
 
 
+def extract_finish_reason(data: dict[str, Any]) -> str | None:
+    choices = data.get("choices")
+    if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+        reason = choices[0].get("finish_reason")
+        return str(reason) if reason is not None else None
+    return None
+
+
 # One SDK client per (base_url, api_key, timeout); httpx.Client is safe to share
 # across the worker threads, and reuse keeps connection pooling.
 _clients: dict[tuple[str, str, float], TrustedRouter] = {}
@@ -95,13 +128,14 @@ def chat(
     model: str,
     messages: list[dict[str, str]],
     max_tokens: int = 1536,
-    temperature: float = 0.0,
+    temperature: float | None = 0.0,
     timeout: float = 120.0,
     extra_body: dict[str, Any] | None = None,
     tools: list[dict[str, Any]] | None = None,
     tool_choice: Any | None = None,
     retries: int = DEFAULT_RETRIES,
     retry_backoff: float = 1.5,
+    use_request: bool = False,
 ) -> dict[str, Any]:
     """One chat completion via the TrustedRouter SDK. Returns {text, tool_calls?,
     usage, latency_ms} or {error}. Transient failures retry; 4xx (other than 429)
@@ -113,7 +147,9 @@ def chat(
     The plain text path keeps `chat_completions()` (streaming tolerates the long
     outputs that reasoning models produce). Both share this retry policy."""
     started = time.monotonic()
-    params: dict[str, Any] = {"temperature": temperature, "max_tokens": max_tokens}
+    params: dict[str, Any] = {"max_tokens": max_tokens}
+    if temperature is not None:
+        params["temperature"] = temperature
     if extra_body:
         params.update(extra_body)
     # Pin the upstream provider for the whole run via env (e.g. route every
@@ -128,8 +164,10 @@ def chat(
     last_error = "unknown"
     for attempt in range(retries + 1):
         try:
-            if tools is not None:
-                body: dict[str, Any] = {"model": model, "messages": messages, "tools": tools, **params}
+            if tools is not None or use_request:
+                body: dict[str, Any] = {"model": model, "messages": messages, **params}
+                if tools is not None:
+                    body["tools"] = tools
                 if tool_choice is not None:
                     body["tool_choice"] = tool_choice
                 data = cli.request("POST", "/chat/completions", json=body)
@@ -138,9 +176,17 @@ def chat(
             result = {
                 "text": extract_text(data),
                 "usage": data.get("usage") if isinstance(data.get("usage"), dict) else {},
+                "finish_reason": extract_finish_reason(data),
                 "latency_ms": round((time.monotonic() - started) * 1000),
                 "attempts": attempt + 1,
             }
+            if not result["text"]:
+                usage = result["usage"]
+                completion_tokens = usage.get("completion_tokens") if isinstance(usage, dict) else None
+                if isinstance(completion_tokens, int) and completion_tokens >= max_tokens:
+                    result["empty_reason"] = "completion_token_budget_exhausted"
+                else:
+                    result["empty_reason"] = "empty_visible_content"
             calls = extract_tool_calls(data)
             if calls is not None:
                 result["tool_calls"] = calls

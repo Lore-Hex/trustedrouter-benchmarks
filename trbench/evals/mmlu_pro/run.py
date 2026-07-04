@@ -13,6 +13,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import UTC, datetime
 from pathlib import Path
 
+from trbench import adapters
 from trbench import client
 from trbench.evals.mmlu_pro.loader import format_options, load
 from trbench.panel import resolve_panel
@@ -32,6 +33,8 @@ def run_model(
     api_key: str,
     max_tokens: int,
     timeout: float,
+    temperature: float | None,
+    extra_body: dict | None,
     concurrency: int,
 ) -> list[dict]:
     def one(item: dict) -> dict:
@@ -42,8 +45,9 @@ def run_model(
             model=model,
             messages=[{"role": "user", "content": prompt}],
             max_tokens=max_tokens,
-            temperature=0.0,
+            temperature=temperature,
             timeout=timeout,
+            extra_body=extra_body,
         )
         # Carry the option count so the scorer knows the valid letter range.
         row = {"model": model, "id": item["id"], "answer": item["answer"],
@@ -73,20 +77,36 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--timeout", type=float, default=180.0)
     parser.add_argument("--concurrency", type=int, default=8)
     parser.add_argument("--prompt-limit", type=int, default=None, help="Use only the first N questions.")
+    parser.add_argument("--adapter-file", default=None, help="JSON model adapter recommendations.")
     parser.add_argument("--out", default="results/mmlu_pro.json")
     args = parser.parse_args(argv)
 
     api_key = client.api_key_from_env(args.api_key)
     models = resolve_panel(args.models)
+    adapter_specs = adapters.load_adapter_file(args.adapter_file)
     items = load(limit=args.prompt_limit)
 
     responses: list[dict] = []
     for model in models:
-        print(f"running mmlu_pro: {model} ({len(items)} questions)")
+        adapter = adapters.adapter_for(
+            model,
+            adapter_specs,
+            default_max_tokens=args.max_tokens,
+            default_timeout=args.timeout,
+        )
+        print(
+            f"running mmlu_pro: {model} ({len(items)} questions, "
+            f"max_tokens={adapter.max_tokens}, timeout={adapter.timeout}, "
+            f"temperature={'omitted' if adapter.temperature is None else adapter.temperature})"
+        )
         responses.extend(
             run_model(
                 model, items, base_url=args.base_url, api_key=api_key,
-                max_tokens=args.max_tokens, timeout=args.timeout, concurrency=args.concurrency,
+                max_tokens=adapter.max_tokens or args.max_tokens,
+                timeout=adapter.timeout or args.timeout,
+                temperature=adapter.temperature,
+                extra_body=adapter.extra_body,
+                concurrency=args.concurrency,
             )
         )
 
@@ -96,6 +116,8 @@ def main(argv: list[str] | None = None) -> int:
         "created_at": datetime.now(UTC).isoformat(),
         "base_url_host": urllib.parse.urlparse(args.base_url).netloc,
         "models": models,
+        "adapter_file": args.adapter_file,
+        "adapter_settings": {m: adapters.public_adapter_settings(m, adapter_specs) for m in models},
         "item_count": len(items),
         "responses": sorted(responses, key=lambda r: (r["model"], r["id"])),
     }

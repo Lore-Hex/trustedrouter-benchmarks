@@ -50,6 +50,47 @@ def _sdk() -> TrustedRouter:
     return _client
 
 
+def _env_int(name: str) -> int | None:
+    value = os.environ.get(name)
+    if not value:
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        return None
+
+
+def _env_float(name: str) -> float | None:
+    value = os.environ.get(name)
+    if not value:
+        return None
+    try:
+        return float(value)
+    except ValueError:
+        return None
+
+
+def _provider_filter() -> dict[str, list[str]] | None:
+    provider = os.environ.get("TRBENCH_PROVIDER")
+    if not provider:
+        return None
+    providers = [p.strip() for p in provider.split(",") if p.strip()]
+    return {"only": providers} if providers else None
+
+
+def _api_model_name(model: str) -> str:
+    # LiteLLM strips the custom provider prefix before invoking the handler:
+    # `trustedrouter/socrates-1.1` arrives as `socrates-1.1`, but TR-native
+    # combo model ids keep the `trustedrouter/` namespace at the API layer.
+    # Vendor-style ids such as `openai/gpt-4.1` and `z-ai/glm-5` already have
+    # a slash and should pass through unchanged.
+    if model == "synth":
+        return "trustedrouter/synth"
+    if "/" not in model:
+        return f"trustedrouter/{model}"
+    return model
+
+
 def _write_call_log(*, started_at: str, latency_ms: float, body: dict[str, Any], data: dict[str, Any]) -> None:
     log_dir = os.environ.get("TRBENCH_LITELLM_LOG_DIR")
     if not log_dir:
@@ -94,20 +135,23 @@ class TrustedRouterSDKLLM(CustomLLM):
     def completion(self, model: str, messages: list, *args: Any, **kwargs: Any) -> ModelResponse:
         model_response: ModelResponse = kwargs.get("model_response") or (args[3] if len(args) > 3 else ModelResponse())
         optional_params: dict = kwargs.get("optional_params") or (args[8] if len(args) > 8 else {})
-        # LiteLLM strips the custom provider prefix before invoking the handler:
-        # `trustedrouter/socrates-1.1` arrives as `socrates-1.1`, but TR-native
-        # combo model ids keep the `trustedrouter/` namespace at the API layer.
-        # Vendor-style ids such as `openai/gpt-4.1` and `z-ai/glm-5` already have
-        # a slash and should pass through unchanged.
-        if "/" not in model:
-            model = f"trustedrouter/{model}"
+        api_model = _api_model_name(model)
 
-        body: dict[str, Any] = {"model": model, "messages": messages}
+        body: dict[str, Any] = {"model": api_model, "messages": messages}
         for k in _PASSTHROUGH:
             if optional_params.get(k) is not None:
                 body[k] = optional_params[k]
+        max_tokens = _env_int("TRBENCH_MAX_TOKENS")
+        if max_tokens is not None and "max_tokens" not in body:
+            body["max_tokens"] = max_tokens
+        temperature = _env_float("TRBENCH_TEMPERATURE")
+        if temperature is not None:
+            body["temperature"] = temperature
         if optional_params.get("tools"):
             body["tools"] = optional_params["tools"]
+        provider = _provider_filter()
+        if provider and "provider" not in body:
+            body["provider"] = provider
 
         # Direct POST via the SDK client (preserves tool_calls, which the SDK's
         # streaming chat_completions assembly drops).
@@ -131,7 +175,7 @@ class TrustedRouterSDKLLM(CustomLLM):
         model_response.choices = [
             Choices(index=0, message=message, finish_reason=choice.get("finish_reason") or "stop")
         ]
-        model_response.model = model
+        model_response.model = api_model
         usage = data.get("usage") or {}
         model_response.usage = Usage(
             prompt_tokens=usage.get("prompt_tokens", 0),
