@@ -2,7 +2,7 @@
 
 Run example:
 
-  TB_TR_CONFIRM=1 PYTHONPATH=scripts uvx --from harbor --with trusted-router-py harbor run \
+  TB_TR_CONFIRM=1 PYTHONPATH=scripts uvx --from harbor --with trustedrouter harbor run \
     -d terminal-bench/terminal-bench-2-1 \
     --agent-import-path harbor_tr_agent:TRHarborTerminus \
     -m trustedrouter/synth \
