@@ -41,7 +41,7 @@ for task in "${tasks[@]}"; do
   job="synth-v21h3x-sprompt-${safe_task}-${JOB_SUFFIX}"
 
   printf "[%s] START %s job=%s\n" "$started" "$task" "$job"
-  TB_TR_CONFIRM=1 PYTHONPATH=scripts /opt/homebrew/bin/uvx --from harbor --with trusted-router-py harbor run \
+  TB_TR_CONFIRM=1 PYTHONPATH=scripts /opt/homebrew/bin/uvx --from harbor --with trustedrouter harbor run \
     --path /tmp/tb21/tasks \
     --agent-import-path harbor_tr_agent:TRHarborTerminus \
     -m trustedrouter/synth \

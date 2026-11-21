@@ -1,7 +1,7 @@
 """TrustedRouter gateway client for the benchmarks.
 
 Every gateway (inference) call goes through the official TrustedRouter Python
-SDK (`trusted-router-py`) — the same shipped client the SDKs and PrometheusBench
+SDK (`trustedrouter`) — the same shipped client the SDKs and PrometheusBench
 use — so the harness exercises the real client path. The thin `chat()` wrapper
 keeps a stable {text, usage} shape for the scorers and owns the retry policy:
 the SDK is created with max_retries=0 and this loop retries transient failures
